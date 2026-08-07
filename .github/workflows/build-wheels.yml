@@ -1,12 +1,11 @@
-# Build CPython wheels for all major platforms on GitHub Actions, then upload
-# them as build artifacts (login required to download — fine for private use
-# until we publish publicly).
+# Build CPython wheels for the platforms we actually ship, then upload them as
+# build artifacts (login required to download — fine for private use until we
+# publish publicly).
 #
-# Why both SSH->HTTPS rewrite: `Cargo.toml` points at the SPICE-Protein forks
-# via `ssh://` (matches local dev), but CI runners have no SSH key. The forks are
-# public, so we rewrite to HTTPS which needs no credentials. This relies on
-# `.cargo/config.toml` (git-fetch-with-cli = true) so cargo uses the git CLI,
-# which honours `url.<base>.insteadOf`.
+# Git deps: `Cargo.toml` uses `https://` URLs to the PUBLIC SPICE-Protein forks
+# (ewald/dynamics), so CI needs no credentials and no SSH->HTTPS rewrite.
+# linux/aarch64 is deferred (maturin cross-build can't find an aarch64 CPython
+# reliably); re-add with a native ARM runner or proper QEMU/manylinux when needed.
 #
 # Trigger: push to main/master, tag `v*`, or manual "Run workflow".
 name: build-wheels
@@ -32,9 +31,9 @@ jobs:
           # Linux x86_64 — Google Colab, most cloud CPUs, cheap GPUs
           - os: ubuntu-latest
             target: x86_64
-          # Linux arm64 — ARM cloud, Jetson, Apple-silicon cloud boxes
-          - os: ubuntu-latest
-            target: aarch64
+          # NOTE: linux/aarch64 (Jetson, ARM cloud) is deferred — maturin's
+          # cross-build can't find an aarch64 CPython reliably; re-add with the
+          # proper manylinux docker/QEMU or a native ARM runner when needed.
           # macOS arm64 (Apple Silicon) — local dev
           - os: macos-14
             target: aarch64
@@ -45,11 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rewrite SSH git deps to HTTPS (public forks, no creds needed)
-        shell: bash
-        run: |
-          git config --global url."https://github.com/SPICE-Protein/".insteadOf "ssh://git@github.com/SPICE-Protein/"
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -59,10 +53,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-          # manylinux:auto → manylinux2014/musllinux wheels; zig helps cross-compile
-          # the aarch64 target when any C dependency needs compiling.
           manylinux: auto
-          zig: true
 
       - name: Upload wheel as artifact
         uses: actions/upload-artifact@v4
