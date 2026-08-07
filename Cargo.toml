@@ -8,9 +8,9 @@ name = "spice_engine"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Local fork (path) while debugging; switch to git for deployment:
-#   dynamics = { git = "ssh://git@github.com/SPICE-Protein/dynamics.git" }
-dynamics = { path = "../dynamics" }
+# Forked MD engine + k-space. Git deps so a fresh clone builds without the
+# local ../dynamics ../ewald paths (dev: swap back to path while hacking).
+dynamics = { git = "ssh://git@github.com/SPICE-Protein/dynamics.git" }
 bio_files = "0.5.2"
 lin_alg = { version = "1.4.3", features = ["encode", "random"] }
 na_seq = "0.3.15"
@@ -19,11 +19,11 @@ pyo3 = { version = "0.29.2", optional = true, features = ["extension-module"] }
 numpy = { version = "0.29.0", optional = true }
 
 # arm64 (Apple Silicon) fix: ewald's SIMD imports are gated on x86_64.
-# Must be in the ROOT manifest for cargo to honor it. Use the same local fork
-# clone as dynamics (../ewald) so md_cal and dynamics share ONE ewald source
-# (keeps the PmeRecip Clone + arm64 fixes in sync while developing).
+# Must be in the ROOT manifest for cargo to honor it — this redirects BOTH
+# spice_engine's and dynamics' crates-io `ewald` to the fork (PmeRecip Clone +
+# fast erfc/exp + arm64 fix), so all three share ONE ewald source.
 [patch.crates-io]
-ewald = { path = "../ewald" }
+ewald = { git = "ssh://git@github.com/SPICE-Protein/ewald.git" }
 
 [features]
 # Build the Python extension (maturin passes `--features python`).

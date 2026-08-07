@@ -5,7 +5,7 @@
 > evolution paths across a multidimensional environment (temperature / pH /
 > ionic strength / pressure).
 
-The Rust engine (this repo, `md_cal/`) builds on the `dynamics` crate
+The Rust engine (this repo) builds on the `dynamics` crate
 (Amber ff19SB force field + OPC water + PME) and provides environment-parameterised
 MD, five physical metrics, RL action (bias-force) interfaces, external structure
 ingestion, a parallel engine pool, and PyO3 Python bindings. The data pipeline
@@ -46,7 +46,7 @@ directory.
 ## Repository layout
 
 ```
-md_cal/
+spice_engine/
 ├── src/
 │   ├── env.rs        EnvParams environment parameters
 │   ├── topology.rs   protein topology (sequence, Cα/backbone/heavy indices, residue→atom map)
@@ -74,11 +74,11 @@ Upstream (`../`):
 
 ```bash
 # Rust engine + tests (release — MD must run in release)
-cd md_cal
+cd spice_engine
 cargo test --release
 
 # Python bindings (conda env spice)
-cd md_cal
+cd spice_engine
 CONDA_PREFIX=/path/to/envs/spice VIRTUAL_ENV=/path/to/envs/spice \
   python -m maturin develop --release
 ```
