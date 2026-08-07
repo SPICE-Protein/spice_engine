@@ -1,0 +1,44 @@
+[package]
+name = "spice_engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "spice_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Local fork (path) while debugging; switch to git for deployment:
+#   dynamics = { git = "ssh://git@github.com/SPICE-Protein/dynamics.git" }
+dynamics = { path = "../dynamics" }
+bio_files = "0.5.2"
+lin_alg = { version = "1.4.3", features = ["encode", "random"] }
+na_seq = "0.3.15"
+rayon = "1.11.0"
+pyo3 = { version = "0.29.2", optional = true, features = ["extension-module"] }
+numpy = { version = "0.29.0", optional = true }
+
+# arm64 (Apple Silicon) fix: ewald's SIMD imports are gated on x86_64.
+# Must be in the ROOT manifest for cargo to honor it. Use the same local fork
+# clone as dynamics (../ewald) so md_cal and dynamics share ONE ewald source
+# (keeps the PmeRecip Clone + arm64 fixes in sync while developing).
+[patch.crates-io]
+ewald = { path = "../ewald" }
+
+[features]
+# Build the Python extension (maturin passes `--features python`).
+python = ["dep:pyo3", "dep:numpy"]
+
+# Deployment-focused release profile: fast + small binaries.
+# NOTE: keep the default unwind strategy — pyo3 relies on catch_unwind to turn
+# a Rust panic into a Python exception. `panic = "abort"` would kill the host.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Forks are git deps from the SPICE-Protein org — deploying anywhere just needs
+# this repo + SSH access to github.com:SPICE-Protein/* (or set HTTPS URLs + token
+# in CI). After changing a fork, run: cargo update -p dynamics -p ewald
+

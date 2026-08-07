@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "spice-engine"
+version = "0.1.0"
+description = "SPICE protein adaptive evolution — Rust MD engine (PyO3 bindings)"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.maturin]
+module-name = "spice_engine"
+features = ["python"]
+bindings = "pyo3"

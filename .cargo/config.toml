@@ -1,0 +1,5 @@
+# Fetch git dependencies (SPICE-Protein forks) with the git CLI instead of
+# cargo's built-in libgit2, so SSH auth reuses your ~/.ssh config.
+# Works for both local dev and deployment (any machine with a working git/SSH).
+[net]
+git-fetch-with-cli = true
