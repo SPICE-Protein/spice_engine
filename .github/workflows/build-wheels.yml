@@ -36,9 +36,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             python: "3.12"
+            interpreter: python3.12
           - os: ubuntu-latest
             target: x86_64
             python: "3.11"
+            interpreter: python3.11
           # NOTE: linux/aarch64 (Jetson, ARM cloud) is deferred — maturin's
           # cross-build can't find an aarch64 CPython reliably; re-add with the
           # proper manylinux docker/QEMU or a native ARM runner when needed.
@@ -46,10 +48,12 @@ jobs:
           - os: macos-14
             target: aarch64
             python: "3.12"
+            interpreter: python
           # Windows x86_64
           - os: windows-latest
             target: x86_64
             python: "3.12"
+            interpreter: python
 
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +66,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          # ⚠️ 必须显式 --interpreter：manylinux 容器默认 python3 是 cp39，
+          # 不钉 interpreter 会打出 cp39 wheel（pip 拒绝装到 3.12/3.11）。
+          args: --release --interpreter ${{ matrix.interpreter }} --out dist
           manylinux: auto
 
       - name: Upload wheel as artifact
