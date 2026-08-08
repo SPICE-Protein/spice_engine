@@ -153,7 +153,14 @@ pub struct PyEngine {
 #[pymethods]
 impl PyEngine {
     /// Build a system from an in-memory `Structure` plus environment.
+    ///
+    /// `strict_incomplete=True` (default) rejects structures with residues
+    /// missing their sidechain heavy atoms (disordered crystal sidechains),
+    /// failing with a clear error listing them. Set `False` to build them
+    /// truncated (backbone + Cα H only, warning) — physics is wrong for those
+    /// residues, so only use it to explore.
     #[staticmethod]
+    #[pyo3(signature = (structure, ph, temp, pressure, ionic_strength_m, relax_iters, tolerance, strict_incomplete = true))]
     fn build(
         structure: &Bound<'_, PyStructure>,
         ph: f32,
@@ -162,12 +169,14 @@ impl PyEngine {
         ionic_strength_m: f32,
         relax_iters: usize,
         tolerance: f32,
+        strict_incomplete: bool,
     ) -> PyResult<Self> {
         let dev = dynamics::ComputationDevice::Cpu;
         let opts = BuildOptions {
             env: EnvParams::new(ph, temp, pressure, ionic_strength_m),
             relax_iters: Some(relax_iters),
             energy_minimization_tolerance: tolerance,
+            strict_incomplete_residues: strict_incomplete,
             ..Default::default()
         };
         let structure = structure.borrow();

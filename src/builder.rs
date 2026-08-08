@@ -27,6 +27,12 @@ pub struct BuildOptions {
     /// Post-minimization equilibration (positional restraints + NVT ramp).
     /// `None` disables it (fast build, but residual strain can crash MD early).
     pub equil: Option<EquilConfig>,
+    /// Reject structures with residues missing their sidechain heavy atoms
+    /// (disordered crystal sidechains). Default `true`: fail with a clear error
+    /// listing the incomplete residues. Set `false` to build them truncated
+    /// (backbone + Cα H only, with a warning) — physics is wrong for those
+    /// residues, so only use this to explore.
+    pub strict_incomplete_residues: bool,
 }
 
 impl Default for BuildOptions {
@@ -43,6 +49,8 @@ impl Default for BuildOptions {
             // Disabled while we validate L-BFGS alone; re-enable later if the
             // hot start still causes stochastic blow-ups.
             equil: None,
+            // Reject truncated residues by default (honest physics).
+            strict_incomplete_residues: true,
         }
     }
 }
@@ -66,8 +74,13 @@ pub fn build_system(
         .ok_or("FfParamSet missing peptide ff/q map — was FfParamSet::new_amber used?")?;
 
     // Assign hydrogens, ff types, partial charges and bonds at the target pH.
-    let (bonds, _dihedrals) =
-        prepare_peptide_mmcif(&mut protein, ff_map, opts.env.ph).map_err(|e| e.to_string())?;
+    let (bonds, _dihedrals) = prepare_peptide_mmcif(
+        &mut protein,
+        ff_map,
+        opts.env.ph,
+        opts.strict_incomplete_residues,
+    )
+    .map_err(|e| e.to_string())?;
 
     let topology = ProteinTopology::from_prepared(&protein)?;
 
