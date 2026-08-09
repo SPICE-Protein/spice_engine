@@ -37,6 +37,14 @@ pub struct AtomInput {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    /// Crystallographic occupancy. CRITICAL for alternate-conformer
+    /// (altloc) structures: `dedup_altloc` in the dynamics fork keeps the
+    /// HIGHEST-occupancy conformer per (chain, residue, atom name). If this is
+    /// dropped (defaults to 1.0 for every altloc), the tie falls back to the
+    /// lowest serial number, which can be a different, overlapping conformer
+    /// -> hard non-bonded clash that blows up MD. The parquet path MUST pass
+    /// this through.
+    pub occupancy: f32,
 }
 
 impl AtomInput {
@@ -60,6 +68,7 @@ impl AtomInput {
             x,
             y,
             z,
+            occupancy: 1.0,
         }
     }
 }
@@ -182,7 +191,7 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
                 force_field_type: None,
                 partial_charge: None,
                 hetero: false,
-                occupancy: None,
+                occupancy: Some(a.occupancy),
                 alt_conformation_id: None,
             });
         }

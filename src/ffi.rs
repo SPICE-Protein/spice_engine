@@ -9,6 +9,7 @@
 
 use std::sync::OnceLock;
 
+use na_seq::Element;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -18,6 +19,7 @@ use crate::actions::ForceAction;
 use crate::builder::BuildOptions;
 use crate::engine::SpiceEngine;
 use crate::env::EnvParams;
+use crate::equilibrate::EquilConfig;
 use crate::metrics::{Metrics, MetricsConfig};
 use crate::structure::{AtomInput, StructureInput, build_from_input};
 
@@ -53,13 +55,19 @@ impl PyStructure {
     ///   res_seq:    [N] int
     ///   res_names:  [N] str   (3-letter, e.g. "ALA")
     ///   coords:     [N, 3] f32  (Å)
+    ///   occupancy:  [N] f32 (optional; default 1.0). MUST be provided for
+    ///               altloc-heavy structures — `dedup_altloc` keeps the
+    ///               highest-occupancy conformer; dropping occupancy mixes
+    ///               overlapping conformers (hard clash that blows up MD).
     #[staticmethod]
+    #[pyo3(signature = (atom_names, elements, res_seq, res_names, coords, occupancy=None))]
     fn from_atoms(
         atom_names: Vec<String>,
         elements: Vec<String>,
         res_seq: Vec<i32>,
         res_names: Vec<String>,
         coords: PyReadonlyArray2<'_, f32>,
+        occupancy: Option<PyReadonlyArray1<'_, f32>>,
     ) -> PyResult<Self> {
         let shape = coords.as_array().shape().to_vec();
         if shape[1] != 3 {
@@ -73,6 +81,18 @@ impl PyStructure {
         {
             return err(format!("array length mismatch: atoms={} elms={} res_seq={} res_names={} coords={n}", atom_names.len(), elements.len(), res_seq.len(), res_names.len()));
         }
+        let occ = occupancy.as_ref().map(|o| {
+            let a = o.as_array();
+            if a.len() != n {
+                return Err(format!("occupancy length {} != coords {n}", a.len()));
+            }
+            Ok(a.iter().copied().collect::<Vec<f32>>())
+        });
+        let occ = match occ {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return err(e),
+            None => vec![1.0f32; n],
+        };
         let c = coords.as_array();
         let mut input = StructureInput::default();
         for i in 0..n {
@@ -87,6 +107,7 @@ impl PyStructure {
                 x: c[[i, 0]],
                 y: c[[i, 1]],
                 z: c[[i, 2]],
+                occupancy: occ[i],
             });
         }
         Ok(Self { inner: input })
@@ -127,6 +148,7 @@ impl PyStructure {
                     x: a.posit.x as f32,
                     y: a.posit.y as f32,
                     z: a.posit.z as f32,
+                    occupancy: a.occupancy.unwrap_or(1.0),
                 });
             }
         }
@@ -284,6 +306,183 @@ impl PyEngine {
 
     fn reset_pseudo_labels(&mut self) {
         self.engine.reset_pseudo_labels();
+    }
+
+    /// Per-protein-atom diagnostic labels: (element, one-letter residue,
+    /// residue seq_id, mmCIF serial number) for every atom of the built system,
+    /// in `MdState.atoms` index order — lets you identify the atoms that hit
+    /// the accel clamp (the index in the `Warn: N atom(s) hit accel clamp ...`
+    /// line is this same index).
+    fn atom_labels<'py>(&self, py: Python<'py>) -> PyResult<Vec<(String, char, i32, u32)>> {
+        let n = self.engine.state.atoms.len();
+        let mut res_of: Vec<(char, i32)> = vec![('?', 0); n];
+        for r in &self.engine.topology.residues {
+            for &i in &r.atom_indices {
+                if i < n {
+                    res_of[i] = (r.one_letter, r.seq_id);
+                }
+            }
+        }
+        Ok(self
+            .engine
+            .state
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                (
+                    format!("{:?}", a.element),
+                    res_of[i].0,
+                    res_of[i].1,
+                    a.serial_number,
+                )
+            })
+            .collect())
+    }
+
+    /// Diagnostic: report every hydrogen whose current force magnitude exceeds
+    /// `min_force`, along with its minimum distance to a NON-bonded atom (any
+    /// atom in a different residue). The min distance is the quantity that
+    /// `add_hydrogens::resolve_h_clashes` uses to decide whether to remove a
+    /// clashing H (current threshold 1.2 Å), so this shows exactly which H's
+    /// are hard clashes that slipped through. Returns
+    /// (element, residue, seq_id, serial, |force| kcal/mol/Å, min_d Å).
+    fn clash_report<'py>(
+        &self,
+        py: Python<'py>,
+        min_force: f32,
+    ) -> PyResult<Vec<(String, char, i32, u32, f32, f32)>> {
+        let n = self.engine.state.atoms.len();
+        let mut res_of: Vec<(char, i32)> = vec![('?', 0); n];
+        let mut atom_res: Vec<usize> = vec![0; n];
+        for (ri, r) in self.engine.topology.residues.iter().enumerate() {
+            for &i in &r.atom_indices {
+                if i < n {
+                    res_of[i] = (r.one_letter, r.seq_id);
+                    atom_res[i] = ri;
+                }
+            }
+        }
+        let atoms = &self.engine.state.atoms;
+        let mut out = Vec::new();
+        for i in 0..n {
+            let a = &atoms[i];
+            if a.element != Element::Hydrogen {
+                continue;
+            }
+            let fmag = a.force.magnitude();
+            if fmag < min_force {
+                continue;
+            }
+            let mut min_d = f32::INFINITY;
+            for j in 0..n {
+                if j == i || atom_res[j] == atom_res[i] {
+                    continue;
+                }
+                let d = (atoms[j].posit - a.posit).magnitude();
+                if d < min_d {
+                    min_d = d;
+                }
+            }
+            out.push((
+                format!("{:?}", a.element),
+                res_of[i].0,
+                res_of[i].1,
+                a.serial_number,
+                fmag,
+                min_d,
+            ));
+        }
+        out.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+
+    /// Diagnostic: report EVERY atom (any element) whose current force
+    /// magnitude exceeds `min_force`, with its minimum distance to a
+    /// NON-bonded atom (different residue). Returns
+    /// (element, residue, seq_id, serial, |force| kcal/mol/Å, min_d Å).
+    fn force_report<'py>(
+        &self,
+        py: Python<'py>,
+        min_force: f32,
+    ) -> PyResult<Vec<(String, char, i32, u32, f32, f32)>> {
+        let n = self.engine.state.atoms.len();
+        let mut res_of: Vec<(char, i32)> = vec![('?', 0); n];
+        let mut atom_res: Vec<usize> = vec![0; n];
+        for (ri, r) in self.engine.topology.residues.iter().enumerate() {
+            for &i in &r.atom_indices {
+                if i < n {
+                    res_of[i] = (r.one_letter, r.seq_id);
+                    atom_res[i] = ri;
+                }
+            }
+        }
+        let atoms = &self.engine.state.atoms;
+        let mut out = Vec::new();
+        for i in 0..n {
+            let a = &atoms[i];
+            let fmag = a.force.magnitude();
+            if fmag < min_force {
+                continue;
+            }
+            let mut min_d = f32::INFINITY;
+            for j in 0..n {
+                if j == i || atom_res[j] == atom_res[i] {
+                    continue;
+                }
+                let d = (atoms[j].posit - a.posit).magnitude();
+                if d < min_d {
+                    min_d = d;
+                }
+            }
+            out.push((
+                format!("{:?}", a.element),
+                res_of[i].0,
+                res_of[i].1,
+                a.serial_number,
+                fmag,
+                min_d,
+            ));
+        }
+        out.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+
+    /// Post-build equilibration: NVT settle with strong friction + gentle
+    /// temperature ramp.
+    ///
+    /// Releases the residual step-0 strain that minimization cannot remove —
+    /// mostly added-HYDROGEN clashes sitting 1.5-2.0 Å from a non-bonded atom
+    /// (a static minimizer can't fix them; the H's are pinned by their bonds).
+    ///
+    /// Validated: on 2LYZ, max |force| drops from ~10⁴ (step 0) to ~107 by
+    /// step 100, and post-equilibration production has ZERO accel clamps (vs
+    /// 13-19/step before). Positional restraints (`k_restraint>0`) are an
+    /// opt-in and are OFF by default — they freeze the heavy skeleton and stop
+    /// the H's from relaxing, which stores strain and causes a mid-ramp crash.
+    ///
+    /// Optional — `Engine.build` stays fast without it. Typical: build, call
+    /// `equilibrate()`, then run production MD. Returns an error if the system
+    /// blows up mid-ramp (caller can treat as build_failed).
+    #[pyo3(signature = (ramp_steps=300, t_start_k=100.0, k_restraint=0.0, hold_steps=100, restrain_hydrogens=false, friction_gamma=10.0))]
+    fn equilibrate(
+        &mut self,
+        ramp_steps: usize,
+        t_start_k: f32,
+        k_restraint: f32,
+        hold_steps: usize,
+        restrain_hydrogens: bool,
+        friction_gamma: f32,
+    ) -> PyResult<()> {
+        let cfg = EquilConfig {
+            ramp_steps,
+            t_start_k,
+            k_restraint,
+            hold_steps,
+            restrain_hydrogens,
+            friction_gamma,
+        };
+        crate::equilibrate::equilibrate(&mut self.engine, &cfg).map_err(PyValueError::new_err)
     }
 
     /// Engine-internal per-category timing sums (µs), sampled every 20 steps.
