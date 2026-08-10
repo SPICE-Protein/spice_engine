@@ -379,6 +379,13 @@ impl PyEngine {
         o.long_range_recip_disabled = long_range;
     }
 
+    /// Diagnostics: skip the Langevin thermostat on rigid WATER (to bisect the
+    /// ~+70 K thermostat-equilibrium offset: per-atom 9-component water noise +
+    /// SETTLE projection vs the rest).
+    fn set_skip_water_thermostat(&mut self, skip: bool) {
+        self.engine.state.cfg.overrides.skip_water_thermostat = skip;
+    }
+
     fn reset_pseudo_labels(&mut self) {
         self.engine.reset_pseudo_labels();
     }
@@ -413,6 +420,29 @@ impl PyEngine {
                 )
             })
             .collect())
+    }
+
+    /// Per-residue max |force| (kcal/mol/Å) over the residue's atoms — the
+    /// per-residue strain map for targeted mutation (path B: which residue to
+    /// mutate). [L] aligned with `topology.residues`. O(N), cheap to call each
+    /// step. Complemented by `clash_report` / `atom_labels` for atom-level
+    /// detail.
+    fn per_residue_max_force(&self) -> Vec<f32> {
+        let n = self.engine.state.atoms.len();
+        let mut max_f = vec![0.0f32; self.engine.topology.residues.len()];
+        for (ri, r) in self.engine.topology.residues.iter().enumerate() {
+            let mut m = 0.0f32;
+            for &i in &r.atom_indices {
+                if i < n {
+                    let fmag = self.engine.state.atoms[i].force.magnitude();
+                    if fmag > m {
+                        m = fmag;
+                    }
+                }
+            }
+            max_f[ri] = m;
+        }
+        max_f
     }
 
     /// Diagnostic: report every hydrogen whose current force magnitude exceeds
