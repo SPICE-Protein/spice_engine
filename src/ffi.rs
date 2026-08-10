@@ -288,6 +288,50 @@ impl PyEngine {
         self.engine.state.potential_energy
     }
 
+    /// Diagnostic: exact DOF / temperature bookkeeping. Returns atom & water
+    /// counts vs the cached `thermo_dof`, and the temperature it implies for
+    /// the current kinetic energy — lets us check whether `t_kin` is
+    /// miscalibrated (e.g. thermo_dof cached before H's/ions were finalized).
+    fn thermo_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        const R_KCAL: f64 = 0.001_987_204_1;
+        let s = &self.engine.state;
+        let n_atoms = s.atoms.len();
+        let n_static = s.atoms.iter().filter(|a| a.static_).count();
+        let n_h = s
+            .atoms
+            .iter()
+            .filter(|a| a.element == Element::Hydrogen && !a.static_)
+            .count();
+        let n_water = s.water.len();
+        let thermo_dof = s.thermo_dof();
+        let dof_now = s.dof_for_thermo_now();
+        let ke = s.kinetic_energy;
+        let t_implied = if thermo_dof > 0 {
+            2.0 * ke / (thermo_dof as f64 * R_KCAL)
+        } else {
+            0.0
+        };
+        let d = PyDict::new(py);
+        d.set_item("n_atoms", n_atoms)?;
+        d.set_item("n_static", n_static)?;
+        d.set_item("n_hydrogens", n_h)?;
+        d.set_item("n_water", n_water)?;
+        d.set_item("thermo_dof", thermo_dof)?;
+        d.set_item("dof_for_thermo_now", dof_now)?;
+        d.set_item("dof_water_6n", 6 * n_water)?;
+        d.set_item("dof_solute_3n", 3 * (n_atoms - n_static))?;
+        d.set_item("kinetic_energy_kcal", ke)?;
+        d.set_item("t_implied_k", t_implied)?;
+        Ok(d)
+    }
+
+    /// Instantaneous kinetic energy in kcal/mol (matches `state.kinetic_energy`,
+    /// the same quantity `t_kin` is derived from). Lets callers compute the
+    /// total energy E = U + KE and check conservation without needing DOF.
+    fn kinetic_energy_kcal(&self) -> f64 {
+        self.engine.state.kinetic_energy
+    }
+
     fn step_count(&self) -> usize {
         self.engine.state.step_count
     }
@@ -302,6 +346,37 @@ impl PyEngine {
 
     fn reset_velocities(&mut self) {
         self.engine.reset_velocities();
+    }
+
+    /// Switch the production integrator (diagnostics / thermostat tuning):
+    ///   "langevin_middle" -> default LangevinMiddle gamma=0.5
+    ///   "langevin_strong" -> LangevinMiddle gamma=10 (well-damped, settle-like)
+    ///   "nve"             -> VerletVelocity with NO thermostat (energy-conservation probe)
+    fn set_integrator(&mut self, mode: &str) -> PyResult<()> {
+        let integrator = match mode {
+            "langevin_middle" => dynamics::Integrator::LangevinMiddle { gamma: 0.5 },
+            "langevin_strong" => dynamics::Integrator::LangevinMiddle { gamma: 10.0 },
+            "nve" => dynamics::Integrator::VerletVelocity { thermostat: None },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown integrator mode '{other}' (expected langevin_middle | langevin_strong | nve)"
+                )))
+            }
+        };
+        self.engine.state.cfg.integrator = integrator;
+        Ok(())
+    }
+
+    /// Toggle individual force classes (diagnostics). Each arg is a boolean:
+    /// `true` DISABLES that class. Used to bisect the NVE energy leak — we
+    /// disable one class at a time and see which one stops the ~7 kcal/mol/step
+    /// spurious heating.
+    fn set_force_overrides(&mut self, bonded: bool, coulomb: bool, lj: bool, long_range: bool) {
+        let o = &mut self.engine.state.cfg.overrides;
+        o.bonded_disabled = bonded;
+        o.coulomb_disabled = coulomb;
+        o.lj_disabled = lj;
+        o.long_range_recip_disabled = long_range;
     }
 
     fn reset_pseudo_labels(&mut self) {
@@ -543,6 +618,12 @@ impl PyEngine {
         d.set_item("step_count", result.step_count)?;
         d.set_item("time_ps", result.time_ps)?;
         d.set_item("crashed", result.crashed)?;
+        // Clamp / thermostat observables: n_clamped + max_accel_clamped are the
+        // "temperature instability" signal (sustained clamps = force spikes being
+        // swallowed by MAX_ACCEL), t_kin verifies the thermostat reached target T.
+        d.set_item("n_clamped", self.engine.state.last_clamped_count)?;
+        d.set_item("max_accel_clamped", self.engine.state.last_clamped_mag)?;
+        d.set_item("t_kin", self.engine.state.last_temperature_k)?;
         if let Some(m) = m {
             d.set_item("m1", m.m1)?;
             d.set_item("m2", m.m2)?;

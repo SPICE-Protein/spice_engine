@@ -100,10 +100,20 @@ impl SpiceEngine {
         self.state.cfg.temp_target = k;
     }
 
-    /// Re-zero all atom velocities (e.g. before a fresh run).
+    /// Re-zero all velocities (e.g. before a fresh run) — SOLUTE and SOLVENT.
+    /// Water is included so a cold start is actually cold: leaving the rigid
+    /// water at the build/solvent-init temperature (~420 K on 2LYZ) means the
+    /// equilibrate ramp and production both start far above the target and the
+    /// weak production thermostat (gamma=0.5) can't pull them down in a short
+    /// window (measured: t_kin sits ~+65-75 K above target for hundreds of steps).
     pub fn reset_velocities(&mut self) {
         for a in &mut self.state.atoms {
             a.vel = Vec3::new_zero();
+        }
+        for w in &mut self.state.water {
+            w.o.vel = Vec3::new_zero();
+            w.h0.vel = Vec3::new_zero();
+            w.h1.vel = Vec3::new_zero();
         }
     }
 
