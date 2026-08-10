@@ -325,6 +325,161 @@ impl PyEngine {
         Ok(d)
     }
 
+    /// Per-species temperature split (solute vs water), for thermostat
+    /// calibration: tells us WHICH species the thermostat over-heats. DOF:
+    /// solute = 3·non-static atoms, water = 6·n_water (rigid). KE in kcal/mol.
+    fn species_temperatures<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        const NATIVE_TO_KCAL: f64 = 1.0 / 418.4;
+        const R_KCAL: f64 = 0.001_987_204_1;
+        let s = &self.engine.state;
+
+        let mut solute_ke_native = 0.0f64;
+        let mut n_solute = 0usize;
+        let mut n_solute_h = 0usize;
+        for a in &s.atoms {
+            if a.static_ {
+                continue;
+            }
+            n_solute += 1;
+            if a.element == Element::Hydrogen {
+                n_solute_h += 1;
+            }
+            let v2 = a.vel.magnitude_squared() as f64;
+            solute_ke_native += (a.mass as f64) * v2;
+        }
+        let solute_ke = 0.5 * solute_ke_native * NATIVE_TO_KCAL;
+
+        let mut water_ke_native = 0.0f64;
+        for w in &s.water {
+            for atom in [&w.o, &w.h0, &w.h1] {
+                let v2 = atom.vel.magnitude_squared() as f64;
+                water_ke_native += (atom.mass as f64) * v2;
+            }
+        }
+        let water_ke = 0.5 * water_ke_native * NATIVE_TO_KCAL;
+
+        // Solute DOF: 3 per non-static atom, minus 1 per constrained H (LINCS/SHAKE
+        // both remove one H–heavy-bond DOF; rattle projects the bond velocity before
+        // the KE is measured). Mirrors dynamics' `dof_for_thermo`.
+        let solute_dof = (3 * n_solute - n_solute_h) as f64;
+        let water_dof = (6 * s.water.len()) as f64;
+
+        let d = PyDict::new(py);
+        d.set_item("solute_ke_kcal", solute_ke)?;
+        d.set_item("water_ke_kcal", water_ke)?;
+        d.set_item("solute_dof", solute_dof)?;
+        d.set_item("water_dof", water_dof)?;
+        d.set_item(
+            "solute_t_k",
+            if solute_dof > 0.0 {
+                2.0 * solute_ke / (solute_dof * R_KCAL)
+            } else {
+                0.0
+            },
+        )?;
+        d.set_item(
+            "water_t_k",
+            if water_dof > 0.0 {
+                2.0 * water_ke / (water_dof * R_KCAL)
+            } else {
+                0.0
+            },
+        )?;
+        Ok(d)
+    }
+
+    /// Diagnostic: split the water kinetic energy into rigid-body (COM
+    /// translation + rotation) vs internal (bond-stretch / angle) parts. If the
+    /// internal part is significant, SETTLE is NOT removing the water's internal
+    /// DOF — then `water_t` (computed with 6 DOF) is inflated ~1.5× and the real
+    /// system temperature is LOWER than reported (thermostat under-injecting).
+    fn water_rigid_split<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use lin_alg::f32::{Mat3 as Mat3F32, Vec3};
+        const NATIVE_TO_KCAL: f64 = 1.0 / 418.4;
+        const R_KCAL: f64 = 0.001_987_204_1;
+        let s = &self.engine.state;
+
+        let mut total_accum = 0.0f64; // Σ m·v² over all 9 components (no ½)
+        let mut rigid_accum = 0.0f64; // M·V² + L·ω  (no ½)
+        let mut n_water = 0usize;
+        for w in &s.water {
+            n_water += 1;
+            let m_total = w.o.mass + w.h0.mass + w.h1.mass;
+            let r_com = (w.o.posit * w.o.mass + w.h0.posit * w.h0.mass + w.h1.posit * w.h1.mass)
+                / m_total;
+            let v_com = (w.o.vel * w.o.mass + w.h0.vel * w.h0.mass + w.h1.vel * w.h1.mass)
+                / m_total;
+
+            for atom in [&w.o, &w.h0, &w.h1] {
+                let v2 = atom.vel.magnitude_squared() as f64;
+                total_accum += (atom.mass as f64) * v2;
+            }
+
+            let (r_o, r_h0, r_h1) = (w.o.posit - r_com, w.h0.posit - r_com, w.h1.posit - r_com);
+            let (v_o, v_h0, v_h1) = (w.o.vel - v_com, w.h0.vel - v_com, w.h1.vel - v_com);
+            let l = r_o.cross(v_o) * w.o.mass
+                + r_h0.cross(v_h0) * w.h0.mass
+                + r_h1.cross(v_h1) * w.h1.mass;
+
+            let inertia = |r: Vec3, mass: f32| {
+                let r2 = r.dot(r);
+                [
+                    [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
+                    [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
+                    [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                ]
+            };
+            let mut i_arr = inertia(r_o, w.o.mass);
+            for add in [inertia(r_h0, w.h0.mass), inertia(r_h1, w.h1.mass)] {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        i_arr[i][j] += add[i][j];
+                    }
+                }
+            }
+            let i_mat = Mat3F32::from_arr(i_arr);
+            let omega = i_mat.solve_system(l); // ω = I⁻¹L
+
+            rigid_accum += (m_total as f64) * (v_com.magnitude_squared() as f64)
+                + l.dot(omega) as f64; // M·V² + L·ω = 2·(COM_KE + rot_KE)
+        }
+
+        let total_ke = 0.5 * total_accum * NATIVE_TO_KCAL;
+        let rigid_ke = 0.5 * rigid_accum * NATIVE_TO_KCAL;
+        let internal_ke = total_ke - rigid_ke;
+
+        let d = PyDict::new(py);
+        d.set_item("water_total_ke_kcal", total_ke)?;
+        d.set_item("water_rigid_ke_kcal", rigid_ke)?;
+        d.set_item("water_internal_ke_kcal", internal_ke)?;
+        d.set_item("n_water", n_water)?;
+        d.set_item(
+            "water_rigid_t_k",
+            if n_water > 0 {
+                2.0 * rigid_ke / ((6 * n_water) as f64 * R_KCAL)
+            } else {
+                0.0
+            },
+        )?;
+        d.set_item(
+            "water_9dof_t_k",
+            if n_water > 0 {
+                2.0 * total_ke / ((9 * n_water) as f64 * R_KCAL)
+            } else {
+                0.0
+            },
+        )?;
+        d.set_item(
+            "water_internal_t_k",
+            if n_water > 0 {
+                2.0 * internal_ke / ((3 * n_water) as f64 * R_KCAL)
+            } else {
+                0.0
+            },
+        )?;
+        Ok(d)
+    }
+
     /// Instantaneous kinetic energy in kcal/mol (matches `state.kinetic_energy`,
     /// the same quantity `t_kin` is derived from). Lets callers compute the
     /// total energy E = U + KE and check conservation without needing DOF.
