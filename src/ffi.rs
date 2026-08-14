@@ -587,7 +587,7 @@ impl PyEngine {
     /// in `MdState.atoms` index order — lets you identify the atoms that hit
     /// the accel clamp (the index in the `Warn: N atom(s) hit accel clamp ...`
     /// line is this same index).
-    fn atom_labels<'py>(&self, py: Python<'py>) -> PyResult<Vec<(String, char, i32, u32)>> {
+    fn atom_labels<'py>(&self, _py: Python<'py>) -> PyResult<Vec<(String, char, i32, u32)>> {
         let n = self.engine.state.atoms.len();
         let mut res_of: Vec<(char, i32)> = vec![('?', 0); n];
         for r in &self.engine.topology.residues {
@@ -646,7 +646,7 @@ impl PyEngine {
     /// (element, residue, seq_id, serial, |force| kcal/mol/Å, min_d Å).
     fn clash_report<'py>(
         &self,
-        py: Python<'py>,
+        _py: Python<'py>,
         min_force: f32,
     ) -> PyResult<Vec<(String, char, i32, u32, f32, f32)>> {
         let n = self.engine.state.atoms.len();
@@ -700,7 +700,7 @@ impl PyEngine {
     /// (element, residue, seq_id, serial, |force| kcal/mol/Å, min_d Å).
     fn force_report<'py>(
         &self,
-        py: Python<'py>,
+        _py: Python<'py>,
         min_force: f32,
     ) -> PyResult<Vec<(String, char, i32, u32, f32, f32)>> {
         let n = self.engine.state.atoms.len();
