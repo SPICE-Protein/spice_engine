@@ -16,6 +16,7 @@ bio_files = "0.5.2"
 lin_alg = { version = "1.4.3", features = ["encode", "random"] }
 na_seq = "0.3.15"
 rayon = "1.11.0"
+indicatif = "0.17.8"
 pyo3 = { version = "0.29.2", optional = true, features = ["extension-module"] }
 numpy = { version = "0.29.0", optional = true }
 

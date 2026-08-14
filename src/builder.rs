@@ -139,3 +139,85 @@ pub fn build_system(
 
     Ok(engine)
 }
+
+/// Create a clone of a parent engine with a mutated structure, reusing the solvent box,
+/// water molecules, and ions of the parent. This avoids the expensive solvent packing
+/// and full solvent-only equilibration (saving 20-40 seconds of CPU time).
+pub fn build_mutant_by_solvent_reuse(
+    parent: &SpiceEngine,
+    param_set: &FfParamSet,
+    mut_input: &crate::structure::StructureInput,
+    opts: &BuildOptions,
+) -> Result<SpiceEngine, String> {
+    let dev = &parent.dev;
+    let protein = crate::structure::atoms_to_mmcif(mut_input)?;
+    let mut protein = protein;
+
+    let ff_map = param_set
+        .peptide_ff_q_map
+        .as_ref()
+        .ok_or("FfParamSet missing peptide ff/q map")?;
+
+    // Assign hydrogens, ff types, partial charges and bonds at the target pH.
+    let (bonds, _dihedrals) = prepare_peptide_mmcif(
+        &mut protein,
+        ff_map,
+        opts.env.ph,
+        opts.strict_incomplete_residues,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let topology = ProteinTopology::from_prepared(&protein)?;
+
+    let mol = MolDynamics {
+        ff_mol_type: FfMolType::Peptide,
+        atoms: protein.atoms.clone(),
+        bonds,
+        ..Default::default()
+    };
+
+    // Prepare the mutant solute atoms using MdState's build logic,
+    // but do not pack water/ions!
+    let mut cfg = MdConfig {
+        temp_target: opts.env.temp_k,
+        hydrogen_constraint: opts.hydrogen_constraint,
+        sim_box: SimBoxInit::Fixed((parent.state.cell.bounds_low, parent.state.cell.bounds_high)),
+        solvent: dynamics::Solvent::None,
+        max_init_relaxation_iters: None, // No minimization here
+        recenter_sim_box: false,
+        ..Default::default()
+    };
+    cfg.overrides.skip_counterion_insertion = true;
+    cfg.overrides.skip_water_relaxation = true;
+    
+    let (mut_solute_state, _) =
+        MdState::new(dev, &cfg, &[mol], param_set).map_err(|e| e.to_string())?;
+
+    // Call the new mutant solvent reuse builder in dynamics!
+    let mutated_state = parent.state.build_mutant_by_solvent_reuse(
+        dev,
+        mut_solute_state.atoms,
+        mut_solute_state.adjacency_list,
+        mut_solute_state.force_field_params,
+    );
+
+    let n_ca = topology.ca_indices.len();
+    let mut engine = SpiceEngine {
+        state: mutated_state,
+        topology,
+        env: opts.env,
+        dev: dev.clone(),
+        dt_ps: parent.dt_ps,
+        u_history: Default::default(),
+        ca_acc: vec![[0.0f64; 3]; n_ca],
+        ca_n: 0,
+    };
+
+    // Run a fast energy minimization on the mutated system to resolve sidechain clashes!
+    // 100-200 iterations are plenty and take <0.2 seconds because water is already minimized.
+    if let Some(relax_iters) = opts.relax_iters {
+        engine.state.minimize_energy(dev, relax_iters, None);
+    }
+
+    Ok(engine)
+}

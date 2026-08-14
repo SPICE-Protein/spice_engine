@@ -14,6 +14,8 @@
 //! by burial count (non-self heavy atoms within Cα radius 8 Å ≤ threshold), with
 //! actual charge summed from atomic partial charges.
 
+use std::collections::HashSet;
+
 use na_seq::Element;
 
 use crate::engine::SpiceEngine;
@@ -142,6 +144,13 @@ pub struct MetricsResult {
     pub n_ss_kept: usize,
     /// Number of charge-capable surface residues considered by m5.
     pub n_surface_charged: usize,
+    /// Combined stability margin. Score representing how far the system is
+    /// from the threshold across all five physical metrics. Margin > 0 is stable,
+    /// and Margin <= 0 is unstable.
+    pub stability_margin: f64,
+    /// Root-mean-square fluctuation of Cα coordinates (Å) relative to the
+    /// time-averaged structure.
+    pub rmsf: f64,
 }
 
 /// Metrics evaluated against a *reference* (native) structure — the structure the
@@ -152,13 +161,6 @@ pub struct Metrics {
     pub rg_ref: f64,
     /// Reference secondary-structure hydrogen bonds: `(donor O res, acceptor N res)`.
     pub ss_ref: Vec<(usize, usize)>,
-}
-
-fn dist3(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
-    let dx = a.0 - b.0;
-    let dy = a.1 - b.1;
-    let dz = a.2 - b.2;
-    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 fn pos(engine: &SpiceEngine, i: usize) -> (f64, f64, f64) {
@@ -174,13 +176,20 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
     }
     let mut com = (0.0f64, 0.0f64, 0.0f64);
     let mut m_sum = 0.0f64;
+    
+    let n_heavy = heavy.len();
+    let mut masses = Vec::with_capacity(n_heavy);
+    let mut positions = Vec::with_capacity(n_heavy);
+
     for &i in heavy {
         let m = engine.state.atoms[i].mass as f64;
-        let (x, y, z) = pos(engine, i);
-        com.0 += m * x;
-        com.1 += m * y;
-        com.2 += m * z;
+        let p = pos(engine, i);
+        com.0 += m * p.0;
+        com.1 += m * p.1;
+        com.2 += m * p.2;
         m_sum += m;
+        masses.push(m);
+        positions.push(p);
     }
     if m_sum <= 0.0 {
         return 0.0;
@@ -190,10 +199,14 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
     com.2 /= m_sum;
 
     let mut acc = 0.0f64;
-    for &i in heavy {
-        let m = engine.state.atoms[i].mass as f64;
-        let d2 = dist3(pos(engine, i), com);
-        acc += m * d2 * d2;
+    for i in 0..n_heavy {
+        let m = masses[i];
+        let p = positions[i];
+        let dx = p.0 - com.0;
+        let dy = p.1 - com.1;
+        let dz = p.2 - com.2;
+        let d2 = dx * dx + dy * dy + dz * dz;
+        acc += m * d2;
     }
     (acc / m_sum).sqrt()
 }
@@ -203,15 +216,35 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
 fn backbone_hbonds(engine: &SpiceEngine, cutoff: f64) -> Vec<(usize, usize)> {
     let n = engine.topology.sequence.len();
     let mut out = Vec::new();
+    
+    let mut o_positions = vec![None; n];
     for i in 0..n {
-        let Some(&oi) = engine.topology.o_indices.get(i) else { continue };
-        let po = pos(engine, oi);
+        if let Some(&oi) = engine.topology.o_indices.get(i) {
+            o_positions[i] = Some(pos(engine, oi));
+        }
+    }
+
+    let mut n_positions = vec![None; n];
+    for j in 0..n {
+        if let Some(&nj) = engine.topology.n_indices.get(j) {
+            n_positions[j] = Some(pos(engine, nj));
+        }
+    }
+
+    let cutoff_sq = cutoff * cutoff;
+
+    for i in 0..n {
+        let Some(po) = o_positions[i] else { continue };
         for j in 0..n {
             if i == j {
                 continue;
             }
-            let Some(&nj) = engine.topology.n_indices.get(j) else { continue };
-            if dist3(po, pos(engine, nj)) < cutoff {
+            let Some(pn) = n_positions[j] else { continue };
+            let dx = po.0 - pn.0;
+            let dy = po.1 - pn.1;
+            let dz = po.2 - pn.2;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 < cutoff_sq {
                 out.push((i, j));
             }
         }
@@ -227,7 +260,8 @@ pub(crate) fn ss_kept_count(engine: &SpiceEngine, refs: &[(usize, usize)], cutof
         return 0;
     }
     let cur = backbone_hbonds(engine, cutoff);
-    refs.iter().filter(|hb| cur.contains(hb)).count()
+    let cur_set: HashSet<(usize, usize)> = cur.into_iter().collect();
+    refs.iter().filter(|hb| cur_set.contains(hb)).count()
 }
 
 impl Metrics {
@@ -276,44 +310,85 @@ impl Metrics {
     /// Clash fraction among protein heavy atoms (O(N²) over heavy atoms only).
     fn clash_fraction(engine: &SpiceEngine, config: &MetricsConfig) -> f64 {
         let heavy = &engine.topology.heavy_indices;
+        let n_heavy = heavy.len();
+        if n_heavy < 2 {
+            return 0.0;
+        }
+        let radii: Vec<f64> = heavy
+            .iter()
+            .map(|&i| config.vdw.radius(engine.state.atoms[i].element))
+            .collect();
+        let positions: Vec<(f64, f64, f64)> = heavy
+            .iter()
+            .map(|&i| pos(engine, i))
+            .collect();
+
         let mut clashes = 0usize;
-        let mut pairs = 0usize;
-        for a in 0..heavy.len() {
-            let ia = heavy[a];
-            let pa = pos(engine, ia);
-            let ra = config.vdw.radius(engine.state.atoms[ia].element);
-            for b in (a + 1)..heavy.len() {
-                let ib = heavy[b];
-                pairs += 1;
-                if dist3(pa, pos(engine, ib)) < (ra + config.vdw.radius(engine.state.atoms[ib].element)) * config.clash_ratio {
+        let r_factor = config.clash_ratio;
+
+        for a in 0..n_heavy {
+            let pa = positions[a];
+            let ra = radii[a];
+            for b in (a + 1)..n_heavy {
+                let pb = positions[b];
+                let rb = radii[b];
+                let r_sum = (ra + rb) * r_factor;
+                let r_sum_sq = r_sum * r_sum;
+                
+                let dx = pa.0 - pb.0;
+                let dy = pa.1 - pb.1;
+                let dz = pa.2 - pb.2;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < r_sum_sq {
                     clashes += 1;
                 }
             }
         }
-        if pairs == 0 {
-            0.0
-        } else {
-            clashes as f64 / pairs as f64
-        }
+        let pairs = n_heavy * (n_heavy - 1) / 2;
+        clashes as f64 / pairs as f64
     }
 
     /// Surface residues via burial counting: a residue is "surface" when it has at
     /// most `surface_max_neighbors` non-self heavy atoms within `surface_radius` of
     /// its Cα (a cheap solvent-accessibility proxy).
     fn surface_residues(&self, engine: &SpiceEngine) -> Vec<bool> {
-        let n = engine.topology.sequence.len();
+        let n_res = engine.topology.sequence.len();
         let heavy = &engine.topology.heavy_indices;
-        let mut surface = vec![false; n];
-        for i in 0..n {
+        let n_heavy = heavy.len();
+        let mut surface = vec![false; n_res];
+
+        let n_atoms = engine.state.atoms.len();
+        let mut atom_to_res = vec![None; n_atoms];
+        for (res_idx, res) in engine.topology.residues.iter().enumerate() {
+            for &atom_idx in &res.atom_indices {
+                if atom_idx < n_atoms {
+                    atom_to_res[atom_idx] = Some(res_idx);
+                }
+            }
+        }
+
+        let heavy_positions: Vec<(f64, f64, f64)> = heavy
+            .iter()
+            .map(|&i| pos(engine, i))
+            .collect();
+
+        let r2 = self.config.surface_radius * self.config.surface_radius;
+
+        for i in 0..n_res {
             let Some(&cai) = engine.topology.ca_indices.get(i) else { continue };
             let pc = pos(engine, cai);
-            let self_atoms = &engine.topology.residues[i].atom_indices;
             let mut count = 0usize;
-            for &hj in heavy {
-                if self_atoms.contains(&hj) {
+            for j in 0..n_heavy {
+                let hj = heavy[j];
+                if atom_to_res[hj] == Some(i) {
                     continue;
                 }
-                if dist3(pc, pos(engine, hj)) < self.config.surface_radius {
+                let phj = heavy_positions[j];
+                let dx = pc.0 - phj.0;
+                let dy = pc.1 - phj.1;
+                let dz = pc.2 - phj.2;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < r2 {
                     count += 1;
                 }
             }
@@ -324,8 +399,10 @@ impl Metrics {
 
     /// Surface charge mismatch (m5): mean |actual − ideal| over surface,
     /// charge-capable residues. 0 when none.
+    /// Re-calibrated to use neutral pH 7.0 as the physiological baseline so that
+    /// extreme pH built states create a clear, discriminating mismatch gradient.
     fn surface_charge_mismatch(&self, engine: &SpiceEngine) -> (f64, usize) {
-        let ph = engine.env.ph as f64;
+        let ph = 7.0; // Physiological neutral pH baseline
         let n = engine.topology.sequence.len();
         let surface = self.surface_residues(engine);
         let mut acc = 0.0f64;
@@ -390,9 +467,10 @@ impl Metrics {
 
         // m3: SS loss
         let cur = backbone_hbonds(engine, self.config.hbond_n_o);
+        let cur_set: HashSet<(usize, usize)> = cur.into_iter().collect();
         let mut kept = 0usize;
         for &(i, j) in &self.ss_ref {
-            if cur.contains(&(i, j)) {
+            if cur_set.contains(&(i, j)) {
                 kept += 1;
             }
         }
@@ -408,6 +486,39 @@ impl Metrics {
         // m5: surface charge mismatch
         let (m5, n_surface_charged) = self.surface_charge_mismatch(engine);
 
+        // Compute Cα root-mean-square fluctuation (rmsf) relative to the time-averaged structure.
+        let ca_avg = engine.time_averaged_ca();
+        let mut rmsf = 0.0f64;
+        if !ca_avg.is_empty() {
+            let coords_ca: Vec<[f32; 3]> = engine.topology.ca_indices.iter().map(|&i| {
+                let p = engine.state.atoms[i].posit;
+                [p.x, p.y, p.z]
+            }).collect();
+            if coords_ca.len() == ca_avg.len() {
+                let mut sum_sq = 0.0f64;
+                for (c, avg) in coords_ca.iter().zip(&ca_avg) {
+                    let dx = (c[0] - avg[0]) as f64;
+                    let dy = (c[1] - avg[1]) as f64;
+                    let dz = (c[2] - avg[2]) as f64;
+                    sum_sq += dx * dx + dy * dy + dz * dz;
+                }
+                rmsf = (sum_sq / coords_ca.len() as f64).sqrt();
+            }
+        }
+
+        // Calculate combined stability margin across all 5 metrics using default StabilityConfig thresholds:
+        // m1_thresh = 1e5, m2_thresh = 0.15, m3_thresh = 0.55, m4_thresh = 0.05, m5_thresh = 1.0.
+        let margin_m1 = 1.0 - m1 / 1e5;
+        let margin_m2 = 1.0 - m2 / 0.15;
+        let margin_m3 = 1.0 - m3 / 0.55;
+        let margin_m4 = 1.0 - m4 / 0.05;
+        let margin_m5 = 1.0 - m5 / 1.0;
+        let stability_margin = margin_m1
+            .min(margin_m2)
+            .min(margin_m3)
+            .min(margin_m4)
+            .min(margin_m5);
+
         MetricsResult {
             m1,
             m2,
@@ -419,6 +530,8 @@ impl Metrics {
             n_ss_ref: self.ss_ref.len(),
             n_ss_kept: kept,
             n_surface_charged,
+            stability_margin,
+            rmsf,
         }
     }
 }

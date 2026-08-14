@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 
@@ -23,6 +24,8 @@ use crate::builder::BuildOptions;
 use crate::env::EnvParams;
 use crate::metrics::{Metrics, MetricsConfig, MetricsResult};
 use crate::structure::{StructureInput, build_from_input};
+
+static PROGRESS_BAR: Mutex<Option<indicatif::ProgressBar>> = Mutex::new(None);
 
 /// Environment-parameter grid (point sets per axis). `mesh()` takes the Cartesian product.
 #[derive(Debug, Clone)]
@@ -387,17 +390,6 @@ impl StabilityPoint {
             metrics: None,
         }
     }
-
-    fn crashed(env: EnvParams) -> Self {
-        Self {
-            env,
-            stable: false,
-            crashed: true,
-            build_failed: false,
-            terminated_reason: None,
-            metrics: None,
-        }
-    }
 }
 
 /// A built (solvated + minimized) engine plus its reference conformation,
@@ -627,12 +619,18 @@ fn eval_group_point(
         } else {
             "unstable"
         };
-        eprintln!(
+        let log_line = format!(
             "[stability] eval {n:>3}: T={:.0} pH={:.1}: {verdict} (crashed={}){tag}",
             env.temp_k,
             env.ph,
             pt.crashed,
         );
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(log_line);
+            pb.inc(1);
+        } else {
+            eprintln!("{}", log_line);
+        }
     }
     pt
 }
@@ -640,11 +638,17 @@ fn eval_group_point(
 /// A skipped (pruned) point: not simulated, marked `build_failed`.
 fn pruned_group_point(env: EnvParams, cfg: &StabilityConfig, reason: &str) -> StabilityPoint {
     if cfg.progress {
-        eprintln!(
+        let log_line = format!(
             "[stability] PRUNED: T={:.0} pH={:.1}: {reason}",
             env.temp_k,
             env.ph,
         );
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(log_line);
+            pb.inc(1);
+        } else {
+            eprintln!("{}", log_line);
+        }
     }
     StabilityPoint {
         env,
@@ -767,6 +771,13 @@ fn bold_walk(
 /// majority crash). **Stage 2** walks temperature only within the viable
 /// columns (bold dynamic-step walk); dead columns are pruned outright. This is
 /// the "fix the other dims, find the viable pH range first, then scan T"
+/// Two-stage parallel stability scan.
+///
+/// **Stage 1** fixes the reference temperature and screens every build-env
+/// column (one pH) to determine the VIABLE pH range (builds + runs without a
+/// majority crash). **Stage 2** walks temperature only within the viable
+/// columns (bold dynamic-step walk); dead columns are pruned outright. This is
+/// the "fix the other dims, find the viable pH range first, then scan T"
 /// strategy — no T-scan is wasted on a pH that cannot even build.
 pub fn scan_stability(
     dev: &dynamics::ComputationDevice,
@@ -782,10 +793,25 @@ pub fn scan_stability(
     let mesh = grid.mesh();
     let total = mesh.len();
     let done = AtomicUsize::new(0);
+
     if cfg.progress {
-        eprintln!(
-            "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} {msg} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
         );
+        pb.set_message("Scanning grid stability...");
+        *PROGRESS_BAR.lock().unwrap() = Some(pb);
+    }
+
+    if cfg.progress {
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(format!(
+                "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
+            ));
+        }
     }
     // Partition mesh points by build-env key; each group reuses one solvated +
     // minimized template (the LAMMPS velocity-create sweep pattern), so solvent
@@ -797,11 +823,13 @@ pub fn scan_stability(
 
     // ---- Stage 1 (parallel): screen each column at its reference temperature.
     if cfg.progress {
-        eprintln!(
-            "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
-            groups.len(),
-            cfg.anchor_temp,
-        );
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(format!(
+                "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
+                groups.len(),
+                cfg.anchor_temp,
+            ));
+        }
     }
     let screened: Vec<(
         (u32, bool, u32),
@@ -843,10 +871,12 @@ pub fn scan_stability(
 
     if cfg.progress {
         let stable_cols = screened.iter().filter(|(_, _, p, _, _)| p.stable).count();
-        eprintln!(
-            "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
-            screened.len(),
-        );
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(format!(
+                "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
+                screened.len(),
+            ));
+        }
     }
 
     // ---- Stage 2 (parallel): walk T within each column, reusing its template.
@@ -923,6 +953,10 @@ pub fn scan_stability(
             (k, results.into_iter().map(|o| o.expect("group point filled")).collect())
         })
         .collect();
+
+    if let Some(pb) = PROGRESS_BAR.lock().unwrap().take() {
+        pb.finish_with_message("Stability scan completed.");
+    }
 
     // Re-assemble in the original mesh order (each group preserves relative
     // order; pop from the front).
@@ -1081,13 +1115,19 @@ fn report_point(
         "unstable"
     };
     let m1 = pt.metrics.as_ref().map_or(f64::NAN, |m| m.m1);
-    eprintln!(
+    let log_line = format!(
         "[stability] {:>3}/{total} {axis:?}/{direction:?} T={:.0} pH={:.1}: {verdict} (crashed={}, m1={m1:.0})",
         n,
         env.temp_k,
         env.ph,
         pt.crashed,
     );
+    if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+        pb.println(log_line);
+        pb.inc(1);
+    } else {
+        eprintln!("{}", log_line);
+    }
 }
 
 /// Adaptive (coarse-to-fine) probe of one ray — the DL-style "big step first,
@@ -1185,14 +1225,29 @@ pub fn scan_radial(
     // Upper bound on candidate points (rays stop early at the first unstable).
     let total: usize = probes.iter().map(|p| 2 * p.max_steps).sum();
     let done = AtomicUsize::new(0);
+
     if cfg.progress {
-        eprintln!(
-            "[stability] scanning up to {total} candidate points across {} rays",
-            jobs.len()
+        let pb = indicatif::ProgressBar::new(total as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} {msg} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
         );
+        pb.set_message("Scanning radial stability...");
+        *PROGRESS_BAR.lock().unwrap() = Some(pb);
     }
 
-    jobs.par_iter()
+    if cfg.progress {
+        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+            pb.println(format!(
+                "[stability] scanning up to {total} candidate points across {} rays",
+                jobs.len()
+            ));
+        }
+    }
+
+    let results: Vec<RadialResult> = jobs.par_iter()
         .map(|&(axis, direction)| {
             let probe = probes
                 .iter()
@@ -1200,17 +1255,19 @@ pub fn scan_radial(
                 .expect("probe for axis");
             let env = axis.step(anchor, direction, probe.step);
             if cfg.progress {
-                eprintln!(
-                    "[stability] ray {axis:?}/{direction:?}: T={:.0} pH={:.1} (up to {} pts, {})",
-                    env.temp_k,
-                    env.ph,
-                    probe.max_steps,
-                    if axis == Axis::Ph {
-                        "rebuild per pt"
-                    } else {
-                        "template reuse"
-                    },
-                );
+                if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+                    pb.println(format!(
+                        "[stability] ray {axis:?}/{direction:?}: T={:.0} pH={:.1} (up to {} pts, {})",
+                        env.temp_k,
+                        env.ph,
+                        probe.max_steps,
+                        if axis == Axis::Ph {
+                            "rebuild per pt"
+                        } else {
+                            "template reuse"
+                        },
+                    ));
+                }
             }
             // One reusable template per ray: temp / pressure / ionic rays share
             // the same build across points (only the runtime T changes); ph rays
@@ -1264,7 +1321,13 @@ pub fn scan_radial(
                 points,
             }
         })
-        .collect()
+        .collect();
+
+    if let Some(pb) = PROGRESS_BAR.lock().unwrap().take() {
+        pb.finish_with_message("Radial scan completed.");
+    }
+
+    results
 }
 
 #[cfg(test)]

@@ -86,7 +86,16 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
     }
     let last = cfg.ramp_steps.saturating_sub(1).max(1) as f32;
 
-    println!(
+    let pb = indicatif::ProgressBar::new(total as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message("Equilibrating system...");
+
+    pb.println(format!(
         "[equil] NVT settle: T {:.0}K -> {t_end:.0}K over {} steps{}then {} hold steps, gamma {} (k_restraint {:.1})",
         cfg.t_start_k,
         cfg.ramp_steps,
@@ -94,7 +103,7 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
         cfg.hold_steps,
         cfg.friction_gamma,
         cfg.k_restraint
-    );
+    ));
 
     // 1) Boost friction for the ramp and start cold & stationary, so the first
     //    steps don't combine thermal velocities with residual strain.
@@ -117,7 +126,7 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
         .collect();
 
     let mut steps = 0usize;
-    let mut run_step = |engine: &mut SpiceEngine, temp: f32, k: f32, step_idx: usize| -> Result<(), String> {
+    let run_step = |engine: &mut SpiceEngine, temp: f32, k: f32, step_idx: usize| -> Result<(), String> {
         let mut force = vec![Vec3::new_zero(); n];
         if k > 0.0 {
             for i in 0..n {
@@ -129,6 +138,7 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
             }
         }
         let r = engine.step(if k > 0.0 { Some(force) } else { None });
+        pb.set_position((step_idx + 1) as u64);
         if step_idx % 100 == 0 || r.crashed || step_idx == total - 1 {
             let mf = engine
                 .state
@@ -136,10 +146,10 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
                 .iter()
                 .map(|a| a.force.magnitude())
                 .fold(0.0f32, f32::max);
-            println!(
+            pb.println(format!(
                 "[equil] step {step_idx:>4}/{total} T={temp:6.1}K k={k:7.1} U={:+.3e} maxF={mf:9.1}",
                 r.u_t_kcal
-            );
+            ));
         }
         if r.crashed {
             return Err(format!(
@@ -171,10 +181,10 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
     //    metrics / pseudo-labels start from a clean equilibrated state.
     engine.state.cfg.integrator = prev_integrator;
     engine.reset_history();
-    println!(
-        "[equil] done: T={t_end:.0}K, U={:.3e}",
+    pb.finish_with_message(format!(
+        "Equilibration complete: T={t_end:.0}K, U={:.3e}",
         engine.state.potential_energy
-    );
+    ));
     Ok(())
 }
 

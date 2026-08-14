@@ -20,7 +20,7 @@ pub mod topology;
 pub mod ffi;
 
 pub use actions::{ActionMask, EnvDelta, ForceAction};
-pub use builder::{BuildOptions, build_system};
+pub use builder::{BuildOptions, build_system, build_mutant_by_solvent_reuse};
 pub use domain::{EnvGrid, StabilityConfig, StabilityPoint, is_stable, scan_stability};
 pub use engine::{SpiceEngine, StepResult};
 pub use env::EnvParams;

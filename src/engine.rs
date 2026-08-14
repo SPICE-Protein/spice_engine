@@ -27,6 +27,8 @@ pub struct StepResult {
     /// Simulation time, ps.
     pub time_ps: f64,
     pub crashed: bool,
+    /// Reason of the crash, if crashed.
+    pub crash_reason: Option<String>,
 }
 
 /// SPICE's MD engine: one protein + solvent system plus its topology and env.
@@ -57,6 +59,26 @@ impl SpiceEngine {
 
         let u_kcal = self.state.potential_energy;
         let crashed = !u_kcal.is_finite() || u_kcal > CRASH_ENERGY_KCAL;
+
+        let mut crash_reason = None;
+        if crashed {
+            if !u_kcal.is_finite() {
+                crash_reason = Some("potential_energy_nan".to_string());
+                // Find first atom with non-finite position
+                for (i, a) in self.state.atoms.iter().enumerate() {
+                    if !a.posit.x.is_finite() || !a.posit.y.is_finite() || !a.posit.z.is_finite() {
+                        let res_desc = self.topology.residues.iter()
+                            .find(|r| r.atom_indices.contains(&i))
+                            .map(|r| format!("{} (seq_id: {})", r.one_letter, r.seq_id))
+                            .unwrap_or_else(|| "unknown_residue".to_string());
+                        crash_reason = Some(format!("nan_coordinates_at_atom_index_{}_in_residue_{}", i, res_desc));
+                        break;
+                    }
+                }
+            } else if u_kcal > CRASH_ENERGY_KCAL {
+                crash_reason = Some(format!("potential_energy_spike_exceeded_crash_threshold_{:.2e}_kcal", u_kcal));
+            }
+        }
 
         if u_kcal.is_finite() {
             self.u_history.push_back(u_kcal);
@@ -92,6 +114,7 @@ impl SpiceEngine {
             step_count: self.state.step_count,
             time_ps: self.state.time,
             crashed,
+            crash_reason,
         }
     }
 
@@ -117,11 +140,20 @@ impl SpiceEngine {
         }
     }
 
-    /// Time-averaged Cα coordinates (Å), the pseudo-label source. Empty until
-    /// at least one finite step has been taken.
+    /// Time-averaged Cα coordinates (Å), the pseudo-label source. Falls back
+    /// to current coordinates when no steps have been accumulated.
     pub fn time_averaged_ca(&self) -> Vec<[f32; 3]> {
         if self.ca_n == 0 {
-            return Vec::new();
+            // Fallback: return instantaneous coordinates of current state
+            return self
+                .topology
+                .ca_indices
+                .iter()
+                .map(|&i| {
+                    let p = self.state.atoms[i].posit;
+                    [p.x, p.y, p.z]
+                })
+                .collect();
         }
         let inv = 1.0 / self.ca_n as f64;
         self.ca_acc

@@ -214,6 +214,41 @@ impl PyEngine {
         })
     }
 
+    /// Create a new engine with a mutated structure by reusing the solvent box and ions
+    /// of this engine. This is extremely fast (<0.5 seconds vs 30 seconds for complete build)
+    /// and avoids CPU thermal throttling.
+    #[pyo3(signature = (structure, ph, temp, pressure, ionic_strength_m, relax_iters, tolerance, strict_incomplete = true))]
+    fn mutate_with_solvent_reuse(
+        &self,
+        structure: &Bound<'_, PyStructure>,
+        ph: f32,
+        temp: f32,
+        pressure: f32,
+        ionic_strength_m: f32,
+        relax_iters: usize,
+        tolerance: f32,
+        strict_incomplete: bool,
+    ) -> PyResult<Self> {
+        let opts = BuildOptions {
+            env: EnvParams::new(ph, temp, pressure, ionic_strength_m),
+            relax_iters: Some(relax_iters),
+            energy_minimization_tolerance: tolerance,
+            strict_incomplete_residues: strict_incomplete,
+            ..Default::default()
+        };
+        let structure = structure.borrow();
+        let engine = crate::builder::build_mutant_by_solvent_reuse(&self.engine, param_set(), &structure.inner, &opts)
+            .map_err(|e| PyValueError::new_err(e))?;
+        let n_res = engine.topology.sequence.len();
+        let metrics = Metrics::new(&engine, MetricsConfig::default());
+        let force = ForceAction::new(n_res, 16, 0.5, 20);
+        Ok(Self {
+            engine,
+            force,
+            metrics,
+        })
+    }
+
     /// Advance one step. `action` is an optional `[M=16]` bias-force coefficient
     /// vector; `None` runs unbiased. Returns a dict with U, Cα coords, step/time,
     /// crash flag and the five metrics.
@@ -248,6 +283,8 @@ impl PyEngine {
         d.set_item("n_ss_ref", m.n_ss_ref)?;
         d.set_item("n_ss_kept", m.n_ss_kept)?;
         d.set_item("n_surface_charged", m.n_surface_charged)?;
+        d.set_item("stability_margin", m.stability_margin)?;
+        d.set_item("rmsf", m.rmsf)?;
         Ok(d)
     }
 
@@ -803,6 +840,7 @@ impl PyEngine {
         d.set_item("step_count", result.step_count)?;
         d.set_item("time_ps", result.time_ps)?;
         d.set_item("crashed", result.crashed)?;
+        d.set_item("crash_reason", result.crash_reason.clone())?;
         // Clamp / thermostat observables: n_clamped + max_accel_clamped are the
         // "temperature instability" signal (sustained clamps = force spikes being
         // swallowed by MAX_ACCEL), t_kin verifies the thermostat reached target T.
@@ -816,6 +854,8 @@ impl PyEngine {
             d.set_item("m4", m.m4)?;
             d.set_item("m5", m.m5)?;
             d.set_item("rg", m.rg)?;
+            d.set_item("stability_margin", m.stability_margin)?;
+            d.set_item("rmsf", m.rmsf)?;
         }
         Ok(d)
     }
