@@ -37,7 +37,7 @@ use pyo3::prelude::*;
 pub fn log_print(msg: String) {
     #[cfg(feature = "python")]
     {
-        pyo3::Python::with_gil(|py| {
+        pyo3::Python::attach(|py| {
             if let Ok(sys) = py.import("sys") {
                 if let Ok(stdout) = sys.getattr("stdout") {
                     let _ = stdout.call_method1("write", (format!("{}\n", msg),));
@@ -53,7 +53,7 @@ pub fn log_print(msg: String) {
 pub fn log_eprint(msg: String) {
     #[cfg(feature = "python")]
     {
-        pyo3::Python::with_gil(|py| {
+        pyo3::Python::attach(|py| {
             if let Ok(sys) = py.import("sys") {
                 if let Ok(stderr) = sys.getattr("stderr") {
                     let _ = stderr.call_method1("write", (format!("{}\n", msg),));
