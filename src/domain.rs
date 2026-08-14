@@ -596,6 +596,22 @@ fn probe_point(
 
 /// Evaluate one point in a `scan_stability` group (probe + progress line) with
 /// template reuse. `tag` is appended to the progress line (e.g. `[screen]`).
+fn log_progress(msg: String, inc: bool) {
+    let mut printed = false;
+    if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
+        if !pb.is_hidden() {
+            pb.println(&msg);
+            printed = true;
+        }
+        if inc {
+            pb.inc(1);
+        }
+    }
+    if !printed {
+        crate::log_eprint(msg);
+    }
+}
+
 fn eval_group_point(
     dev: &dynamics::ComputationDevice,
     param_set: &dynamics::params::FfParamSet,
@@ -625,12 +641,7 @@ fn eval_group_point(
             env.ph,
             pt.crashed,
         );
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(log_line);
-            pb.inc(1);
-        } else {
-            eprintln!("{}", log_line);
-        }
+        log_progress(log_line, true);
     }
     pt
 }
@@ -643,12 +654,7 @@ fn pruned_group_point(env: EnvParams, cfg: &StabilityConfig, reason: &str) -> St
             env.temp_k,
             env.ph,
         );
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(log_line);
-            pb.inc(1);
-        } else {
-            eprintln!("{}", log_line);
-        }
+        log_progress(log_line, true);
     }
     StabilityPoint {
         env,
@@ -764,20 +770,6 @@ fn bold_walk(
     }
 }
 
-/// Two-stage parallel stability scan.
-///
-/// **Stage 1** fixes the reference temperature and screens every build-env
-/// column (one pH) to determine the VIABLE pH range (builds + runs without a
-/// majority crash). **Stage 2** walks temperature only within the viable
-/// columns (bold dynamic-step walk); dead columns are pruned outright. This is
-/// the "fix the other dims, find the viable pH range first, then scan T"
-/// Two-stage parallel stability scan.
-///
-/// **Stage 1** fixes the reference temperature and screens every build-env
-/// column (one pH) to determine the VIABLE pH range (builds + runs without a
-/// majority crash). **Stage 2** walks temperature only within the viable
-/// columns (bold dynamic-step walk); dead columns are pruned outright. This is
-/// the "fix the other dims, find the viable pH range first, then scan T"
 /// strategy — no T-scan is wasted on a pH that cannot even build.
 pub fn scan_stability(
     dev: &dynamics::ComputationDevice,
@@ -807,11 +799,9 @@ pub fn scan_stability(
     }
 
     if cfg.progress {
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(format!(
-                "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
-            ));
-        }
+        log_progress(format!(
+            "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
+        ), false);
     }
     // Partition mesh points by build-env key; each group reuses one solvated +
     // minimized template (the LAMMPS velocity-create sweep pattern), so solvent
@@ -823,13 +813,11 @@ pub fn scan_stability(
 
     // ---- Stage 1 (parallel): screen each column at its reference temperature.
     if cfg.progress {
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(format!(
-                "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
-                groups.len(),
-                cfg.anchor_temp,
-            ));
-        }
+        log_progress(format!(
+            "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
+            groups.len(),
+            cfg.anchor_temp,
+        ), false);
     }
     let screened: Vec<(
         (u32, bool, u32),
@@ -871,12 +859,10 @@ pub fn scan_stability(
 
     if cfg.progress {
         let stable_cols = screened.iter().filter(|(_, _, p, _, _)| p.stable).count();
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(format!(
-                "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
-                screened.len(),
-            ));
-        }
+        log_progress(format!(
+            "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
+            screened.len(),
+        ), false);
     }
 
     // ---- Stage 2 (parallel): walk T within each column, reusing its template.
@@ -1122,12 +1108,7 @@ fn report_point(
         env.ph,
         pt.crashed,
     );
-    if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-        pb.println(log_line);
-        pb.inc(1);
-    } else {
-        eprintln!("{}", log_line);
-    }
+    log_progress(log_line, true);
 }
 
 /// Adaptive (coarse-to-fine) probe of one ray — the DL-style "big step first,
@@ -1239,12 +1220,10 @@ pub fn scan_radial(
     }
 
     if cfg.progress {
-        if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-            pb.println(format!(
-                "[stability] scanning up to {total} candidate points across {} rays",
-                jobs.len()
-            ));
-        }
+        log_progress(format!(
+            "[stability] scanning up to {total} candidate points across {} rays",
+            jobs.len()
+        ), false);
     }
 
     let results: Vec<RadialResult> = jobs.par_iter()
@@ -1255,19 +1234,17 @@ pub fn scan_radial(
                 .expect("probe for axis");
             let env = axis.step(anchor, direction, probe.step);
             if cfg.progress {
-                if let Some(pb) = &*PROGRESS_BAR.lock().unwrap() {
-                    pb.println(format!(
-                        "[stability] ray {axis:?}/{direction:?}: T={:.0} pH={:.1} (up to {} pts, {})",
-                        env.temp_k,
-                        env.ph,
-                        probe.max_steps,
-                        if axis == Axis::Ph {
-                            "rebuild per pt"
-                        } else {
-                            "template reuse"
-                        },
-                    ));
-                }
+                log_progress(format!(
+                    "[stability] ray {axis:?}/{direction:?}: T={:.0} pH={:.1} (up to {} pts, {})",
+                    env.temp_k,
+                    env.ph,
+                    probe.max_steps,
+                    if axis == Axis::Ph {
+                        "rebuild per pt"
+                    } else {
+                        "template reuse"
+                    },
+                ), false);
             }
             // One reusable template per ray: temp / pressure / ionic rays share
             // the same build across points (only the runtime T changes); ph rays

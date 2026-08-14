@@ -30,3 +30,38 @@ pub use mutate::{Mutation, apply_mutations, validate_sequence};
 pub use pool::{EnginePool, EngineWorker};
 pub use structure::{AtomInput, StructureInput, atoms_to_mmcif, build_from_input};
 pub use topology::{ProteinTopology, ResidueInfo};
+
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+pub fn log_print(msg: String) {
+    #[cfg(feature = "python")]
+    {
+        Python::with_gil(|py| {
+            if let Ok(sys) = py.import("sys") {
+                if let Ok(stdout) = sys.getattr("stdout") {
+                    let _ = stdout.call_method1("write", (format!("{}\n", msg),));
+                    let _ = stdout.call_method1("flush", ());
+                    return;
+                }
+            }
+        });
+    }
+    println!("{}", msg);
+}
+
+pub fn log_eprint(msg: String) {
+    #[cfg(feature = "python")]
+    {
+        Python::with_gil(|py| {
+            if let Ok(sys) = py.import("sys") {
+                if let Ok(stderr) = sys.getattr("stderr") {
+                    let _ = stderr.call_method1("write", (format!("{}\n", msg),));
+                    let _ = stderr.call_method1("flush", ());
+                    return;
+                }
+            }
+        });
+    }
+    eprintln!("{}", msg);
+}
