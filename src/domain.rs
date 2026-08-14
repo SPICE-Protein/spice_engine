@@ -1323,6 +1323,8 @@ mod tests {
             n_ss_ref: 290,
             n_ss_kept: 290,
             n_surface_charged: 17,
+            stability_margin: 1.0,
+            rmsf: 0.0,
         }
     }
 

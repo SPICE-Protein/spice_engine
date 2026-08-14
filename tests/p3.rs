@@ -45,6 +45,7 @@ fn mmcif_to_structure(mm: &MmCif) -> StructureInput {
                 x: a.posit.x as f32,
                 y: a.posit.y as f32,
                 z: a.posit.z as f32,
+                occupancy: a.occupancy.unwrap_or(1.0),
             });
         }
     }
