@@ -12,6 +12,7 @@ pub mod env;
 pub mod equilibrate;
 pub mod metrics;
 pub mod mutate;
+pub mod pocket;
 pub mod pool;
 pub mod structure;
 pub mod topology;
@@ -27,6 +28,11 @@ pub use env::EnvParams;
 pub use equilibrate::{EquilConfig, equilibrate};
 pub use metrics::{Metrics, MetricsConfig, MetricsResult};
 pub use mutate::{Mutation, apply_mutations, validate_sequence};
+pub use pocket::{
+    GridStatus, NativePocket, AdvancedPocketFeatures, PocketDelta,
+    calculate_pockets_native, calculate_engine_pockets, is_atom_hydrophobic,
+    calculate_advanced_features, calculate_pocket_delta, analyze_pocket_trajectory
+};
 pub use pool::{EnginePool, EngineWorker};
 pub use structure::{AtomInput, StructureInput, atoms_to_mmcif, build_from_input};
 pub use topology::{ProteinTopology, ResidueInfo};

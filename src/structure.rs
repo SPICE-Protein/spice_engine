@@ -158,8 +158,22 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
     let mut chain_res_sns: Vec<u32> = Vec::with_capacity(by_res.len());
     let mut next_serial: u32 = 1;
 
-    let n_res = by_res.len();
-    for (res_idx, (res_seq, res_atoms)) in by_res.iter().enumerate() {
+    // 结晶水（HOH/WAT/SOL/H2O/DOD）不能进蛋白 MD：水 O 的 type_in_res="O" 在
+    // 氨基酸模板里没有 FF type → "Atom missing FF type"（1R2I 的 214 个 HOH 触发）。
+    // 调用方应先脱去结晶水；这里引擎兜底跳过水残基（与 from_mmcif 一致），保证
+    // StructureInput（from_atoms / Tauri GUI）路径也安全。
+    let is_water = |a: &AtomInput| {
+        matches!(a.res_name.as_str(), "HOH" | "WAT" | "SOL" | "H2O" | "DOD")
+    };
+    let kept_res: Vec<&Vec<&AtomInput>> = by_res
+        .values()
+        .filter(|ra| !ra.is_empty() && !is_water(ra[0]))
+        .collect();
+    if kept_res.is_empty() {
+        return Err("StructureInput has no protein residues (all atoms are waters)".to_string());
+    }
+    let n_res = kept_res.len();
+    for (res_idx, res_atoms) in kept_res.iter().enumerate() {
         // Residue end tagging determines which charge map (internal/n/c-term) is used.
         let end = if res_idx == 0 {
             ResidueEnd::NTerminus
@@ -203,9 +217,6 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
             atom_sns,
             end,
         });
-
-        // (res_seq retained only for grouping; MmCif uses internal serial numbers)
-        let _ = res_seq;
     }
 
     let chains = vec![ChainGeneric {
