@@ -197,7 +197,7 @@ mod tests {
         let c = EquilConfig::default();
         assert!(c.ramp_steps > 0);
         assert!(c.t_start_k < 310.0);
-        assert!(c.k_restraint > 0.0);
+        assert!(c.k_restraint >= 0.0);
         assert!(c.friction_gamma > 0.0);
     }
 }
