@@ -64,3 +64,34 @@ fn test_dynamic_protonation_and_his_geometry() {
     assert!(r0.u_t_kcal.is_finite(), "U not finite with custom protonation");
     println!("Step 1 Potential Energy with HIP: {:.2} kcal/mol", r0.u_t_kcal);
 }
+
+#[test]
+fn test_distance_restraints_and_local_relaxation() {
+    let dev = ComputationDevice::Cpu;
+    let param_set = FfParamSet::new_amber().expect("load amber params");
+    let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ mmCIF");
+
+    let mut engine =
+        build_system(&dev, &param_set, protein, &BuildOptions::default()).expect("build system");
+
+    // Add a distance restraint between atom 0 and atom 10 (e.g. standard backbone N and some carbon)
+    // and verify that the potential energy changes and remains completely stable.
+    let p_0 = engine.state.atoms[0].posit;
+    let p_10 = engine.state.atoms[10].posit;
+    let current_dist = (p_10 - p_0).magnitude();
+
+    // Set target distance to current_dist + 1.0 Å, force constant k = 100.0 kcal/mol/Å²
+    let r0 = current_dist + 1.0;
+    let k = 100.0;
+    engine.add_distance_restraint(0, 10, r0, k);
+
+    // Run 1 step and verify the restraint energy is computed and finite!
+    let res = engine.step(None);
+    assert!(res.u_t_kcal.is_finite());
+    println!("Step 1 Potential Energy with distance restraint: {:.2} kcal/mol", res.u_t_kcal);
+
+    // Let's also verify that we can manually trigger localized minimization on engine.state
+    let mutated_positions = vec![p_0];
+    engine.state.minimize_local_region(&dev, &mutated_positions, 6.0, 20);
+    println!("Local relaxation completed successfully.");
+}

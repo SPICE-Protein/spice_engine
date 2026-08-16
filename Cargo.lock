@@ -343,7 +343,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 [[package]]
 name = "dynamics"
 version = "0.2.0"
-source = "git+https://github.com/SPICE-Protein/dynamics.git#db5d38f594a7773840e854981918e62fe4eab4dc"
+source = "git+https://github.com/SPICE-Protein/dynamics.git#25990d7095b3c0dcb6571373d4a18999286e32f4"
 dependencies = [
  "bincode",
  "bio_apis",

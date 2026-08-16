@@ -178,4 +178,14 @@ impl SpiceEngine {
         self.ca_acc = vec![[0.0f64; 3]; n];
         self.ca_n = 0;
     }
+
+    /// Register a harmonic distance restraint between two atoms (e.g. for AlphaFold 3 ligand/ion coordination).
+    pub fn add_distance_restraint(&mut self, atom_0_idx: usize, atom_1_idx: usize, r0: f32, k: f32) {
+        self.state.distance_restraints.push(dynamics::DistanceRestraint {
+            atom_0_idx,
+            atom_1_idx,
+            r0,
+            k,
+        });
+    }
 }

@@ -299,6 +299,11 @@ impl PyEngine {
         PyArray2::from_vec2(py, &avg).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// Add a harmonic distance restraint between two atoms (e.g. for AlphaFold 3 ligand/ion coordination).
+    fn add_distance_restraint(&mut self, atom_0_idx: usize, atom_1_idx: usize, r0: f32, k: f32) {
+        self.engine.add_distance_restraint(atom_0_idx, atom_1_idx, r0, k);
+    }
+
     /// Current Cα coordinates `[L, 3]`.
     fn coords_ca<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let coords: Vec<Vec<f32>> = self

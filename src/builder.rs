@@ -218,10 +218,38 @@ pub fn build_mutant_by_solvent_reuse(
         ca_n: 0,
     };
 
-    // Run a fast energy minimization on the mutated system to resolve sidechain clashes!
-    // 100-200 iterations are plenty and take <0.2 seconds because water is already minimized.
+    // Identify mutated residues by comparing parent and mutant sequences
+    let mut mutated_residue_indices = Vec::new();
+    for (i, (c1, c2)) in parent.topology.sequence.chars().zip(engine.topology.sequence.chars()).enumerate() {
+        if c1 != c2 {
+            mutated_residue_indices.push(i);
+        }
+    }
+
+    let mut mutated_positions = Vec::new();
+    for &r_idx in &mutated_residue_indices {
+        if r_idx < engine.topology.residues.len() {
+            for &atom_idx in &engine.topology.residues[r_idx].atom_indices {
+                if atom_idx < engine.state.atoms.len() {
+                    mutated_positions.push(engine.state.atoms[atom_idx].posit);
+                }
+            }
+        }
+    }
+
+    // Run the fast localized L-BFGS minimization around mutated positions
+    // to relieve any steric conflicts with the reused solvent box or ions.
     if let Some(relax_iters) = opts.relax_iters {
-        engine.state.minimize_energy(dev, relax_iters, None);
+        if !mutated_positions.is_empty() {
+            engine.state.minimize_local_region(
+                dev,
+                &mutated_positions,
+                6.0, // 6.0 Å search radius
+                relax_iters,
+            );
+        } else {
+            engine.state.minimize_energy(dev, relax_iters, None);
+        }
     }
 
     Ok(engine)
