@@ -31,7 +31,7 @@ fn debug_prep() {
     );
 
     let (bonds, _dih) =
-        prepare_peptide_mmcif(&mut protein, &param_set.peptide_ff_q_map.as_ref().unwrap(), 7.0, true)
+        prepare_peptide_mmcif(&mut protein, &param_set.peptide_ff_q_map.as_ref().unwrap(), 7.0, None, true)
             .unwrap();
     let n = protein.atoms.len();
     println!("atoms after prep: {n}, bonds: {}", bonds.len());

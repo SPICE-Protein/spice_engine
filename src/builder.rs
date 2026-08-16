@@ -28,11 +28,13 @@ pub struct BuildOptions {
     /// `None` disables it (fast build, but residual strain can crash MD early).
     pub equil: Option<EquilConfig>,
     /// Reject structures with residues missing their sidechain heavy atoms
-    /// (disordered crystal sidechains). Default `true`: fail with a clear error
+    /// (disordered crystal sidechains). Default `true`: fail with a? clear error
     /// listing the incomplete residues. Set `false` to build them truncated
     /// (backbone + Cα H only, with a warning) — physics is wrong for those
     /// residues, so only use this to explore.
     pub strict_incomplete_residues: bool,
+    /// Optional dynamic protonation map resolved from PROPKA/H++
+    pub custom_protonation: Option<std::collections::HashMap<usize, na_seq::AminoAcidProtenationVariant>>,
 }
 
 impl Default for BuildOptions {
@@ -51,6 +53,7 @@ impl Default for BuildOptions {
             equil: None,
             // Reject truncated residues by default (honest physics).
             strict_incomplete_residues: true,
+            custom_protonation: None,
         }
     }
 }
@@ -78,6 +81,7 @@ pub fn build_system(
         &mut protein,
         ff_map,
         opts.env.ph,
+        opts.custom_protonation.as_ref(),
         opts.strict_incomplete_residues,
     )
     .map_err(|e| e.to_string())?;
@@ -163,6 +167,7 @@ pub fn build_mutant_by_solvent_reuse(
         &mut protein,
         ff_map,
         opts.env.ph,
+        opts.custom_protonation.as_ref(),
         opts.strict_incomplete_residues,
     )
     .map_err(|e| e.to_string())?;
