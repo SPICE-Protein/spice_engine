@@ -36,7 +36,7 @@ python = ["dep:pyo3", "dep:numpy"]
 # a Rust panic into a Python exception. `panic = "abort"` would kill the host.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = true
 codegen-units = 1
 strip = "symbols"
 

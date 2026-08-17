@@ -3,3 +3,7 @@
 # Works for both local dev and deployment (any machine with a working git/SSH).
 [net]
 git-fetch-with-cli = true
+
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "llvm-args=--fp-contract=off"]
+
