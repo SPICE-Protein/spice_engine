@@ -343,7 +343,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 [[package]]
 name = "dynamics"
 version = "0.2.0"
-source = "git+https://github.com/SPICE-Protein/dynamics.git#85b4000c8484c5daed93f8cc3506c1b2078ff500"
+source = "git+https://github.com/SPICE-Protein/dynamics.git#602ca2a1ed97620a0286b504317861f4ea53398b"
 dependencies = [
  "bincode",
  "bio_apis",
@@ -395,7 +395,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "ewald"
 version = "0.1.14"
-source = "git+https://github.com/SPICE-Protein/ewald.git#28c1eef6d754c043fa7483ba8bcf8f18f70cecc2"
+source = "git+https://github.com/SPICE-Protein/ewald.git#936624617d21c0871ddad337d1a40b5aa25a6aff"
 dependencies = [
  "cc",
  "lin_alg",
