@@ -608,7 +608,7 @@ fn log_progress(msg: String, inc: bool) {
         }
     }
     if !printed {
-        crate::log_eprint(msg);
+        eprintln!("{}", msg);
     }
 }
 
