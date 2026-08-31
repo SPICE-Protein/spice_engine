@@ -343,7 +343,6 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 [[package]]
 name = "dynamics"
 version = "0.2.0"
-source = "git+https://github.com/SPICE-Protein/dynamics.git#602ca2a1ed97620a0286b504317861f4ea53398b"
 dependencies = [
  "bincode",
  "bio_apis",
@@ -360,6 +359,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_distr 0.6.0",
  "rayon",
+ "wide",
 ]
 
 [[package]]
@@ -1825,7 +1825,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spice_engine"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "bio_files",
  "dynamics",
@@ -1835,6 +1835,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "rayon",
+ "wide",
 ]
 
 [[package]]

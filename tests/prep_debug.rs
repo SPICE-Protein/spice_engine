@@ -2,8 +2,8 @@
 //! Kept as #[ignore] — run explicitly with `cargo test --release -- --ignored prep_debug`.
 
 use bio_files::MmCif;
-use dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use dynamics::ComputationDevice;
+use dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use na_seq::{AtomTypeInRes, Element};
 use std::collections::HashSet;
 use std::path::Path;
@@ -30,9 +30,14 @@ fn debug_prep() {
         protein.residues.len()
     );
 
-    let (bonds, _dih) =
-        prepare_peptide_mmcif(&mut protein, &param_set.peptide_ff_q_map.as_ref().unwrap(), 7.0, None, true)
-            .unwrap();
+    let (bonds, _dih) = prepare_peptide_mmcif(
+        &mut protein,
+        &param_set.peptide_ff_q_map.as_ref().unwrap(),
+        7.0,
+        None,
+        true,
+    )
+    .unwrap();
     let n = protein.atoms.len();
     println!("atoms after prep: {n}, bonds: {}", bonds.len());
 
@@ -56,7 +61,10 @@ fn debug_prep() {
             dup += 1;
         }
     }
-    println!("bonds referencing a missing serial: {missing} / {}", bonds.len());
+    println!(
+        "bonds referencing a missing serial: {missing} / {}",
+        bonds.len()
+    );
     println!("bonds where atom_0_sn is duplicated: {dup}");
     for b in bonds.iter().take(6) {
         println!("  bond {} - {}", b.atom_0_sn, b.atom_1_sn);
@@ -71,13 +79,18 @@ fn debug_prep() {
                 .or_insert(0) += 1;
         }
     }
-    println!(
-        "CA atoms by ff_type: {ca_types:?}"
-    );
+    println!("CA atoms by ff_type: {ca_types:?}");
 
     // Inspect the atoms that blow up on step 1 (backbone serials).
-    let target: std::collections::HashSet<u32> = [40u32, 41, 47, 86, 87, 143, 145, 208, 210, 237, 251].into_iter().collect();
-    for a in protein.atoms.iter().filter(|a| target.contains(&a.serial_number)) {
+    let target: std::collections::HashSet<u32> =
+        [40u32, 41, 47, 86, 87, 143, 145, 208, 210, 237, 251]
+            .into_iter()
+            .collect();
+    for a in protein
+        .atoms
+        .iter()
+        .filter(|a| target.contains(&a.serial_number))
+    {
         let res = protein
             .residues
             .iter()
@@ -91,7 +104,9 @@ fn debug_prep() {
     // bonds involving the step-1 exploding atoms CZ(40)/NH1(41) of Arg #5
     let mut b: Vec<(u32, u32)> = bonds
         .iter()
-        .filter(|b| b.atom_0_sn == 40 || b.atom_1_sn == 40 || b.atom_0_sn == 41 || b.atom_1_sn == 41)
+        .filter(|b| {
+            b.atom_0_sn == 40 || b.atom_1_sn == 40 || b.atom_0_sn == 41 || b.atom_1_sn == 41
+        })
         .map(|b| (b.atom_0_sn, b.atom_1_sn))
         .collect();
     b.sort();
@@ -133,8 +148,15 @@ fn debug_prep() {
                 .iter()
                 .filter(|b| b.serial_number != sn)
                 .map(|b| {
-                    let d = ((b.posit.x - px).powi(2) + (b.posit.y - py).powi(2) + (b.posit.z - pz).powi(2)).sqrt();
-                    (b.serial_number, b.type_in_res_general.as_deref().unwrap_or("?"), d)
+                    let d = ((b.posit.x - px).powi(2)
+                        + (b.posit.y - py).powi(2)
+                        + (b.posit.z - pz).powi(2))
+                    .sqrt();
+                    (
+                        b.serial_number,
+                        b.type_in_res_general.as_deref().unwrap_or("?"),
+                        d,
+                    )
                 })
                 .filter(|(_, _, d)| *d < 2.0)
                 .collect();
@@ -145,7 +167,9 @@ fn debug_prep() {
                 .collect();
             println!(
                 "HOT i={idx} sn={sn} name={} ff={:?} res={res:?}  near(<2Å): {}",
-                a.type_in_res_general.as_deref().unwrap_or("?"), a.force_field_type, near_s.join(", ")
+                a.type_in_res_general.as_deref().unwrap_or("?"),
+                a.force_field_type,
+                near_s.join(", ")
             );
         }
     }
@@ -169,7 +193,9 @@ fn debug_prep() {
             let a = &st.atoms[i];
             println!(
                 "  atom {i}: ff={} elm={:?} q_e={:.4}",
-                a.force_field_type, a.element, a.partial_charge / scaler
+                a.force_field_type,
+                a.element,
+                a.partial_charge / scaler
             );
         }
         let n = st.atoms.len();
@@ -179,7 +205,10 @@ fn debug_prep() {
             if a.static_ {
                 continue;
             }
-            let m = ((a.force.x as f64).powi(2) + (a.force.y as f64).powi(2) + (a.force.z as f64).powi(2)).sqrt();
+            let m = ((a.force.x as f64).powi(2)
+                + (a.force.y as f64).powi(2)
+                + (a.force.z as f64).powi(2))
+            .sqrt();
             n_moved += 1;
             sum_sq += m * m;
             if m > max_f {
@@ -195,7 +224,9 @@ fn debug_prep() {
         );
         println!(
             "  n_atoms={n} n_waters={}  U_bonded={:.1} U_nonbonded={:.1}",
-            st.water.len(), st.potential_energy_bonded, st.potential_energy_nonbonded
+            st.water.len(),
+            st.potential_energy_bonded,
+            st.potential_energy_nonbonded
         );
     }
 
@@ -203,7 +234,10 @@ fn debug_prep() {
     println!("\n[production 310K] running 6 steps");
     for _ in 0..6 {
         let r = engine.step(None);
-        println!("  step {}: U={:.1} crashed={}", r.step_count, r.u_t_kcal, r.crashed);
+        println!(
+            "  step {}: U={:.1} crashed={}",
+            r.step_count, r.u_t_kcal, r.crashed
+        );
         if r.crashed {
             break;
         }
@@ -216,8 +250,7 @@ fn debug_prep() {
         .collect();
     println!("  bonds involving NH2(992): {b992:?}");
     for a in protein.atoms.iter().filter(|a| {
-        matches!(a.type_in_res, Some(AtomTypeInRes::CA))
-            && (200..235).contains(&a.serial_number)
+        matches!(a.type_in_res, Some(AtomTypeInRes::CA)) && (200..235).contains(&a.serial_number)
     }) {
         println!(
             "  sn={} t_in_res={:?} ff={:?}",

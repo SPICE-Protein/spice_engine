@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use na_seq::AminoAcidProtenationVariant;
 use spice_engine::{BuildOptions, build_system};
 
@@ -45,8 +45,12 @@ fn test_dynamic_protonation_and_his_geometry() {
 
     // The two engines should have different charge distributions or atom counts on this His residue
     // because HIP has more hydrogen atoms and a different net charge than HID or HIE.
-    let count_atoms_geom = engine_geom.topology.residues[his_res_idx].atom_indices.len();
-    let count_atoms_custom = engine_custom.topology.residues[his_res_idx].atom_indices.len();
+    let count_atoms_geom = engine_geom.topology.residues[his_res_idx]
+        .atom_indices
+        .len();
+    let count_atoms_custom = engine_custom.topology.residues[his_res_idx]
+        .atom_indices
+        .len();
 
     println!(
         "His {} - Geom-based atoms: {}, Custom (HIP) atoms: {}",
@@ -61,8 +65,14 @@ fn test_dynamic_protonation_and_his_geometry() {
 
     // Let's run a few MD steps to verify physical stability under the custom protonation state.
     let r0 = engine_custom.step(None);
-    assert!(r0.u_t_kcal.is_finite(), "U not finite with custom protonation");
-    println!("Step 1 Potential Energy with HIP: {:.2} kcal/mol", r0.u_t_kcal);
+    assert!(
+        r0.u_t_kcal.is_finite(),
+        "U not finite with custom protonation"
+    );
+    println!(
+        "Step 1 Potential Energy with HIP: {:.2} kcal/mol",
+        r0.u_t_kcal
+    );
 }
 
 #[test]
@@ -88,10 +98,15 @@ fn test_distance_restraints_and_local_relaxation() {
     // Run 1 step and verify the restraint energy is computed and finite!
     let res = engine.step(None);
     assert!(res.u_t_kcal.is_finite());
-    println!("Step 1 Potential Energy with distance restraint: {:.2} kcal/mol", res.u_t_kcal);
+    println!(
+        "Step 1 Potential Energy with distance restraint: {:.2} kcal/mol",
+        res.u_t_kcal
+    );
 
     // Let's also verify that we can manually trigger localized minimization on engine.state
     let mutated_positions = vec![p_0];
-    engine.state.minimize_local_region(&dev, &mutated_positions, 6.0, 20);
+    engine
+        .state
+        .minimize_local_region(&dev, &mutated_positions, 6.0, 20);
     println!("Local relaxation completed successfully.");
 }

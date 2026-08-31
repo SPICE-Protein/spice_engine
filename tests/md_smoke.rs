@@ -18,8 +18,8 @@
 //! `tests/p2.rs` exercises 8 bias-force steps alongside the five physical metrics.
 
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use lin_alg::f32::Vec3;
 use spice_engine::{BuildOptions, build_system};
 use std::path::Path;

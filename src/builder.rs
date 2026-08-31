@@ -9,12 +9,17 @@ use dynamics::{
 use crate::engine::SpiceEngine;
 use crate::env::EnvParams;
 use crate::equilibrate::{EquilConfig, equilibrate};
+use crate::forcefield::{ComputationContent, ForceFieldSelection};
 use crate::topology::ProteinTopology;
 
 /// Options controlling system construction.
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     pub env: EnvParams,
+    /// Physical content being prepared; selects the compatible parameter domain.
+    pub computation_content: ComputationContent,
+    /// Existing force-field family used for this content.
+    pub force_field: ForceFieldSelection,
     /// Box padding (Å) around the solute.
     pub box_padding_angstrom: f32,
     pub hydrogen_constraint: HydrogenConstraint,
@@ -34,13 +39,16 @@ pub struct BuildOptions {
     /// residues, so only use this to explore.
     pub strict_incomplete_residues: bool,
     /// Optional dynamic protonation map resolved from PROPKA/H++
-    pub custom_protonation: Option<std::collections::HashMap<usize, na_seq::AminoAcidProtenationVariant>>,
+    pub custom_protonation:
+        Option<std::collections::HashMap<usize, na_seq::AminoAcidProtenationVariant>>,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             env: EnvParams::default(),
+            computation_content: ComputationContent::Protein,
+            force_field: ForceFieldSelection::Amber19,
             box_padding_angstrom: 10.0,
             hydrogen_constraint: HydrogenConstraint::default(),
             relax_iters: Some(2_000),
@@ -70,6 +78,20 @@ pub fn build_system(
     opts: &BuildOptions,
 ) -> Result<SpiceEngine, String> {
     let mut protein = protein;
+
+    if !opts.force_field.supports_content(opts.computation_content) {
+        return Err(format!(
+            "force field '{}' does not support computation content {:?}",
+            opts.force_field.name(),
+            opts.computation_content
+        ));
+    }
+    // Prepare the selected existing force-field adapter at the build boundary.
+    // Numerical evaluation remains on the legacy dynamics path in v1.1.
+    let _prepared_force_field = opts
+        .force_field
+        .prepare_for_content(opts.computation_content)
+        .map_err(|e| e.to_string())?;
 
     let ff_map = param_set
         .peptide_ff_q_map
@@ -130,6 +152,8 @@ pub fn build_system(
         env: opts.env,
         dev: dev.clone(),
         dt_ps: 0.002,
+        computation_content: opts.computation_content,
+        force_field: opts.force_field,
         u_history: Default::default(),
         ca_acc: vec![[0.0f64; 3]; n_ca],
         ca_n: 0,
@@ -194,7 +218,7 @@ pub fn build_mutant_by_solvent_reuse(
     };
     cfg.overrides.skip_counterion_insertion = true;
     cfg.overrides.skip_water_relaxation = true;
-    
+
     let (mut_solute_state, _) =
         MdState::new(dev, &cfg, &[mol], param_set).map_err(|e| e.to_string())?;
 
@@ -213,6 +237,8 @@ pub fn build_mutant_by_solvent_reuse(
         env: opts.env,
         dev: dev.clone(),
         dt_ps: parent.dt_ps,
+        computation_content: opts.computation_content,
+        force_field: opts.force_field,
         u_history: Default::default(),
         ca_acc: vec![[0.0f64; 3]; n_ca],
         ca_n: 0,
@@ -220,7 +246,13 @@ pub fn build_mutant_by_solvent_reuse(
 
     // Identify mutated residues by comparing parent and mutant sequences
     let mut mutated_residue_indices = Vec::new();
-    for (i, (c1, c2)) in parent.topology.sequence.chars().zip(engine.topology.sequence.chars()).enumerate() {
+    for (i, (c1, c2)) in parent
+        .topology
+        .sequence
+        .chars()
+        .zip(engine.topology.sequence.chars())
+        .enumerate()
+    {
         if c1 != c2 {
             mutated_residue_indices.push(i);
         }

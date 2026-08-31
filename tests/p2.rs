@@ -1,10 +1,12 @@
 //! P2 integration test: five physical metrics + force-basis actions.
 
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use lin_alg::f32::Vec3;
-use spice_engine::{ActionMask, BuildOptions, EnvDelta, ForceAction, Metrics, MetricsConfig, build_system};
+use spice_engine::{
+    ActionMask, BuildOptions, EnvDelta, ForceAction, Metrics, MetricsConfig, build_system,
+};
 use std::path::Path;
 
 #[test]
@@ -18,7 +20,11 @@ fn metrics_and_actions() {
 
     // --- Metrics at reference (native) structure ---
     let metrics = Metrics::new(&engine, MetricsConfig::default());
-    assert!(metrics.rg_ref.is_finite() && metrics.rg_ref > 1.0, "Rg_ref={}", metrics.rg_ref);
+    assert!(
+        metrics.rg_ref.is_finite() && metrics.rg_ref > 1.0,
+        "Rg_ref={}",
+        metrics.rg_ref
+    );
     println!(
         "Rg_ref={:.2}Å, SS_ref={} hbonds",
         metrics.rg_ref,
@@ -58,12 +64,18 @@ fn metrics_and_actions() {
     // --- EnvDelta temperature hot-switch ---
     let delta = EnvDelta::new(10.0, -0.5);
     delta.apply_t(&mut engine);
-    assert_eq!(engine.env.temp_k + 10.0, engine.state.cfg.temp_target, "T hot-switch");
+    assert_eq!(
+        engine.env.temp_k + 10.0,
+        engine.state.cfg.temp_target,
+        "T hot-switch"
+    );
     assert!((delta.effective_ph(7.0) - 6.5).abs() < 1e-6, "pH clamp");
 
     // --- Drive a few steps: bias force + metrics per step ---
     engine.set_temperature(310.0);
-    println!("\nstep | U(kcal/mol) | m1 VarU/kBT | m2 RgΔ | m3 SSloss | m4 clash | m5 surfQ | Rg(Å)");
+    println!(
+        "\nstep | U(kcal/mol) | m1 VarU/kBT | m2 RgΔ | m3 SSloss | m4 clash | m5 surfQ | Rg(Å)"
+    );
     for k in 0..8 {
         let r = fa.step(&mut engine, &a);
         assert!(!r.crashed, "crashed at step {}", r.step_count);
@@ -84,7 +96,11 @@ fn metrics_and_actions() {
     // m1 becomes meaningful once enough U samples accumulate (window ≤ 8 here,
     // so it is the running variance of the whole history — finite and ≥ 0).
     let m_last = metrics.compute(&engine);
-    assert!(m_last.n_surface_charged >= 5, "m5 needs a meaningful surface set, got {}", m_last.n_surface_charged);
+    assert!(
+        m_last.n_surface_charged >= 5,
+        "m5 needs a meaningful surface set, got {}",
+        m_last.n_surface_charged
+    );
     println!(
         "\nfinal: n_ss_ref={} n_ss_kept={} n_surface_charged={}",
         m_last.n_ss_ref, m_last.n_ss_kept, m_last.n_surface_charged

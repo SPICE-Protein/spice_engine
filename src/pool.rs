@@ -111,7 +111,10 @@ impl EnginePool {
 
     /// Collect the five metrics across all workers (aligned with `workers`).
     pub fn metrics_all(&self) -> Vec<MetricsResult> {
-        self.workers.iter().map(|w| w.metrics.compute(&w.engine)).collect()
+        self.workers
+            .iter()
+            .map(|w| w.metrics.compute(&w.engine))
+            .collect()
     }
 
     /// Hot-switch temperature on all workers.

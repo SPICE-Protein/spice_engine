@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use bio_files::{AtomGeneric, ChainGeneric, MmCif, ResidueEnd, ResidueGeneric, ResidueType};
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use na_seq::{AtomTypeInRes, Element};
 
 use crate::builder::{BuildOptions, build_system};
@@ -162,9 +162,8 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
     // 氨基酸模板里没有 FF type → "Atom missing FF type"（1R2I 的 214 个 HOH 触发）。
     // 调用方应先脱去结晶水；这里引擎兜底跳过水残基（与 from_mmcif 一致），保证
     // StructureInput（from_atoms / Tauri GUI）路径也安全。
-    let is_water = |a: &AtomInput| {
-        matches!(a.res_name.as_str(), "HOH" | "WAT" | "SOL" | "H2O" | "DOD")
-    };
+    let is_water =
+        |a: &AtomInput| matches!(a.res_name.as_str(), "HOH" | "WAT" | "SOL" | "H2O" | "DOD");
     let kept_res: Vec<&Vec<&AtomInput>> = by_res
         .values()
         .filter(|ra| !ra.is_empty() && !is_water(ra[0]))

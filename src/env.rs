@@ -71,9 +71,12 @@ impl EnvParams {
     pub fn clamped(mut self) -> Self {
         self.ph = self.ph.clamp(sane::PH_MIN, sane::PH_MAX);
         self.temp_k = self.temp_k.clamp(sane::TEMP_K_MIN, sane::TEMP_K_MAX);
-        self.pressure_bar = self.pressure_bar.clamp(sane::PRESSURE_BAR_MIN, sane::PRESSURE_BAR_MAX);
-        self.ionic_strength_m =
-            self.ionic_strength_m.clamp(sane::IONIC_M_MIN, sane::IONIC_M_MAX);
+        self.pressure_bar = self
+            .pressure_bar
+            .clamp(sane::PRESSURE_BAR_MIN, sane::PRESSURE_BAR_MAX);
+        self.ionic_strength_m = self
+            .ionic_strength_m
+            .clamp(sane::IONIC_M_MIN, sane::IONIC_M_MAX);
         self
     }
 
@@ -86,30 +89,44 @@ impl EnvParams {
     pub fn validate(&self) -> Result<(), String> {
         let mut bad = Vec::new();
         if !(sane::PH_MIN..=sane::PH_MAX).contains(&self.ph) {
-            bad.push(format!("ph={} (range {}-{})", self.ph, sane::PH_MIN, sane::PH_MAX));
+            bad.push(format!(
+                "ph={} (range {}-{})",
+                self.ph,
+                sane::PH_MIN,
+                sane::PH_MAX
+            ));
         }
         if !(sane::TEMP_K_MIN..=sane::TEMP_K_MAX).contains(&self.temp_k) {
             bad.push(format!(
                 "temp_k={} (range {}-{})",
-                self.temp_k, sane::TEMP_K_MIN, sane::TEMP_K_MAX
+                self.temp_k,
+                sane::TEMP_K_MIN,
+                sane::TEMP_K_MAX
             ));
         }
         if !(sane::PRESSURE_BAR_MIN..=sane::PRESSURE_BAR_MAX).contains(&self.pressure_bar) {
             bad.push(format!(
                 "pressure_bar={} (range {}-{})",
-                self.pressure_bar, sane::PRESSURE_BAR_MIN, sane::PRESSURE_BAR_MAX
+                self.pressure_bar,
+                sane::PRESSURE_BAR_MIN,
+                sane::PRESSURE_BAR_MAX
             ));
         }
         if !(sane::IONIC_M_MIN..=sane::IONIC_M_MAX).contains(&self.ionic_strength_m) {
             bad.push(format!(
                 "ionic_strength_m={} (range {}-{})",
-                self.ionic_strength_m, sane::IONIC_M_MIN, sane::IONIC_M_MAX
+                self.ionic_strength_m,
+                sane::IONIC_M_MIN,
+                sane::IONIC_M_MAX
             ));
         }
         if bad.is_empty() {
             Ok(())
         } else {
-            Err(format!("EnvParams out of biological range: {}", bad.join(", ")))
+            Err(format!(
+                "EnvParams out of biological range: {}",
+                bad.join(", ")
+            ))
         }
     }
 }
@@ -147,4 +164,3 @@ mod tests {
         assert!(!e.is_sane());
     }
 }
-

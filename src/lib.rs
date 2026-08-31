@@ -10,10 +10,12 @@ pub mod domain;
 pub mod engine;
 pub mod env;
 pub mod equilibrate;
+pub mod forcefield;
 pub mod metrics;
 pub mod mutate;
 pub mod pocket;
 pub mod pool;
+pub mod rna;
 pub mod structure;
 pub mod topology;
 
@@ -21,19 +23,28 @@ pub mod topology;
 pub mod ffi;
 
 pub use actions::{ActionMask, EnvDelta, ForceAction};
-pub use builder::{BuildOptions, build_system, build_mutant_by_solvent_reuse};
+pub use builder::{BuildOptions, build_mutant_by_solvent_reuse, build_system};
 pub use domain::{EnvGrid, StabilityConfig, StabilityPoint, is_stable, scan_stability};
 pub use engine::{SpiceEngine, StepResult};
 pub use env::EnvParams;
 pub use equilibrate::{EquilConfig, equilibrate};
+pub use forcefield::{
+    Amber19, AtomBlock, BlockForceAccumulator, Charmm36m, ComputationContent, CsrNeighborList,
+    DirectedPair, ForceField, ForceFieldRegion, ForceFieldSelection, Martini3, PairBatch8,
+    PairBlock, PairResult8, ParameterDomain, PreparedForceField, Resolution, SimdBackend,
+    atom_block_index, make_atom_blocks, partition_directed_pairs,
+};
+#[cfg(target_arch = "x86_64")]
+pub use forcefield::{PairBatch16, PairResult16};
 pub use metrics::{Metrics, MetricsConfig, MetricsResult};
 pub use mutate::{Mutation, apply_mutations, validate_sequence};
 pub use pocket::{
-    GridStatus, NativePocket, AdvancedPocketFeatures, PocketDelta,
-    calculate_pockets_native, calculate_engine_pockets, is_atom_hydrophobic,
-    calculate_advanced_features, calculate_pocket_delta, analyze_pocket_trajectory
+    AdvancedPocketFeatures, GridStatus, NativePocket, PocketDelta, analyze_pocket_trajectory,
+    calculate_advanced_features, calculate_engine_pockets, calculate_pocket_delta,
+    calculate_pockets_native, is_atom_hydrophobic,
 };
 pub use pool::{EnginePool, EngineWorker};
+pub use rna::{RnaStructureInput, build_rna_from_input, validate_rna_input};
 pub use structure::{AtomInput, StructureInput, atoms_to_mmcif, build_from_input};
 pub use topology::{ProteinTopology, ResidueInfo};
 

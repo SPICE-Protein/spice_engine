@@ -4,10 +4,12 @@
 //! 3. stability margin and RMSF metrics
 
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
-use spice_engine::{BuildOptions, build_system, build_mutant_by_solvent_reuse, Metrics, MetricsConfig};
+use dynamics::params::FfParamSet;
 use spice_engine::structure::{AtomInput, StructureInput};
+use spice_engine::{
+    BuildOptions, Metrics, MetricsConfig, build_mutant_by_solvent_reuse, build_system,
+};
 use std::path::Path;
 
 #[test]
@@ -28,17 +30,26 @@ fn test_wishlist_features() {
 
     // --- 1. Test pseudo_labels fallback when ca_n == 0 (Wish 1) ---
     let labels = engine.time_averaged_ca();
-    assert!(!labels.is_empty(), "time_averaged_ca should not be empty even when ca_n == 0");
+    assert!(
+        !labels.is_empty(),
+        "time_averaged_ca should not be empty even when ca_n == 0"
+    );
     assert_eq!(labels.len(), engine.topology.ca_indices.len());
 
     // --- 2. Test crash_reason in StepResult (Wish 1) ---
     let r0 = engine.step(None);
-    assert!(r0.crash_reason.is_none() || r0.crashed, "crash_reason should only be Some when crashed");
+    assert!(
+        r0.crash_reason.is_none() || r0.crashed,
+        "crash_reason should only be Some when crashed"
+    );
 
     // --- 3. Test metrics: stability_margin and rmsf (Wish 3) ---
     let metrics_calc = Metrics::new(&engine, MetricsConfig::default());
     let m = metrics_calc.compute(&engine);
-    println!("Initial metrics: margin={:.4}, rmsf={:.4}", m.stability_margin, m.rmsf);
+    println!(
+        "Initial metrics: margin={:.4}, rmsf={:.4}",
+        m.stability_margin, m.rmsf
+    );
     assert!(m.stability_margin.is_finite());
     assert!(m.rmsf.is_finite());
     assert_eq!(m.rmsf, 0.0, "RMSF at step 0 must be 0");
@@ -46,7 +57,10 @@ fn test_wishlist_features() {
     // Run one step to accumulate fluctuation
     engine.step(None);
     let m2 = metrics_calc.compute(&engine);
-    println!("Step 1 metrics: margin={:.4}, rmsf={:.4}", m2.stability_margin, m2.rmsf);
+    println!(
+        "Step 1 metrics: margin={:.4}, rmsf={:.4}",
+        m2.stability_margin, m2.rmsf
+    );
     assert!(m2.rmsf >= 0.0);
     assert!(m2.stability_margin.is_finite());
 
@@ -91,15 +105,26 @@ fn test_wishlist_features() {
         relax_iters: Some(20), // fast relaxation
         ..opts.clone()
     };
-    
+
     println!("Building mutant system via solvent reuse...");
     let start_time = std::time::Instant::now();
     let mut_engine = build_mutant_by_solvent_reuse(&engine, &param_set, &wt_input, &mut_opts);
-    println!("Solvent reuse build completed in: {:?}", start_time.elapsed());
-    
-    assert!(mut_engine.is_ok(), "build_mutant_by_solvent_reuse failed: {:?}", mut_engine.err());
+    println!(
+        "Solvent reuse build completed in: {:?}",
+        start_time.elapsed()
+    );
+
+    assert!(
+        mut_engine.is_ok(),
+        "build_mutant_by_solvent_reuse failed: {:?}",
+        mut_engine.err()
+    );
     let mut_engine = mut_engine.unwrap();
-    assert_eq!(mut_engine.state.water.len(), engine.state.water.len(), "Water molecules count must match parent");
+    assert_eq!(
+        mut_engine.state.water.len(),
+        engine.state.water.len(),
+        "Water molecules count must match parent"
+    );
     assert!(mut_engine.state.atoms.len() > 0);
     println!("All wishlist tests completed successfully!");
 }

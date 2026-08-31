@@ -1,12 +1,12 @@
-use std::path::Path;
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use spice_engine::{
-    build_system, calculate_engine_pockets, calculate_pockets_native, is_atom_hydrophobic,
-    calculate_advanced_features, calculate_pocket_delta, analyze_pocket_trajectory,
-    BuildOptions,
+    BuildOptions, analyze_pocket_trajectory, build_system, calculate_advanced_features,
+    calculate_engine_pockets, calculate_pocket_delta, calculate_pockets_native,
+    is_atom_hydrophobic,
 };
+use std::path::Path;
 
 #[test]
 fn test_pocket_calculation_on_cif() {
@@ -47,10 +47,26 @@ fn test_pocket_calculation_on_cif() {
             bio_files::ResidueType::AminoAcid(aa) => {
                 use na_seq::AminoAcid::*;
                 match aa {
-                    Arg => 'R', His => 'H', Lys => 'K', Asp => 'D', Glu => 'E',
-                    Ser => 'S', Thr => 'T', Asn => 'N', Gln => 'Q', Cys => 'C',
-                    Sec => 'U', Gly => 'G', Pro => 'P', Ala => 'A', Val => 'V',
-                    Ile => 'I', Leu => 'L', Met => 'M', Phe => 'F', Tyr => 'Y',
+                    Arg => 'R',
+                    His => 'H',
+                    Lys => 'K',
+                    Asp => 'D',
+                    Glu => 'E',
+                    Ser => 'S',
+                    Thr => 'T',
+                    Asn => 'N',
+                    Gln => 'Q',
+                    Cys => 'C',
+                    Sec => 'U',
+                    Gly => 'G',
+                    Pro => 'P',
+                    Ala => 'A',
+                    Val => 'V',
+                    Ile => 'I',
+                    Leu => 'L',
+                    Met => 'M',
+                    Phe => 'F',
+                    Tyr => 'Y',
                     Trp => 'W',
                 }
             }
@@ -61,7 +77,10 @@ fn test_pocket_calculation_on_cif() {
     }
 
     // 2. Compute pockets using the raw native API
-    println!("Calculating pockets with raw native API on {} heavy atoms...", coords.len());
+    println!(
+        "Calculating pockets with raw native API on {} heavy atoms...",
+        coords.len()
+    );
     let pockets = calculate_pockets_native(&coords, &residue_indices, &is_hydrophobic, 1.0);
 
     println!("Detected {} pockets using native API.", pockets.len());
@@ -70,9 +89,18 @@ fn test_pocket_calculation_on_cif() {
             "Pocket ID {}: Volume = {:.2} Å³, Druggability = {:.4}, Center = {:?}",
             p.id, p.volume, p.druggability, p.center
         );
-        assert!(p.volume >= 200.0, "pockets should be filtered by minimum volume");
-        assert!(p.druggability >= 0.0 && p.druggability <= 1.0, "druggability score must be in [0, 1]");
-        assert!(!p.surface_residues.is_empty(), "pocket should touch some residues");
+        assert!(
+            p.volume >= 200.0,
+            "pockets should be filtered by minimum volume"
+        );
+        assert!(
+            p.druggability >= 0.0 && p.druggability <= 1.0,
+            "druggability score must be in [0, 1]"
+        );
+        assert!(
+            !p.surface_residues.is_empty(),
+            "pocket should touch some residues"
+        );
     }
 
     // Verify sorting order: descending by volume
@@ -118,11 +146,26 @@ fn test_pocket_calculation_on_engine() {
         // Test Advanced Features
         println!("Testing Advanced Features on first pocket...");
         let adv = calculate_advanced_features(&engine, &pockets[0]);
-        println!("Advanced features: net_charge_at_ph = {:.4} e", adv.net_charge_at_ph);
-        println!("Advanced features: hydrophobic_ratio = {:.4}", adv.hydrophobic_ratio);
-        println!("Advanced features: hydrophobic_centroids len = {}", adv.hydrophobic_centroids.len());
-        println!("Advanced features: hbond_acceptors len = {}", adv.hbond_acceptors.len());
-        println!("Advanced features: hbond_donors len = {}", adv.hbond_donors.len());
+        println!(
+            "Advanced features: net_charge_at_ph = {:.4} e",
+            adv.net_charge_at_ph
+        );
+        println!(
+            "Advanced features: hydrophobic_ratio = {:.4}",
+            adv.hydrophobic_ratio
+        );
+        println!(
+            "Advanced features: hydrophobic_centroids len = {}",
+            adv.hydrophobic_centroids.len()
+        );
+        println!(
+            "Advanced features: hbond_acceptors len = {}",
+            adv.hbond_acceptors.len()
+        );
+        println!(
+            "Advanced features: hbond_donors len = {}",
+            adv.hbond_donors.len()
+        );
 
         assert!(adv.net_charge_at_ph.is_finite());
         assert!(adv.hydrophobic_ratio >= 0.0 && adv.hydrophobic_ratio <= 1.0);
@@ -136,7 +179,10 @@ fn test_pocket_calculation_on_engine() {
             mutant_pocket.voxels.remove(0); // slightly change voxels
         }
         let delta = calculate_pocket_delta(&pockets[0], &mutant_pocket, 1.0);
-        println!("Pocket Delta: volume_delta = {:.2} Å³, Jaccard overlap = {:.4}", delta.volume_delta, delta.jaccard_overlap);
+        println!(
+            "Pocket Delta: volume_delta = {:.2} Å³, Jaccard overlap = {:.4}",
+            delta.volume_delta, delta.jaccard_overlap
+        );
         assert_eq!(delta.volume_delta, 15.0);
         assert!(delta.jaccard_overlap >= 0.0 && delta.jaccard_overlap <= 1.0);
 
@@ -144,7 +190,10 @@ fn test_pocket_calculation_on_engine() {
         println!("Testing Pocket Trajectory analysis (2 samples, step size 1)...");
         let mut mut_engine = engine.clone();
         let (mad, open_prob) = analyze_pocket_trajectory(&mut mut_engine, 2, 1, 1.0, 200.0);
-        println!("Trajectory Analysis: Volume MAD = {:.4} Å³, Open Probability = {:.4}", mad, open_prob);
+        println!(
+            "Trajectory Analysis: Volume MAD = {:.4} Å³, Open Probability = {:.4}",
+            mad, open_prob
+        );
         assert!(mad >= 0.0);
         assert!(open_prob >= 0.0 && open_prob <= 1.0);
     }
@@ -159,7 +208,8 @@ fn test_pockets_on_all_repository_cifs() {
     }
 
     let files = vec![
-        "1R2I.cif", "1T19.cif", "1XJ3.cif", "2LYZ.cif", "4LPX.cif", "5H3G.cif", "7G0M.cif", "8CWC.cif"
+        "1R2I.cif", "1T19.cif", "1XJ3.cif", "2LYZ.cif", "4LPX.cif", "5H3G.cif", "7G0M.cif",
+        "8CWC.cif",
     ];
 
     for file_name in files {
@@ -208,10 +258,26 @@ fn test_pockets_on_all_repository_cifs() {
                 bio_files::ResidueType::AminoAcid(aa) => {
                     use na_seq::AminoAcid::*;
                     match aa {
-                        Arg => 'R', His => 'H', Lys => 'K', Asp => 'D', Glu => 'E',
-                        Ser => 'S', Thr => 'T', Asn => 'N', Gln => 'Q', Cys => 'C',
-                        Sec => 'U', Gly => 'G', Pro => 'P', Ala => 'A', Val => 'V',
-                        Ile => 'I', Leu => 'L', Met => 'M', Phe => 'F', Tyr => 'Y',
+                        Arg => 'R',
+                        His => 'H',
+                        Lys => 'K',
+                        Asp => 'D',
+                        Glu => 'E',
+                        Ser => 'S',
+                        Thr => 'T',
+                        Asn => 'N',
+                        Gln => 'Q',
+                        Cys => 'C',
+                        Sec => 'U',
+                        Gly => 'G',
+                        Pro => 'P',
+                        Ala => 'A',
+                        Val => 'V',
+                        Ile => 'I',
+                        Leu => 'L',
+                        Met => 'M',
+                        Phe => 'F',
+                        Tyr => 'Y',
                         Trp => 'W',
                     }
                 }
@@ -222,7 +288,11 @@ fn test_pockets_on_all_repository_cifs() {
         }
 
         let pockets = calculate_pockets_native(&coords, &residue_indices, &is_hydrophobic, 1.0);
-        println!("File {}: Found {} pockets >= 200.0 Å³", file_name, pockets.len());
+        println!(
+            "File {}: Found {} pockets >= 200.0 Å³",
+            file_name,
+            pockets.len()
+        );
         if let Some(p) = pockets.first() {
             println!(
                 "  Largest Pocket ID {}: Volume = {:.2} Å³, Druggability = {:.4}, Center = {:?}",

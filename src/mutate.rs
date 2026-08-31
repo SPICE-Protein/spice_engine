@@ -71,7 +71,10 @@ pub fn apply_mutations(seq: &str, ms: &[Mutation]) -> Result<String, String> {
             }
         }
         if !found {
-            return Err(format!("invalid target residue '{}' at position {}", m.to, m.position));
+            return Err(format!(
+                "invalid target residue '{}' at position {}",
+                m.to, m.position
+            ));
         }
         chars[m.position] = m.to;
         touched[m.position] = true;

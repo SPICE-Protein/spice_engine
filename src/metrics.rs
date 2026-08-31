@@ -176,7 +176,7 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
     }
     let mut com = (0.0f64, 0.0f64, 0.0f64);
     let mut m_sum = 0.0f64;
-    
+
     let n_heavy = heavy.len();
     let mut masses = Vec::with_capacity(n_heavy);
     let mut positions = Vec::with_capacity(n_heavy);
@@ -216,7 +216,7 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
 fn backbone_hbonds(engine: &SpiceEngine, cutoff: f64) -> Vec<(usize, usize)> {
     let n = engine.topology.sequence.len();
     let mut out = Vec::new();
-    
+
     let mut o_positions = vec![None; n];
     for i in 0..n {
         if let Some(&oi) = engine.topology.o_indices.get(i) {
@@ -318,10 +318,7 @@ impl Metrics {
             .iter()
             .map(|&i| config.vdw.radius(engine.state.atoms[i].element))
             .collect();
-        let positions: Vec<(f64, f64, f64)> = heavy
-            .iter()
-            .map(|&i| pos(engine, i))
-            .collect();
+        let positions: Vec<(f64, f64, f64)> = heavy.iter().map(|&i| pos(engine, i)).collect();
 
         let mut clashes = 0usize;
         let r_factor = config.clash_ratio;
@@ -334,7 +331,7 @@ impl Metrics {
                 let rb = radii[b];
                 let r_sum = (ra + rb) * r_factor;
                 let r_sum_sq = r_sum * r_sum;
-                
+
                 let dx = pa.0 - pb.0;
                 let dy = pa.1 - pb.1;
                 let dz = pa.2 - pb.2;
@@ -367,15 +364,14 @@ impl Metrics {
             }
         }
 
-        let heavy_positions: Vec<(f64, f64, f64)> = heavy
-            .iter()
-            .map(|&i| pos(engine, i))
-            .collect();
+        let heavy_positions: Vec<(f64, f64, f64)> = heavy.iter().map(|&i| pos(engine, i)).collect();
 
         let r2 = self.config.surface_radius * self.config.surface_radius;
 
         for i in 0..n_res {
-            let Some(&cai) = engine.topology.ca_indices.get(i) else { continue };
+            let Some(&cai) = engine.topology.ca_indices.get(i) else {
+                continue;
+            };
             let pc = pos(engine, cai);
             let mut count = 0usize;
             for j in 0..n_heavy {
@@ -414,7 +410,8 @@ impl Metrics {
             let one = engine.topology.residues[i].one_letter;
             let is_nterm = i == 0;
             let is_cterm = i + 1 == n;
-            let Some(ideal) = Self::ideal_charge(one, ph, &self.config.pka, is_nterm, is_cterm) else {
+            let Some(ideal) = Self::ideal_charge(one, ph, &self.config.pka, is_nterm, is_cterm)
+            else {
                 continue;
             };
             let actual = Self::actual_residue_charge(engine, i);
@@ -490,10 +487,15 @@ impl Metrics {
         let ca_avg = engine.time_averaged_ca();
         let mut rmsf = 0.0f64;
         if !ca_avg.is_empty() {
-            let coords_ca: Vec<[f32; 3]> = engine.topology.ca_indices.iter().map(|&i| {
-                let p = engine.state.atoms[i].posit;
-                [p.x, p.y, p.z]
-            }).collect();
+            let coords_ca: Vec<[f32; 3]> = engine
+                .topology
+                .ca_indices
+                .iter()
+                .map(|&i| {
+                    let p = engine.state.atoms[i].posit;
+                    [p.x, p.y, p.z]
+                })
+                .collect();
             if coords_ca.len() == ca_avg.len() {
                 let mut sum_sq = 0.0f64;
                 for (c, avg) in coords_ca.iter().zip(&ca_avg) {

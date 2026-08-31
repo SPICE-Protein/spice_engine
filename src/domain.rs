@@ -13,8 +13,8 @@
 //! as SAC reward / threshold).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -101,7 +101,10 @@ impl EnvGrid {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.temps.is_empty() || self.phs.is_empty() || self.pressures.is_empty() || self.ionics.is_empty()
+        self.temps.is_empty()
+            || self.phs.is_empty()
+            || self.pressures.is_empty()
+            || self.ionics.is_empty()
     }
 }
 
@@ -332,11 +335,7 @@ impl TrendDetector {
             bad += 1;
             reason = "ss_loss";
         }
-        if bad >= 2 {
-            Some(reason)
-        } else {
-            None
-        }
+        if bad >= 2 { Some(reason) } else { None }
     }
 }
 
@@ -354,11 +353,7 @@ fn slope_ps(t: &VecDeque<f64>, y: &VecDeque<f64>) -> f64 {
         num += dt * (y[i] - y_mean);
         den += dt * dt;
     }
-    if den.abs() < 1e-12 {
-        0.0
-    } else {
-        num / den
-    }
+    if den.abs() < 1e-12 { 0.0 } else { num / den }
 }
 
 /// Scan result for a single environment point.
@@ -637,9 +632,7 @@ fn eval_group_point(
         };
         let log_line = format!(
             "[stability] eval {n:>3}: T={:.0} pH={:.1}: {verdict} (crashed={}){tag}",
-            env.temp_k,
-            env.ph,
-            pt.crashed,
+            env.temp_k, env.ph, pt.crashed,
         );
         log_progress(log_line, true);
     }
@@ -651,8 +644,7 @@ fn pruned_group_point(env: EnvParams, cfg: &StabilityConfig, reason: &str) -> St
     if cfg.progress {
         let log_line = format!(
             "[stability] PRUNED: T={:.0} pH={:.1}: {reason}",
-            env.temp_k,
-            env.ph,
+            env.temp_k, env.ph,
         );
         log_progress(log_line, true);
     }
@@ -748,7 +740,9 @@ fn bold_walk(
         for j in (f + 1)..indices.len() {
             let jidx = indices[j];
             results[jidx] = Some(pruned_group_point(
-                envs[jidx], cfg, "monotonic: beyond boundary",
+                envs[jidx],
+                cfg,
+                "monotonic: beyond boundary",
             ));
         }
     } else if let Some(l) = ls {
@@ -764,7 +758,9 @@ fn bold_walk(
         for j in (f + 1)..indices.len() {
             let jidx = indices[j];
             results[jidx] = Some(pruned_group_point(
-                envs[jidx], cfg, "monotonic: beyond boundary",
+                envs[jidx],
+                cfg,
+                "monotonic: beyond boundary",
             ));
         }
     }
@@ -799,9 +795,12 @@ pub fn scan_stability(
     }
 
     if cfg.progress {
-        log_progress(format!(
-            "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
-        ), false);
+        log_progress(
+            format!(
+                "[stability] grid = {total} cells; progress below reports ACTUAL MD simulations as \"eval #\""
+            ),
+            false,
+        );
     }
     // Partition mesh points by build-env key; each group reuses one solvated +
     // minimized template (the LAMMPS velocity-create sweep pattern), so solvent
@@ -813,11 +812,14 @@ pub fn scan_stability(
 
     // ---- Stage 1 (parallel): screen each column at its reference temperature.
     if cfg.progress {
-        log_progress(format!(
-            "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
-            groups.len(),
-            cfg.anchor_temp,
-        ), false);
+        log_progress(
+            format!(
+                "[stability] stage 1: screening {} columns at T≈{:.0} K (each = 1 build + ref MD eval)",
+                groups.len(),
+                cfg.anchor_temp,
+            ),
+            false,
+        );
     }
     let screened: Vec<(
         (u32, bool, u32),
@@ -859,10 +861,13 @@ pub fn scan_stability(
 
     if cfg.progress {
         let stable_cols = screened.iter().filter(|(_, _, p, _, _)| p.stable).count();
-        log_progress(format!(
-            "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
-            screened.len(),
-        ), false);
+        log_progress(
+            format!(
+                "[stability] stage 2: {stable_cols}/{} columns stable at ref — walking T (\"eval #\" = actual MD sims)",
+                screened.len(),
+            ),
+            false,
+        );
     }
 
     // ---- Stage 2 (parallel): walk T within each column, reusing its template.
@@ -881,11 +886,7 @@ pub fn scan_stability(
             if pruned {
                 for (i, env) in envs.iter().enumerate() {
                     if i != ref_idx {
-                        results[i] = Some(pruned_group_point(
-                            *env,
-                            cfg,
-                            "pH not stable at ref",
-                        ));
+                        results[i] = Some(pruned_group_point(*env, cfg, "pH not stable at ref"));
                     }
                 }
             } else if cfg.monotonic_prune && n > 1 {
@@ -912,12 +913,28 @@ pub fn scan_stability(
                     .collect();
                 below.reverse(); // walk away below (descending temperatures)
                 bold_walk(
-                    dev, param_set, structure, &envs, &above, build_opts, cfg,
-                    &mut template, &done, &mut results,
+                    dev,
+                    param_set,
+                    structure,
+                    &envs,
+                    &above,
+                    build_opts,
+                    cfg,
+                    &mut template,
+                    &done,
+                    &mut results,
                 );
                 bold_walk(
-                    dev, param_set, structure, &envs, &below, build_opts, cfg,
-                    &mut template, &done, &mut results,
+                    dev,
+                    param_set,
+                    structure,
+                    &envs,
+                    &below,
+                    build_opts,
+                    cfg,
+                    &mut template,
+                    &done,
+                    &mut results,
                 );
             } else {
                 for (i, env) in envs.iter().enumerate() {
@@ -936,7 +953,13 @@ pub fn scan_stability(
                     }
                 }
             }
-            (k, results.into_iter().map(|o| o.expect("group point filled")).collect())
+            (
+                k,
+                results
+                    .into_iter()
+                    .map(|o| o.expect("group point filled"))
+                    .collect(),
+            )
         })
         .collect();
 
@@ -1103,10 +1126,7 @@ fn report_point(
     let m1 = pt.metrics.as_ref().map_or(f64::NAN, |m| m.m1);
     let log_line = format!(
         "[stability] {:>3}/{total} {axis:?}/{direction:?} T={:.0} pH={:.1}: {verdict} (crashed={}, m1={m1:.0})",
-        n,
-        env.temp_k,
-        env.ph,
-        pt.crashed,
+        n, env.temp_k, env.ph, pt.crashed,
     );
     log_progress(log_line, true);
 }
@@ -1220,10 +1240,13 @@ pub fn scan_radial(
     }
 
     if cfg.progress {
-        log_progress(format!(
-            "[stability] scanning up to {total} candidate points across {} rays",
-            jobs.len()
-        ), false);
+        log_progress(
+            format!(
+                "[stability] scanning up to {total} candidate points across {} rays",
+                jobs.len()
+            ),
+            false,
+        );
     }
 
     let results: Vec<RadialResult> = jobs.par_iter()
@@ -1389,7 +1412,10 @@ mod tests {
         assert_eq!(Axis::Ph.step(a, Direction::Positive, 0.5).ph, 7.5);
         assert_eq!(Axis::Ph.step(a, Direction::Negative, 0.5).ph, 6.5);
         // stepping clamps into the biologically sensible ranges
-        assert_eq!(Axis::Ph.step(a, Direction::Negative, 99.0).ph, crate::env::sane::PH_MIN);
+        assert_eq!(
+            Axis::Ph.step(a, Direction::Negative, 99.0).ph,
+            crate::env::sane::PH_MIN
+        );
         assert_eq!(
             Axis::Temp.step(a, Direction::Positive, 999.0).temp_k,
             crate::env::sane::TEMP_K_MAX

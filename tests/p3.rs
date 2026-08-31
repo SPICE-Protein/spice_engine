@@ -2,10 +2,11 @@
 //! and time-averaged Cα pseudo-labels.
 
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use spice_engine::{
-    AtomInput, BuildOptions, EnginePool, Mutation, StructureInput, apply_mutations, build_from_input,
+    AtomInput, BuildOptions, EnginePool, Mutation, StructureInput, apply_mutations,
+    build_from_input,
 };
 use std::path::Path;
 
@@ -62,13 +63,16 @@ fn p3_structure_mutate_pool() {
     let input = mmcif_to_structure(&mm);
     let n_res_in = input.residue_count();
     let seq = input.sequence().expect("infer sequence");
-    println!("StructureInput: {n_res_in} residues, sequence len {}", seq.len());
+    println!(
+        "StructureInput: {n_res_in} residues, sequence len {}",
+        seq.len()
+    );
     assert_eq!(n_res_in, 129);
     assert_eq!(seq.len(), 129);
 
     // --- build engine from in-memory structure (not from the mmCIF file) ---
-    let mut engine =
-        build_from_input(&dev, &param_set, &input, &BuildOptions::default()).expect("build from input");
+    let mut engine = build_from_input(&dev, &param_set, &input, &BuildOptions::default())
+        .expect("build from input");
     assert_eq!(engine.topology.sequence.len(), 129);
     assert_eq!(engine.topology.ca_indices.len(), 129);
 

@@ -8,8 +8,8 @@
 //! `diag_equil_off` shows the raw post-min state + production steps (the crash
 //! mechanism). `diag_equil_on` additionally logs the equilibration ramp.
 use bio_files::MmCif;
-use dynamics::params::FfParamSet;
 use dynamics::ComputationDevice;
+use dynamics::params::FfParamSet;
 use spice_engine::{BuildOptions, EnvParams, EquilConfig, build_system};
 use std::path::Path;
 
@@ -153,9 +153,7 @@ fn run(label: &str, equil: Option<EquilConfig>, pressure_bar: f32, n_prod_steps:
                 .find(|r| r.atom_indices.contains(&j))
                 .map(|r| format!("{}{}", r.one_letter, r.seq_id))
                 .unwrap_or_else(|| "?".into());
-            println!(
-                "[clashpair] {d:.3}Å atom{i}(m{mi:.0},{ri}) <-> atom{j}(m{mj:.0},{rj})"
-            );
+            println!("[clashpair] {d:.3}Å atom{i}(m{mi:.0},{ri}) <-> atom{j}(m{mj:.0},{rj})");
         }
     }
 
@@ -238,4 +236,3 @@ fn diag_equil_off_nobar() {
 fn diag_equil_on() {
     run("equil-on-nobar", Some(EquilConfig::default()), 0.0, 40);
 }
-

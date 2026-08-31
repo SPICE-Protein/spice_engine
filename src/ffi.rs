@@ -79,7 +79,13 @@ impl PyStructure {
             || res_seq.len() != n
             || res_names.len() != n
         {
-            return err(format!("array length mismatch: atoms={} elms={} res_seq={} res_names={} coords={n}", atom_names.len(), elements.len(), res_seq.len(), res_names.len()));
+            return err(format!(
+                "array length mismatch: atoms={} elms={} res_seq={} res_names={} coords={n}",
+                atom_names.len(),
+                elements.len(),
+                res_seq.len(),
+                res_names.len()
+            ));
         }
         let occ = occupancy.as_ref().map(|o| {
             let a = o.as_array();
@@ -237,8 +243,13 @@ impl PyEngine {
             ..Default::default()
         };
         let structure = structure.borrow();
-        let engine = crate::builder::build_mutant_by_solvent_reuse(&self.engine, param_set(), &structure.inner, &opts)
-            .map_err(|e| PyValueError::new_err(e))?;
+        let engine = crate::builder::build_mutant_by_solvent_reuse(
+            &self.engine,
+            param_set(),
+            &structure.inner,
+            &opts,
+        )
+        .map_err(|e| PyValueError::new_err(e))?;
         let n_res = engine.topology.sequence.len();
         let metrics = Metrics::new(&engine, MetricsConfig::default());
         let force = ForceAction::new(n_res, 16, 0.5, 20);
@@ -301,7 +312,8 @@ impl PyEngine {
 
     /// Add a harmonic distance restraint between two atoms (e.g. for AlphaFold 3 ligand/ion coordination).
     fn add_distance_restraint(&mut self, atom_0_idx: usize, atom_1_idx: usize, r0: f32, k: f32) {
-        self.engine.add_distance_restraint(atom_0_idx, atom_1_idx, r0, k);
+        self.engine
+            .add_distance_restraint(atom_0_idx, atom_1_idx, r0, k);
     }
 
     /// Current Cα coordinates `[L, 3]`.
@@ -447,10 +459,10 @@ impl PyEngine {
         for w in &s.water {
             n_water += 1;
             let m_total = w.o.mass + w.h0.mass + w.h1.mass;
-            let r_com = (w.o.posit * w.o.mass + w.h0.posit * w.h0.mass + w.h1.posit * w.h1.mass)
-                / m_total;
-            let v_com = (w.o.vel * w.o.mass + w.h0.vel * w.h0.mass + w.h1.vel * w.h1.mass)
-                / m_total;
+            let r_com =
+                (w.o.posit * w.o.mass + w.h0.posit * w.h0.mass + w.h1.posit * w.h1.mass) / m_total;
+            let v_com =
+                (w.o.vel * w.o.mass + w.h0.vel * w.h0.mass + w.h1.vel * w.h1.mass) / m_total;
 
             for atom in [&w.o, &w.h0, &w.h1] {
                 let v2 = atom.vel.magnitude_squared() as f64;
@@ -466,9 +478,21 @@ impl PyEngine {
             let inertia = |r: Vec3, mass: f32| {
                 let r2 = r.dot(r);
                 [
-                    [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
-                    [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
-                    [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                    [
+                        mass * (r2 - r.x * r.x),
+                        -mass * r.x * r.y,
+                        -mass * r.x * r.z,
+                    ],
+                    [
+                        -mass * r.y * r.x,
+                        mass * (r2 - r.y * r.y),
+                        -mass * r.y * r.z,
+                    ],
+                    [
+                        -mass * r.z * r.x,
+                        -mass * r.z * r.y,
+                        mass * (r2 - r.z * r.z),
+                    ],
                 ]
             };
             let mut i_arr = inertia(r_o, w.o.mass);
@@ -482,8 +506,8 @@ impl PyEngine {
             let i_mat = Mat3F32::from_arr(i_arr);
             let omega = i_mat.solve_system(l); // ω = I⁻¹L
 
-            rigid_accum += (m_total as f64) * (v_com.magnitude_squared() as f64)
-                + l.dot(omega) as f64; // M·V² + L·ω = 2·(COM_KE + rot_KE)
+            rigid_accum +=
+                (m_total as f64) * (v_com.magnitude_squared() as f64) + l.dot(omega) as f64; // M·V² + L·ω = 2·(COM_KE + rot_KE)
         }
 
         let total_ke = 0.5 * total_accum * NATIVE_TO_KCAL;
@@ -557,7 +581,7 @@ impl PyEngine {
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown integrator mode '{other}' (expected langevin_middle | langevin_strong | nve)"
-                )))
+                )));
             }
         };
         self.engine.state.cfg.integrator = integrator;
@@ -826,7 +850,9 @@ impl PyEngine {
     ) -> PyResult<Bound<'py, PyDict>> {
         let result = match action {
             Some(a) => {
-                let v = a.as_slice().map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let v = a
+                    .as_slice()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
                 self.force.step(&mut self.engine, v)
             }
             None => self.engine.step(None),
@@ -1214,7 +1240,11 @@ fn scan_radial<'py>(
         d.set_item("axis", r.axis.name())?;
         d.set_item(
             "direction",
-            if r.direction == Direction::Positive { "+" } else { "-" },
+            if r.direction == Direction::Positive {
+                "+"
+            } else {
+                "-"
+            },
         )?;
         d.set_item("anchor", env_dict(py, &r.anchor))?;
         match r.boundary_stable() {

@@ -126,7 +126,11 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
         .collect();
 
     let mut steps = 0usize;
-    let run_step = |engine: &mut SpiceEngine, temp: f32, k: f32, step_idx: usize| -> Result<(), String> {
+    let run_step = |engine: &mut SpiceEngine,
+                    temp: f32,
+                    k: f32,
+                    step_idx: usize|
+     -> Result<(), String> {
         let mut force = vec![Vec3::new_zero(); n];
         if k > 0.0 {
             for i in 0..n {

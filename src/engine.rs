@@ -6,6 +6,7 @@ use dynamics::{ComputationDevice, MdState};
 use lin_alg::f32::Vec3;
 
 use crate::env::EnvParams;
+use crate::forcefield::{ComputationContent, ForceBuffer, ForceFieldSelection, ForceFieldSystem};
 use crate::topology::ProteinTopology;
 
 /// Potential energy (kcal/mol) above which the system is treated as blown up.
@@ -43,6 +44,9 @@ pub struct SpiceEngine {
     pub env: EnvParams,
     pub dev: ComputationDevice,
     pub dt_ps: f32,
+    /// SE-selected calculation content and existing force-field family.
+    pub computation_content: ComputationContent,
+    pub force_field: ForceFieldSelection,
     /// Recent potential-energy samples (kcal/mol), used by the `m1` metric.
     pub u_history: VecDeque<f64>,
     /// Running sum of Cα coordinates (Å) for time-averaged pseudo-labels.
@@ -67,16 +71,25 @@ impl SpiceEngine {
                 // Find first atom with non-finite position
                 for (i, a) in self.state.atoms.iter().enumerate() {
                     if !a.posit.x.is_finite() || !a.posit.y.is_finite() || !a.posit.z.is_finite() {
-                        let res_desc = self.topology.residues.iter()
+                        let res_desc = self
+                            .topology
+                            .residues
+                            .iter()
                             .find(|r| r.atom_indices.contains(&i))
                             .map(|r| format!("{} (seq_id: {})", r.one_letter, r.seq_id))
                             .unwrap_or_else(|| "unknown_residue".to_string());
-                        crash_reason = Some(format!("nan_coordinates_at_atom_index_{}_in_residue_{}", i, res_desc));
+                        crash_reason = Some(format!(
+                            "nan_coordinates_at_atom_index_{}_in_residue_{}",
+                            i, res_desc
+                        ));
                         break;
                     }
                 }
             } else if u_kcal > CRASH_ENERGY_KCAL {
-                crash_reason = Some(format!("potential_energy_spike_exceeded_crash_threshold_{:.2e}_kcal", u_kcal));
+                crash_reason = Some(format!(
+                    "potential_energy_spike_exceeded_crash_threshold_{:.2e}_kcal",
+                    u_kcal
+                ));
             }
         }
 
@@ -116,6 +129,28 @@ impl SpiceEngine {
             crashed,
             crash_reason,
         }
+    }
+
+    /// Evaluate the currently selected SE force-field adapter on the current
+    /// system. The MD step still uses dynamics' integrator until the low-level
+    /// force boundary is split out.
+    pub fn evaluate_selected_force_field(
+        &self,
+    ) -> Result<(ForceBuffer, crate::forcefield::EnergyVirial), String> {
+        let atoms: Vec<_> = self.state.atoms.clone();
+        let system = ForceFieldSystem {
+            atoms: &atoms,
+            bonds: &[],
+        };
+        let prepared = self
+            .force_field
+            .prepare_for_content(self.computation_content)
+            .map_err(|e| e.to_string())?;
+        let mut forces = ForceBuffer::zeros(atoms.len());
+        let energy = prepared
+            .evaluate(&system, &mut forces)
+            .map_err(|e| e.to_string())?;
+        Ok((forces, energy))
     }
 
     /// Live temperature change (environment perturbation, e.g. +ΔT).
@@ -158,7 +193,13 @@ impl SpiceEngine {
         let inv = 1.0 / self.ca_n as f64;
         self.ca_acc
             .iter()
-            .map(|a| [a[0] as f32 * inv as f32, a[1] as f32 * inv as f32, a[2] as f32 * inv as f32])
+            .map(|a| {
+                [
+                    a[0] as f32 * inv as f32,
+                    a[1] as f32 * inv as f32,
+                    a[2] as f32 * inv as f32,
+                ]
+            })
             .collect()
     }
 
@@ -180,12 +221,20 @@ impl SpiceEngine {
     }
 
     /// Register a harmonic distance restraint between two atoms (e.g. for AlphaFold 3 ligand/ion coordination).
-    pub fn add_distance_restraint(&mut self, atom_0_idx: usize, atom_1_idx: usize, r0: f32, k: f32) {
-        self.state.distance_restraints.push(dynamics::DistanceRestraint {
-            atom_0_idx,
-            atom_1_idx,
-            r0,
-            k,
-        });
+    pub fn add_distance_restraint(
+        &mut self,
+        atom_0_idx: usize,
+        atom_1_idx: usize,
+        r0: f32,
+        k: f32,
+    ) {
+        self.state
+            .distance_restraints
+            .push(dynamics::DistanceRestraint {
+                atom_0_idx,
+                atom_1_idx,
+                r0,
+                k,
+            });
     }
 }

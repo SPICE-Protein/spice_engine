@@ -44,11 +44,6 @@ jobs:
           # NOTE: linux/aarch64 (Jetson, ARM cloud) is deferred — maturin's
           # cross-build can't find an aarch64 CPython reliably; re-add with the
           # proper manylinux docker/QEMU or a native ARM runner when needed.
-          # macOS arm64 (Apple Silicon) — local dev
-          - os: macos-14
-            target: aarch64
-            python: "3.12"
-            interpreter: python
           # Windows x86_64
           - os: windows-latest
             target: x86_64

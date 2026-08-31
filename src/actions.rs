@@ -50,7 +50,9 @@ impl ActionMask {
         let mut x = self.seed;
         for e in self.enabled.iter_mut() {
             // SplitMix64-ish LCG — deterministic, dependency-free.
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *e = (x >> 33) % 3 == 0; // ~1/3 of residues active
         }
         self.seed = x;
@@ -88,7 +90,9 @@ impl ForceAction {
         let mut w = vec![0.0f32; n_res * 3 * m];
         let mut x: u64 = 0x1234_5678_9ABC_DEF0;
         for v in w.iter_mut() {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((x >> 33) as f32 / (1u64 << 31) as f32) - 1.0; // ~U(-1,1)
         }
         // Normalize each basis column.
@@ -156,7 +160,9 @@ impl ForceAction {
         let f_ca = self.actions_to_forces(a);
         let mut f_full = vec![Vec3::new_zero(); engine.state.atoms.len()];
         for (res, f) in f_ca.iter().enumerate() {
-            let Some(&ca) = engine.topology.ca_indices.get(res) else { continue };
+            let Some(&ca) = engine.topology.ca_indices.get(res) else {
+                continue;
+            };
             f_full[ca] = *f;
         }
         engine.step(Some(f_full))
