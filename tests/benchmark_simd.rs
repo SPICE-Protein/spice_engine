@@ -62,7 +62,9 @@ fn benchmark_pair_kernel() {
         let start16 = Instant::now();
         let mut checksum16 = 0.0f64;
         for _ in 0..BATCHES {
-            let result = batch16.eval_lj_coulomb(332.0522);
+            let result = batch16
+                .eval_lj_coulomb_runtime(332.0522)
+                .expect("AVX-512 runtime dispatch unexpectedly unavailable");
             checksum16 += result
                 .energy
                 .to_array()

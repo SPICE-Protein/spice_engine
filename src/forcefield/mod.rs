@@ -26,13 +26,16 @@ pub use self::neighbors::{
     make_atom_blocks, partition_directed_pairs,
 };
 pub use parameters::{
-    Amber19, Amber19Prepared, Charmm36m, Charmm36mPrepared, ComputationContent,
-    ForceFieldSelection, Martini3, Martini3Prepared, ParameterDomain,
+    Amber19, Amber19Prepared, AmberAngle, AmberBond, AmberDihedral, AmberMass, AmberNonbonded,
+    AmberParameterIndex, Charmm36m, Charmm36mPrepared, CoarseGrainedBead, CoarseGrainedTopology,
+    ComputationContent, ForceFieldSelection, Martini3, Martini3Prepared, ParameterDomain,
+    build_coarse_grained_topology,
 };
 pub use simd::{PairBatch8, PairResult8, SimdBackend};
 #[cfg(target_arch = "x86_64")]
 pub use simd::{PairBatch16, PairResult16};
 pub use traits::{ForceField, PreparedForceField};
 pub use types::{
-    EnergyVirial, ForceBuffer, ForceFieldError, ForceFieldRegion, ForceFieldSystem, Resolution,
+    EnergyVirial, ForceAtom, ForceBuffer, ForceFieldError, ForceFieldRegion, ForceFieldSystem,
+    Resolution,
 };

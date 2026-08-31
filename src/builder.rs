@@ -22,6 +22,13 @@ pub struct BuildOptions {
     pub force_field: ForceFieldSelection,
     /// Box padding (Å) around the solute.
     pub box_padding_angstrom: f32,
+    /// SPME reciprocal mesh spacing in Å. Smaller values improve reciprocal
+    /// resolution at increased cost.
+    pub spme_mesh_spacing: f32,
+    /// Ewald/ SPME splitting parameter in Å⁻¹.
+    pub spme_alpha: f32,
+    /// Neighbor-list skin in Å.
+    pub neighbor_skin: f32,
     pub hydrogen_constraint: HydrogenConstraint,
     /// Max energy-minimization iterations at init. `None` disables.
     pub relax_iters: Option<usize>,
@@ -50,6 +57,9 @@ impl Default for BuildOptions {
             computation_content: ComputationContent::Protein,
             force_field: ForceFieldSelection::Amber19,
             box_padding_angstrom: 10.0,
+            spme_mesh_spacing: 1.0,
+            spme_alpha: 0.26,
+            neighbor_skin: 2.0,
             hydrogen_constraint: HydrogenConstraint::default(),
             relax_iters: Some(2_000),
             energy_minimization_tolerance: 2.0,
@@ -126,6 +136,9 @@ pub fn build_system(
         },
         hydrogen_constraint: opts.hydrogen_constraint,
         sim_box: SimBoxInit::Pad(opts.box_padding_angstrom),
+        spme_mesh_spacing: opts.spme_mesh_spacing,
+        spme_alpha: opts.spme_alpha,
+        neighbor_skin: opts.neighbor_skin,
         max_init_relaxation_iters: opts.relax_iters,
         energy_minimization_tolerance: opts.energy_minimization_tolerance,
         salt_concentration_m: if opts.env.ionic_strength_m > 0.0 {
@@ -210,6 +223,9 @@ pub fn build_mutant_by_solvent_reuse(
     let mut cfg = MdConfig {
         temp_target: opts.env.temp_k,
         hydrogen_constraint: opts.hydrogen_constraint,
+        spme_mesh_spacing: opts.spme_mesh_spacing,
+        spme_alpha: opts.spme_alpha,
+        neighbor_skin: opts.neighbor_skin,
         sim_box: SimBoxInit::Fixed((parent.state.cell.bounds_low, parent.state.cell.bounds_high)),
         solvent: dynamics::Solvent::None,
         max_init_relaxation_iters: None, // No minimization here

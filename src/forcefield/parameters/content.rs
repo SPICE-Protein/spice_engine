@@ -20,6 +20,14 @@ impl ComputationContent {
     pub const fn is_coarse_grained(self) -> bool {
         matches!(self, Self::CoarseGrainedProtein)
     }
+
+    pub const fn is_nucleic_acid(self) -> bool {
+        matches!(self, Self::Rna | Self::Dna)
+    }
+
+    pub const fn requires_mapping(self) -> bool {
+        self.is_coarse_grained()
+    }
 }
 
 /// Selectable existing force-field family for a content type.
@@ -99,17 +107,23 @@ impl ForceFieldSelection {
         }
     }
 
+    pub fn validate_content(self, content: ComputationContent) -> Result<(), ForceFieldError> {
+        if self.supports_content(content) {
+            Ok(())
+        } else {
+            Err(ForceFieldError(format!(
+                "force field '{}' does not support computation content {:?}",
+                self.name(),
+                content
+            )))
+        }
+    }
+
     pub fn prepare_for_content(
         self,
         content: ComputationContent,
     ) -> Result<Box<dyn PreparedForceField>, ForceFieldError> {
-        if !self.supports_content(content) {
-            return Err(ForceFieldError(format!(
-                "force field '{}' does not support computation content {:?}",
-                self.name(),
-                content
-            )));
-        }
+        self.validate_content(content)?;
         self.prepare()
     }
 

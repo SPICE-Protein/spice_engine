@@ -29,10 +29,12 @@ pub use engine::{SpiceEngine, StepResult};
 pub use env::EnvParams;
 pub use equilibrate::{EquilConfig, equilibrate};
 pub use forcefield::{
-    Amber19, AtomBlock, BlockForceAccumulator, Charmm36m, ComputationContent, CsrNeighborList,
-    DirectedPair, ForceField, ForceFieldRegion, ForceFieldSelection, Martini3, PairBatch8,
-    PairBlock, PairResult8, ParameterDomain, PreparedForceField, Resolution, SimdBackend,
-    atom_block_index, make_atom_blocks, partition_directed_pairs,
+    Amber19, AmberAngle, AmberBond, AmberDihedral, AmberMass, AmberNonbonded, AmberParameterIndex,
+    AtomBlock, BlockForceAccumulator, Charmm36m, CoarseGrainedBead, CoarseGrainedTopology,
+    ComputationContent, CsrNeighborList, DirectedPair, ForceAtom, ForceField, ForceFieldRegion,
+    ForceFieldSelection, Martini3, PairBatch8, PairBlock, PairResult8, ParameterDomain,
+    PreparedForceField, Resolution, SimdBackend, atom_block_index, build_coarse_grained_topology,
+    make_atom_blocks, partition_directed_pairs,
 };
 #[cfg(target_arch = "x86_64")]
 pub use forcefield::{PairBatch16, PairResult16};

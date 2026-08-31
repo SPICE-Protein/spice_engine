@@ -122,7 +122,7 @@ fn benchmark_production_steps_detailed() {
         pct(0.99)
     );
     println!(
-        "phase_mean_us bonded={} nonbonded_short={} ewald_long={} neighbor_all={} neighbor_rebuild={} integration={} ambient={} snapshot={} total={}",
+        "phase_mean_us bonded={} nonbonded_short={} ewald_long={} neighbor_all={} neighbor_rebuild={} integration={} ambient={} kinetic={} water_settle={} thermostat={} barostat={} snapshot={} total={}",
         phase.bonded,
         phase.non_bonded_short_range,
         phase.ewald_long_range,
@@ -130,6 +130,10 @@ fn benchmark_production_steps_detailed() {
         phase.neighbor_rebuild,
         phase.integration,
         phase.ambient,
+        phase.kinetic,
+        phase.water_settle,
+        phase.thermostat,
+        phase.barostat,
         phase.snapshots,
         phase.total
     );
@@ -169,4 +173,131 @@ fn benchmark_production_steps_detailed() {
         engine.state.scalar_pair_count(),
         engine.state.nb_pair_count(),
     );
+}
+
+/// Neighbor skin trade-off sweep. Run with:
+/// `cargo test --release --test benchmark_md benchmark_neighbor_skin_sweep -- --ignored --nocapture`
+#[test]
+#[ignore = "expensive solvated neighbor skin sweep"]
+fn benchmark_neighbor_skin_sweep() {
+    let dev = ComputationDevice::Cpu;
+    let params = FfParamSet::new_amber().expect("load Amber parameters");
+    let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
+    for skin in [1.0_f32, 2.0, 3.0, 4.0] {
+        let mut opts = BuildOptions::default();
+        opts.neighbor_skin = skin;
+        let mut engine = build_system(&dev, &params, protein.clone(), &opts)
+            .unwrap_or_else(|e| panic!("build failed for skin={skin}: {e}"));
+        for _ in 0..3 {
+            assert!(!engine.step(None).crashed);
+        }
+        engine.state.computation_time = Default::default();
+        let start = Instant::now();
+        for _ in 0..20 {
+            assert!(!engine.step(None).crashed);
+        }
+        let wall_ms = start.elapsed().as_secs_f64() * 1_000.0 / 20.0;
+        let phase = engine
+            .state
+            .computation_time
+            .time_per_step(20)
+            .expect("phase timing");
+        println!(
+            "skin_A={skin:.2} wall_mean_ms={wall_ms:.3} neighbor_all_us={} rebuild_us={} rebuild_count={}",
+            phase.neighbor_all,
+            phase.neighbor_rebuild,
+            engine.state.computation_time.neighbor_rebuild_count
+        );
+    }
+}
+
+/// Regression guard for reciprocal-space cache policy. SPME_RATIO is intentionally
+/// one in dynamics; this confirms every measured step has fresh PME forces and
+/// finite energy/virial instead of silently consuming stale cached forces.
+/// Run with: `cargo test --release --test benchmark_md benchmark_pme_cache_regression -- --ignored --nocapture`
+#[test]
+#[ignore = "expensive solvated PME cache regression"]
+fn benchmark_pme_cache_regression() {
+    let dev = ComputationDevice::Cpu;
+    let params = FfParamSet::new_amber().expect("load Amber parameters");
+    let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
+    let mut engine =
+        build_system(&dev, &params, protein, &BuildOptions::default()).expect("build engine");
+    for _ in 0..3 {
+        assert!(!engine.step(None).crashed);
+    }
+    engine.state.computation_time = Default::default();
+    for _ in 0..10 {
+        let result = engine.step(None);
+        assert!(!result.crashed);
+        assert!(result.u_t_kcal.is_finite());
+        assert!(engine.state.virial_components().2.is_finite());
+        assert!(engine.state.last_step_used_pme());
+    }
+    let rebuilds = engine.state.computation_time.neighbor_rebuild_count;
+    assert!(rebuilds <= 10, "unexpected rebuild count: {rebuilds}");
+    println!(
+        "pme_cache_policy=refresh_every_step pme_steps=10 ewald_us={} long_virial={:.6} rebuilds={rebuilds}",
+        engine.state.computation_time.ewald_long_range_sum,
+        engine.state.virial_components().2
+    );
+}
+
+/// Explicit reciprocal-space tuning sweep. Run with:
+/// `cargo test --release --test benchmark_md benchmark_pme_parameter_sweep -- --ignored --nocapture`
+#[test]
+#[ignore = "expensive solvated PME parameter sweep"]
+fn benchmark_pme_parameter_sweep() {
+    let dev = ComputationDevice::Cpu;
+    let params = FfParamSet::new_amber().expect("load Amber parameters");
+    let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
+    let cases = [(1.25_f32, 0.22_f32), (1.00, 0.26), (0.80, 0.30)];
+    println!("=== PME parameter sweep (mesh_spacing_A, alpha_A^-1) ===");
+    for (mesh_spacing, alpha) in cases {
+        let mut opts = BuildOptions::default();
+        opts.spme_mesh_spacing = mesh_spacing;
+        opts.spme_alpha = alpha;
+        let mut engine = build_system(&dev, &params, protein.clone(), &opts).unwrap_or_else(|e| {
+            panic!("build failed for spacing={mesh_spacing}, alpha={alpha}: {e}")
+        });
+        for _ in 0..3 {
+            let result = engine.step(None);
+            assert!(
+                !result.crashed,
+                "warm-up crashed for spacing={mesh_spacing}, alpha={alpha}"
+            );
+        }
+        engine.state.computation_time = Default::default();
+        let mut wall = Vec::with_capacity(10);
+        let mut energy_sum = 0.0;
+        let mut long_virial_sum = 0.0;
+        let mut pme_steps = 0usize;
+        for _ in 0..10 {
+            let start = Instant::now();
+            let result = engine.step(None);
+            assert!(
+                !result.crashed,
+                "production crashed for spacing={mesh_spacing}, alpha={alpha}"
+            );
+            wall.push(start.elapsed().as_secs_f64() * 1_000.0);
+            energy_sum += result.u_t_kcal;
+            long_virial_sum += engine.state.virial_components().2;
+            if engine.state.step_kind().contains("pme") {
+                pme_steps += 1;
+            }
+        }
+        let mean_ms = wall.iter().sum::<f64>() / wall.len() as f64;
+        let phase = engine
+            .state
+            .computation_time
+            .time_per_step(10)
+            .expect("phase timing");
+        let e_mean = energy_sum / 10.0;
+        let v_mean = long_virial_sum / 10.0;
+        assert!(e_mean.is_finite() && v_mean.is_finite());
+        println!(
+            "spacing_A={mesh_spacing:.2} alpha_A^-1={alpha:.3} mean_ms={mean_ms:.3} ewald_mean_us={} energy_mean_kcal={e_mean:.3} long_virial_mean={v_mean:.3} pme_steps={pme_steps} rebuilds={}",
+            phase.ewald_long_range, engine.state.neighbor_rebuild_count,
+        );
+    }
 }

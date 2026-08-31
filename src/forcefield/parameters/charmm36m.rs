@@ -5,6 +5,7 @@
 //! without treating them as an Amber-format force field.
 
 use crate::forcefield::{
+    nonbonded::evaluate::evaluate_half_pairs,
     traits::{ForceField, PreparedForceField},
     types::{EnergyVirial, ForceBuffer, ForceFieldError, ForceFieldSystem, Resolution},
 };
@@ -70,6 +71,6 @@ impl PreparedForceField for Charmm36mPrepared {
                 system.atoms.len()
             )));
         }
-        Ok(EnergyVirial::default())
+        evaluate_half_pairs(system, forces, 332.0522)
     }
 }

@@ -6,7 +6,9 @@ use dynamics::{ComputationDevice, MdState};
 use lin_alg::f32::Vec3;
 
 use crate::env::EnvParams;
-use crate::forcefield::{ComputationContent, ForceBuffer, ForceFieldSelection, ForceFieldSystem};
+use crate::forcefield::{
+    ComputationContent, ForceAtom, ForceBuffer, ForceFieldSelection, ForceFieldSystem,
+};
 use crate::topology::ProteinTopology;
 
 /// Potential energy (kcal/mol) above which the system is treated as blown up.
@@ -137,7 +139,17 @@ impl SpiceEngine {
     pub fn evaluate_selected_force_field(
         &self,
     ) -> Result<(ForceBuffer, crate::forcefield::EnergyVirial), String> {
-        let atoms: Vec<_> = self.state.atoms.clone();
+        let atoms: Vec<ForceAtom> = self
+            .state
+            .atoms
+            .iter()
+            .map(|atom| ForceAtom {
+                position: atom.posit,
+                charge: atom.partial_charge,
+                sigma: atom.lj_sigma,
+                epsilon: atom.lj_eps,
+            })
+            .collect();
         let system = ForceFieldSystem {
             atoms: &atoms,
             bonds: &[],

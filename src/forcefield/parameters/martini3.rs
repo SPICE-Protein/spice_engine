@@ -4,6 +4,7 @@
 //! are intentionally kept separate from all-atom Amber and CHARMM assets.
 
 use crate::forcefield::{
+    nonbonded::evaluate::evaluate_half_pairs,
     traits::{ForceField, PreparedForceField},
     types::{EnergyVirial, ForceBuffer, ForceFieldError, ForceFieldSystem, Resolution},
 };
@@ -77,6 +78,6 @@ impl PreparedForceField for Martini3Prepared {
                 system.atoms.len()
             )));
         }
-        Ok(EnergyVirial::default())
+        evaluate_half_pairs(system, forces, 332.0522)
     }
 }

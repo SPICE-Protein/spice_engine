@@ -8,9 +8,10 @@
 //! Build with maturin: `maturin develop --features python` (or `--release`).
 
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use na_seq::Element;
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -176,6 +177,12 @@ pub struct PyEngine {
     pub engine: SpiceEngine,
     pub force: ForceAction,
     pub metrics: Metrics,
+    /// Last-call timings in microseconds; MD excludes metrics computation.
+    pub last_md_us: u64,
+    pub last_metrics_us: u64,
+    /// Reused row storage for NumPy coordinate conversion.
+    pub coords_scratch: Vec<Vec<f32>>,
+    pub flat_coords_scratch: Vec<f32>,
 }
 
 #[pymethods]
@@ -217,6 +224,10 @@ impl PyEngine {
             engine,
             force,
             metrics,
+            last_md_us: 0,
+            last_metrics_us: 0,
+            coords_scratch: Vec::with_capacity(n_res),
+            flat_coords_scratch: Vec::with_capacity(n_res * 3),
         })
     }
 
@@ -257,6 +268,10 @@ impl PyEngine {
             engine,
             force,
             metrics,
+            last_md_us: 0,
+            last_metrics_us: 0,
+            coords_scratch: Vec::with_capacity(n_res),
+            flat_coords_scratch: Vec::with_capacity(n_res * 3),
         })
     }
 
@@ -275,9 +290,38 @@ impl PyEngine {
     /// `step` spends ~20-90 ms/step in O(N²) clash + surface + DSSP-lite work;
     /// `step_md` is just the integrator (~ms/step). Use this in tight loops
     /// (benchmarks, stability scans, long production runs) and call `metrics()`
-    /// at checkpoints. Returns U, coords, step/time and crash flag only.
-    fn step_md<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.step_impl(py, None, false)
+    /// at checkpoints. An optional action applies the same 16-dimensional bias
+    /// force as `step`, without paying for metrics on the current step.
+    #[pyo3(signature = (action = None))]
+    fn step_md<'py>(
+        &mut self,
+        py: Python<'py>,
+        action: Option<PyReadonlyArray1<'_, f32>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.step_impl(py, action, false)
+    }
+
+    /// Fast MD step with optional low-frequency metrics.
+    ///
+    /// `metrics_every=0` is equivalent to `step_md` and never computes the
+    /// expensive physical metrics. For a positive interval, metrics are
+    /// included only on steps whose absolute `step_count` is divisible by the
+    /// interval; callers can use the returned `metrics_available` flag rather
+    /// than probing dictionary keys. This keeps the hot loop allocation and
+    /// O(N²) metric cost out of most steps while retaining a single-call API.
+    #[pyo3(signature = (action = None, metrics_every = 0))]
+    fn step_fast<'py>(
+        &mut self,
+        py: Python<'py>,
+        action: Option<PyReadonlyArray1<'_, f32>>,
+        metrics_every: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        // `step_impl` advances the state before exposing `step_count`; compute
+        // the schedule for the step that is about to be produced.
+        let metrics_available = metrics_due(self.engine.state.step_count + 1, metrics_every);
+        let result = self.step_impl(py, action, metrics_available)?;
+        result.set_item("metrics_available", metrics_available)?;
+        Ok(result)
     }
 
     /// The five physical metrics at the current state.
@@ -317,17 +361,27 @@ impl PyEngine {
     }
 
     /// Current Cα coordinates `[L, 3]`.
-    fn coords_ca<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let coords: Vec<Vec<f32>> = self
-            .topology()
-            .ca_indices
-            .iter()
-            .map(|&i| {
+    fn coords_ca<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let ca_indices = self.topology().ca_indices.clone();
+        self.coords_scratch.clear();
+        self.coords_scratch.extend(ca_indices.iter().map(|&i| {
+            let p = self.engine.state.atoms[i].posit;
+            vec![p.x, p.y, p.z]
+        }));
+        PyArray2::from_vec2(py, &self.coords_scratch)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Low-allocation flat Cα coordinates `[x0,y0,z0,...]`.
+    fn coords_ca_flat<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let ca_indices = self.topology().ca_indices.clone();
+        self.flat_coords_scratch.clear();
+        self.flat_coords_scratch
+            .extend(ca_indices.iter().flat_map(|&i| {
                 let p = self.engine.state.atoms[i].posit;
-                vec![p.x, p.y, p.z]
-            })
-            .collect();
-        PyArray2::from_vec2(py, &coords).map_err(|e| PyValueError::new_err(e.to_string()))
+                [p.x, p.y, p.z]
+            }));
+        Ok(PyArray1::from_vec(py, self.flat_coords_scratch.clone()))
     }
 
     fn sequence(&self) -> String {
@@ -828,6 +882,8 @@ impl PyEngine {
         d.set_item("ambient_us", ct.ambient_sum)?;
         d.set_item("snapshot_us", ct.snapshot_sum)?;
         d.set_item("total_us", ct.total)?;
+        d.set_item("last_md_us", self.last_md_us)?;
+        d.set_item("last_metrics_us", self.last_metrics_us)?;
         d.set_item("steps", self.engine.state.step_count)?;
         Ok(d)
     }
@@ -835,6 +891,28 @@ impl PyEngine {
     /// Fraction of residues currently receiving bias force.
     fn mask_fraction(&self) -> f32 {
         self.force.mask.fraction()
+    }
+}
+
+fn metrics_due(step_count: usize, metrics_every: usize) -> bool {
+    metrics_every != 0 && step_count % metrics_every == 0
+}
+
+#[cfg(test)]
+mod fast_step_tests {
+    use super::metrics_due;
+
+    #[test]
+    fn metrics_interval_is_disabled_at_zero() {
+        assert!(!metrics_due(0, 0));
+        assert!(!metrics_due(17, 0));
+    }
+
+    #[test]
+    fn metrics_interval_uses_absolute_step_count() {
+        assert!(metrics_due(20, 20));
+        assert!(metrics_due(40, 20));
+        assert!(!metrics_due(21, 20));
     }
 }
 
@@ -848,6 +926,7 @@ impl PyEngine {
         action: Option<PyReadonlyArray1<'_, f32>>,
         want_metrics: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let md_start = Instant::now();
         let result = match action {
             Some(a) => {
                 let v = a
@@ -857,17 +936,22 @@ impl PyEngine {
             }
             None => self.engine.step(None),
         };
+        self.last_md_us = md_start.elapsed().as_micros() as u64;
+        let metrics_start = Instant::now();
         let m = want_metrics.then(|| self.metrics.compute(&self.engine));
+        self.last_metrics_us = if want_metrics {
+            metrics_start.elapsed().as_micros() as u64
+        } else {
+            0
+        };
 
         let d = PyDict::new(py);
         d.set_item("u_t_kcal", result.u_t_kcal)?;
         d.set_item("u_t_kj", result.u_t_kj)?;
-        let coords_vec: Vec<Vec<f32>> = result
-            .coords_ca
-            .iter()
-            .map(|c| vec![c[0], c[1], c[2]])
-            .collect();
-        d.set_item("coords_ca", PyArray2::from_vec2(py, &coords_vec)?)?;
+        self.coords_scratch.clear();
+        self.coords_scratch
+            .extend(result.coords_ca.iter().map(|c| vec![c[0], c[1], c[2]]));
+        d.set_item("coords_ca", PyArray2::from_vec2(py, &self.coords_scratch)?)?;
         d.set_item("step_count", result.step_count)?;
         d.set_item("time_ps", result.time_ps)?;
         d.set_item("crashed", result.crashed)?;
