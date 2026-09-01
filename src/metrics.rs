@@ -428,7 +428,7 @@ impl Metrics {
         // of variance, so rare numerical spikes (accel clamps from residual build
         // strain) do not dominate the fluctuation estimate.
         let temp_k = engine.env.temp_k as f64;
-        let hist: Vec<f64> = engine
+        let mut hist: Vec<f64> = engine
             .u_history
             .iter()
             .skip(self.config.u_skip)
@@ -437,12 +437,15 @@ impl Metrics {
             .copied()
             .collect();
         let m1 = if hist.len() >= 2 {
-            let mut sorted: Vec<f64> = hist.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let med = sorted[sorted.len() / 2];
-            let mut abs_dev: Vec<f64> = sorted.iter().map(|u| (u - med).abs()).collect();
-            abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let mad = abs_dev[abs_dev.len() / 2];
+            hist.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = hist[hist.len() / 2];
+            // Reuse the history allocation for absolute deviations instead of
+            // cloning it and allocating a second vector.
+            for u in &mut hist {
+                *u = (*u - med).abs();
+            }
+            hist.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mad = hist[hist.len() / 2];
             // 1.4826 × MAD ≈ σ for normally distributed data.
             let sigma = mad * 1.4826;
             if temp_k > 0.0 {
