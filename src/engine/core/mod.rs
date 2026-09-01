@@ -93,7 +93,7 @@ mod forces;
 pub mod integrate;
 #[path = "../forcefield/neighbors.rs"]
 mod neighbors;
-#[path = "../forcefield/non_bonded.rs"]
+#[path = "../forcefield/non_bonded/mod.rs"]
 mod non_bonded;
 #[path = "../forcefield/params.rs"]
 pub mod params;
