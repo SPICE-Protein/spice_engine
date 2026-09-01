@@ -75,6 +75,8 @@ impl ActionMask {
 pub struct ForceAction {
     /// Action-space dimension M.
     pub m: usize,
+    /// Reusable Cα force scratch; avoids allocating the per-residue vector each step.
+    force_ca_scratch: Vec<Vec3>,
     /// Basis matrix `W`, row-major `[L*3, M]`.
     pub w: Vec<f32>,
     /// Force clamp (kcal/(mol·Å)); each component is `±clamp * tanh(·)`.
@@ -111,6 +113,7 @@ impl ForceAction {
         }
         Self {
             m,
+            force_ca_scratch: vec![Vec3::new_zero(); n_res],
             w,
             clamp,
             mask: ActionMask::new(n_res, mutation_every),
@@ -157,9 +160,35 @@ impl ForceAction {
     /// all-atom indices (force applied at each residue's Cα), and integrate.
     pub fn step(&mut self, engine: &mut SpiceEngine, a: &[f32]) -> StepResult {
         self.mask.tick();
-        let f_ca = self.actions_to_forces(a);
+        debug_assert_eq!(a.len(), self.m, "action length != M");
+        if self.force_ca_scratch.len() != self.mask.enabled.len() {
+            self.force_ca_scratch
+                .resize(self.mask.enabled.len(), Vec3::new_zero());
+        }
+        self.force_ca_scratch.fill(Vec3::new_zero());
+        let n_res = self.mask.enabled.len();
+        for res in 0..n_res {
+            if !self.mask.enabled[res] {
+                continue;
+            }
+            let base = res * 3 * self.m;
+            let mut fx = 0.0f32;
+            let mut fy = 0.0f32;
+            let mut fz = 0.0f32;
+            for m_idx in 0..self.m {
+                let a_m = a[m_idx];
+                fx += self.w[base + m_idx] * a_m;
+                fy += self.w[base + self.m + m_idx] * a_m;
+                fz += self.w[base + 2 * self.m + m_idx] * a_m;
+            }
+            self.force_ca_scratch[res] = Vec3::new(
+                self.clamp * fx.tanh(),
+                self.clamp * fy.tanh(),
+                self.clamp * fz.tanh(),
+            );
+        }
         let mut f_full = vec![Vec3::new_zero(); engine.state.atoms.len()];
-        for (res, f) in f_ca.iter().enumerate() {
+        for (res, f) in self.force_ca_scratch.iter().enumerate() {
             let Some(&ca) = engine.topology.ca_indices.get(res) else {
                 continue;
             };
