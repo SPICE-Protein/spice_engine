@@ -2,7 +2,7 @@
 //!
 //! `wide` selects the best available implementation for the target: AVX/SSE
 //! on x86_64 and NEON on aarch64. The kernel is deliberately independent of
-//! `dynamics::MdState` so it can be tested against the scalar reference before
+//! `crate::engine::md_core::MdState` so it can be tested against the scalar reference before
 //! the production force loop is switched over.
 
 use wide::f32x8;

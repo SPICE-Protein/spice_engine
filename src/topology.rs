@@ -1,7 +1,7 @@
 //! Protein topology: residue table, sequence, and Cα atom index mapping.
 //!
 //! Built from a *prepared* `MmCif` (i.e. after
-//! `dynamics::params::prepare_peptide_mmcif` has assigned hydrogens,
+//! `crate::engine::md_core::params::prepare_peptide_mmcif` has assigned hydrogens,
 //! force-field types and partial charges). The Cα indices are indices into
 //! `MdState.atoms`, so coordinates can be read straight out of the engine.
 

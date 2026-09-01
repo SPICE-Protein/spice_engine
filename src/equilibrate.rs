@@ -31,7 +31,7 @@
 //! GROMACS-style position restraints (e.g. to keep a coarsely-placed
 //! backbone/Cα from drifting), but it is OFF by default.
 
-use dynamics::Integrator;
+use crate::engine::md_core::Integrator;
 use lin_alg::f32::Vec3;
 use na_seq::Element;
 

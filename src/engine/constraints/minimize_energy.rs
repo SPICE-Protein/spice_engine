@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use lin_alg::f32::Vec3;
 
-use crate::{AtomDynamics, ComputationDevice, MdState};
+use crate::engine::md_core::{AtomDynamics, ComputationDevice, MdState};
 
 // emtol and emstep come from cfg.energy_minimization; see EnergyMinimization.
 // nstcgsteep (CG) and nbfgscorr (L-BFGS) are not used: this is a steepest-descent minimizer.
@@ -21,7 +21,7 @@ fn compute_forces_and_energy(
     state.reset_f_acc_pe_virial();
     state.potential_energy = 0.0;
 
-    state.apply_all_forces(dev, external_force);
+    state.apply_all_forces(dev, external_force.as_deref());
 }
 
 fn force_stats(state: &MdState) -> (f32, f32) {

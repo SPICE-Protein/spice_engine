@@ -11,7 +11,7 @@ use bio_files::{
     },
 };
 
-use crate::{
+use crate::engine::md_core::{
     MdOverrides, SimBoxInit, barostat,
     integrate::Integrator,
     prep::HydrogenConstraint,
@@ -248,7 +248,7 @@ impl MdConfig {
 
 impl From<MdpParams> for MdConfig {
     fn from(p: MdpParams) -> Self {
-        use crate::thermostat::LANGEVIN_GAMMA_DEFAULT;
+        use crate::engine::md_core::thermostat::LANGEVIN_GAMMA_DEFAULT;
 
         // Mirror of to_gromacs(): Sd → LangevinMiddle, everything else → VerletVelocity.
         let integrator = match p.integrator {

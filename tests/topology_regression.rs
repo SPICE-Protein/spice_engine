@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use bio_files::MmCif;
-use dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use na_seq::AtomTypeInRes;
+use spice_engine::engine::dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use spice_engine::{BuildOptions, ProteinTopology, atoms_to_mmcif};
 
 #[test]

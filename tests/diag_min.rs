@@ -8,8 +8,8 @@
 //! `diag_equil_off` shows the raw post-min state + production steps (the crash
 //! mechanism). `diag_equil_on` additionally logs the equilibration ramp.
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::{BuildOptions, EnvParams, EquilConfig, build_system};
 use std::path::Path;
 

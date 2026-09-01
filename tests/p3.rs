@@ -2,8 +2,8 @@
 //! and time-averaged Cα pseudo-labels.
 
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::{
     AtomInput, BuildOptions, EnginePool, Mutation, StructureInput, apply_mutations,
     build_from_input,

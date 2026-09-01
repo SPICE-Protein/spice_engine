@@ -1,6 +1,6 @@
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::{
     BuildOptions, analyze_pocket_trajectory, build_system, calculate_advanced_features,
     calculate_engine_pockets, calculate_pocket_delta, calculate_pockets_native,

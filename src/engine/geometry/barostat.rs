@@ -14,7 +14,7 @@ use lin_alg::f32::Vec3;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::{
+use crate::engine::md_core::{
     AtomDynamics, KCAL_TO_NATIVE, MdState, NATIVE_TO_KCAL, SimBoxInit, solvent::WaterMolOpc,
 };
 
@@ -393,15 +393,15 @@ impl Barostat {
         simbox: &mut SimBox,
         atoms_dyn: &mut [AtomDynamics],
         waters: &mut [WaterMolOpc],
-    ) {
-        // todo: Temporarily disabled  barostat, until pressure measurements are fixed
-        return;
+    ) -> bool {
+        // todo: Temporarily disabled barostat, until pressure measurements are fixed
+        return false;
 
         let vol_a3 = simbox.volume() as f64;
         let lam = self.scale_factor(p_inst_bar, dt_ps, temp_k, vol_a3, cfg); // λ for lengths (not volume)
 
         if !(lam.is_finite() && lam > 0.0) || (lam - 1.0).abs() < 1e-12 {
-            return; // no-op
+            return false; // no-op
         }
 
         // 1) Scale the box about its center
@@ -440,6 +440,7 @@ impl Barostat {
             // We moved O and Hs above; update EP.
             w.update_virtual_site();
         }
+        true
     }
 }
 

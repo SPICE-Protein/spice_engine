@@ -8,7 +8,7 @@ use std::{
 
 use bio_files::{AtomGeneric, BondGeneric};
 
-use crate::{COMPUTATION_TIME_RATIO, ParamError};
+use crate::engine::md_core::{COMPUTATION_TIME_RATIO, ParamError};
 
 /// Build a list of indices that relate atoms that are connected by covalent bonds.
 /// For each outer atom index, the inner values are indices of the atom it's bonded to.
@@ -66,6 +66,10 @@ pub struct ComputationTime {
     pub neighbor_rebuild_ratio: f32,
     pub integration: u32,
     pub ambient: u32,
+    pub kinetic: u32,
+    pub water_settle: u32,
+    pub thermostat: u32,
+    pub barostat: u32,
     pub snapshots: u32,
     /// Others substracted from `total`. Assumes no overlap. Uses `neighbor_all`, since `neighbor_rebuild`
     /// is part of it.
@@ -124,6 +128,10 @@ pub struct ComputationTimeSums {
     /// Thermostat, barostat, sim box rebuilds.
     /// todo: Split this up into these components if it's significantly large.
     pub ambient_sum: u64,
+    pub kinetic_sum: u64,
+    pub water_settle_sum: u64,
+    pub thermostat_sum: u64,
+    pub barostat_sum: u64,
     pub snapshot_sum: u64,
     /// If the other values don't add up to nearly this, parts we haven't counted
     /// make up a significant amount of the computation time; we may need to include them.
@@ -150,6 +158,10 @@ impl ComputationTimeSums {
         let neighbor_rebuild = (self.neighbor_rebuild_sum / num_steps as u64) as u32;
         let integration = apply(self.integration_sum);
         let ambient = apply(self.ambient_sum);
+        let kinetic = apply(self.kinetic_sum);
+        let water_settle = apply(self.water_settle_sum);
+        let thermostat = apply(self.thermostat_sum);
+        let barostat = apply(self.barostat_sum);
         let snapshots = apply(self.snapshot_sum);
         let total = apply(self.total);
 
@@ -172,6 +184,10 @@ impl ComputationTimeSums {
             neighbor_rebuild_ratio: self.neighbor_rebuild_count as f32 / num_steps as f32,
             integration,
             ambient,
+            kinetic,
+            water_settle,
+            thermostat,
+            barostat,
             snapshots,
             other,
             total,

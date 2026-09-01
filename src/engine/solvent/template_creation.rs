@@ -19,7 +19,7 @@ use rand::{
 };
 use rand_distr::Normal;
 
-use crate::{
+use crate::engine::md_core::{
     AtomDynamics, ComputationDevice, MdState, MolDynamics, NATIVE_TO_KCAL,
     barostat::SimBox,
     solvent::{

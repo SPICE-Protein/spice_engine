@@ -1,0 +1,706 @@
+//! Handles adding hydrogen based on geometry (See also aa_coords/mod.rs, which this calls),
+//! and assigns H types that map to Amber params. Note that in addition to using these types to
+//! assign FF params, we can also use them to QC which H atoms should be present on specific
+//! parents in each AA. (It has helped us catch several errors, like extra Hs in Proline and Trp rings.)
+//!
+//! todo: Handle differnet protenation states, and assign atom-types in a way that's
+//! , todo for a given residue, consistent with a single protenation state. The current approach
+//! is an innacurate hybrid.
+//!
+//! This page has atom labels for all AAs; use it as a ref and QC: https://ccpn.ac.uk/manual/v3/NEFAtomNames.html
+
+use std::collections::{HashMap, HashSet};
+
+use bio_files::{AtomGeneric, ChainGeneric, ResidueGeneric, ResidueType};
+use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element};
+
+use crate::engine::md_core::{
+    ParamError,
+    add_hydrogens::{
+        add_hydrogens_2::{Dihedral, aa_data_from_coords},
+        bond_vecs::init_local_bond_vecs,
+        ph::{
+            PKA_TYR, his_choice, resolve_his_tautomer_by_geometry, standard_allowed_at_ph,
+            variant_allowed_at_ph,
+        },
+    },
+    params::{ProtFfChargeMap, ProtFfChargeMapSet},
+};
+
+pub(crate) mod add_hydrogens_2;
+pub mod bond_vecs;
+pub(crate) mod ph;
+mod sidechain;
+
+// We use the normal AA, vice general form here, as that's the one available in the mmCIF files
+// we're parsing. This is despite the Amber data we are using for the source using the general versions.
+pub type DigitMap = HashMap<AminoAcid, HashMap<char, Vec<u8>>>;
+// pub type DigitMap = HashMap<AminoAcidGeneral, HashMap<char, Vec<u8>>>;
+// todo: Perhaps we use General here, since that's what we need to adjust protenation based on pH.
+
+/// We use this to validate H atom type assignments. We derive this directly from `amino19.lib` (Amber)
+/// Returns `true` if valid.
+/// Note that this does not ensure completeness of the H set for a given AA; only if a given
+/// value is valid for that AA.
+/// h_num=0 means it's just "HE" or similar.
+///
+/// We use the `digit_map` vice the `ff_map` directly, so we can merge protenation variants, e.g. for  His.
+fn validate_h_atom_type(
+    depth: char,
+    digit: u8,
+    aa: AminoAcid,
+    digit_map: &DigitMap,
+) -> Result<bool, ParamError> {
+    let data = digit_map.get(&aa).ok_or_else(|| {
+        ParamError::new(&format!(
+            "No parm19_data entry for amino acid {:?}",
+            AminoAcidGeneral::Standard(aa)
+        ))
+    })?;
+
+    let data_this_depth = data.get(&depth).ok_or_else(|| {
+        ParamError::new(&format!(
+            "No parm19_data entry for amino acid (Depth) {:?}",
+            AminoAcidGeneral::Standard(aa)
+        ))
+    })?;
+    if data_this_depth.contains(&digit) {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+// todo: Include N and C terminus maps A/R.
+/// Helper to get the digit part of the H from what's expected in Amber's naming conventions.
+/// E.g. this might map an incrementing `0` and `1` to `2` and `3` for HE2 and HE3.
+fn make_h_digit_map(ff_map: &ProtFfChargeMap, ph: f32) -> DigitMap {
+    make_h_digit_map_custom(ff_map, ph, None)
+}
+
+pub(crate) fn make_h_digit_map_custom(
+    ff_map: &ProtFfChargeMap,
+    ph: f32,
+    custom_variant: Option<AminoAcidProtenationVariant>,
+) -> DigitMap {
+    let mut result: DigitMap = HashMap::new();
+
+    // Preselect a single HIS state at this pH so we don't mix HID/HIE/HIP digits.
+    let his_selected = if let Some(v) = custom_variant {
+        if matches!(
+            v,
+            AminoAcidProtenationVariant::Hid
+                | AminoAcidProtenationVariant::Hie
+                | AminoAcidProtenationVariant::Hip
+        ) {
+            Some(v)
+        } else {
+            his_choice(ph)
+        }
+    } else {
+        his_choice(ph)
+    };
+
+    for (&aa_gen, params) in ff_map {
+        // Filter by pH/custom variant:
+        let allowed = match aa_gen {
+            AminoAcidGeneral::Standard(aa) => {
+                if let Some(v) = custom_variant {
+                    match (aa, v) {
+                        (AminoAcid::Asp, AminoAcidProtenationVariant::Ash) => false,
+                        (AminoAcid::Glu, AminoAcidProtenationVariant::Glh) => false,
+                        (AminoAcid::Cys, AminoAcidProtenationVariant::Cym) => false,
+                        (AminoAcid::Lys, AminoAcidProtenationVariant::Lyn) => false,
+                        (AminoAcid::His, _) => false,
+                        _ => true,
+                    }
+                } else {
+                    standard_allowed_at_ph(aa, ph)
+                }
+            }
+            AminoAcidGeneral::Variant(v) => {
+                if let Some(cv) = custom_variant {
+                    cv == v
+                } else {
+                    if matches!(
+                        v,
+                        AminoAcidProtenationVariant::Hid
+                            | AminoAcidProtenationVariant::Hie
+                            | AminoAcidProtenationVariant::Hip
+                    ) {
+                        matches!(his_selected, Some(sel) if sel == v)
+                    } else {
+                        variant_allowed_at_ph(v, ph)
+                    }
+                }
+            }
+        };
+        if !allowed {
+            continue;
+        }
+
+        let mut per_heavy: HashMap<char, Vec<u8>> = HashMap::new();
+
+        for cp in params {
+            let tir = &cp.type_in_res; // adjust accessor as needed
+
+            match tir {
+                AtomTypeInRes::H(name) => {
+                    // Split:  H  <designator-char>  <digits...>
+                    let mut chars = name.chars();
+                    chars.next(); // discard the leading 'H'
+
+                    // Heavy-atom designator is always a single alphabetic char
+                    let designator = match chars.next() {
+                        Some(c) if c.is_ascii_alphabetic() => c,
+                        _ => continue, // malformed – ignore
+                    };
+
+                    // Collect *all* trailing digits (handles "11", "21", ...)
+                    let digits: String = chars.filter(|c| c.is_ascii_digit()).collect();
+                    if digits.is_empty() {
+                        // We will handle this designation appropriately downstream. For "HG", for example.
+                        per_heavy.entry(designator).or_default().push(0);
+                    } else {
+                        // Safe because Amber never goes beyond two digits
+                        let num: u8 = digits.parse().unwrap();
+                        per_heavy.entry(designator).or_default().push(num);
+                    }
+                }
+                // We only care about hydrogens that *do* carry a numeric suffix
+                _ => (),
+            }
+        }
+
+        if per_heavy.is_empty() {
+            continue;
+        }
+
+        let aa = match aa_gen {
+            AminoAcidGeneral::Standard(a) => a,
+            AminoAcidGeneral::Variant(av) => av.get_standard().unwrap(), // todo: Unwrap OK?
+        };
+
+        // Make the relationship deterministic (ordinal 0 → smallest digit, …)
+        for v in per_heavy.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+
+        // This combines entries in the case of duplicates: This happens in the case of protenation
+        // variants, like HIE and HID for HIS.
+        if let Some(existing) = result.get_mut(&aa) {
+            for (designator, mut digits) in per_heavy {
+                existing.entry(designator).or_default().append(&mut digits);
+            }
+            for v in existing.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+        } else {
+            result.insert(aa, per_heavy);
+        }
+    }
+
+    // Override for His, to combine
+
+    // Tyr phenol OH deprotonates above its pKa (~10.5): remove the 'H' depth entry
+    // (which holds HH for the OH parent) so h_type_in_res_sidechain returns None for
+    // Tyr OH at high pH.  Ring H atoms use depths 'D', 'E', 'Z', 'B' and are unaffected.
+    // (amino19.lib has no TYM variant, so we handle this here directly.)
+    if ph > PKA_TYR {
+        if let Some(tyr_map) = result.get_mut(&AminoAcid::Tyr) {
+            tyr_map.remove(&'H');
+        }
+    }
+
+    result
+}
+
+/// Assign atom-type-in-res for hydrogen atoms in polypeptides. This is not for small molecules,
+/// which use GAFF types, nor generally required for them: Files for those tend to include H atoms,
+/// while mmCIF and PDF files for proteins generally don't.
+///
+/// This function is for sidechain only; Backbone H are always "H" for on N, and "HA", "HA2", or "HA3"
+/// for on Cα (The latter two for the case of Glycine only, which has no sidechain).
+///
+/// `neighbors` is atoms bonded to the atom the H is bonded to ?
+/// Reference `amino19.lib`, which shows which atom-in-res types we should expect (including)
+/// for these H atoms.
+///
+/// We need to correctly populate these atom-in-res types, to properly assign Amber FF type, and
+/// partial charge downstream.
+///
+/// Example. For Asp, we should have one each of "H", "HA", "HB2", and "HB3".
+///
+/// `h_num_this_parent` increments from 0. We use a table to map these to digits, e.g. 0 and 1 might mean the
+/// `2` and `3` in "HB2" and "HB3". Increments for a given parent that has multiple H.
+/// Assigns the numerical value in the result, e.g. the "2" in "NE2". `parent_depth` provides the letter
+/// e.g. the "D" in "HD1". (WHere "H" means Hydrogen, and "1" means the first hydrogen attached to this parent.
+///
+/// This can also be used for hetero atoms, or for that matter, ligands.
+///
+/// Returns None if the H should be absent due to protonation state. (?)
+pub(crate) fn h_type_in_res_sidechain(
+    h_num_this_parent: usize,
+    parent_tir: &AtomTypeInRes,
+    aa: Option<AminoAcid>, // None for hetero/ligand.
+    h_digit_map: &DigitMap,
+) -> Result<Option<AtomTypeInRes>, ParamError> {
+    let Some(aa) = aa else {
+        // Hetero. We can determine the naming scheme directly from the parent.
+        let val = match parent_tir {
+            AtomTypeInRes::Hetero(name_parent) => {
+                // if parent looks like "C<digits>" (e.g. "C23"), drop the "C" and append the H‑index
+                let mut chars = name_parent.chars();
+                let elem = chars.next().unwrap(); // the leading letter, e.g. 'C' or 'O'
+                let rest: String = chars.collect(); // the trailing digits, e.g. "23" or "5"
+
+                if elem == 'C' && rest.chars().all(|c| c.is_ascii_digit()) {
+                    // C23 → H231, H232, … depending on h_num_this_parent
+                    let idx = h_num_this_parent + 1;
+                    format!("H{}{}", rest, idx)
+                } else {
+                    // everything else → just prefix with "H", so "O5" → "HO5"
+                    format!("H{}", name_parent)
+                }
+            }
+            _ => {
+                return Err(ParamError::new(
+                    "Error assigning H type: Non-hetero parent, but missing AA.",
+                ));
+            }
+        };
+
+        return Ok(Some(AtomTypeInRes::Hetero(val)));
+    };
+
+    // todo: Assign the number based on parent type as well??
+    let depth = match parent_tir {
+        AtomTypeInRes::CB => 'B',
+        AtomTypeInRes::CD | AtomTypeInRes::CD1 | AtomTypeInRes::CD2 => 'D',
+        AtomTypeInRes::CE | AtomTypeInRes::CE1 | AtomTypeInRes::CE2 | AtomTypeInRes::CE3 => 'E',
+        AtomTypeInRes::CG | AtomTypeInRes::CG1 | AtomTypeInRes::CG2 => 'G',
+        AtomTypeInRes::CH2 | AtomTypeInRes::CH3 => 'H',
+        AtomTypeInRes::CZ | AtomTypeInRes::CZ1 | AtomTypeInRes::CZ2 | AtomTypeInRes::CZ3 => 'Z',
+        AtomTypeInRes::OD1 | AtomTypeInRes::OD2 => 'D',
+        AtomTypeInRes::OG | AtomTypeInRes::OG1 | AtomTypeInRes::OG2 => 'G',
+        AtomTypeInRes::OH => 'H',
+        AtomTypeInRes::OE1 | AtomTypeInRes::OE2 => 'E',
+        AtomTypeInRes::ND1 | AtomTypeInRes::ND2 => 'D',
+        AtomTypeInRes::NH1 | AtomTypeInRes::NH2 => 'H',
+        AtomTypeInRes::NE | AtomTypeInRes::NE1 | AtomTypeInRes::NE2 => 'E',
+        AtomTypeInRes::NZ => 'Z',
+        AtomTypeInRes::SE => 'E',
+        AtomTypeInRes::SG => 'G',
+        AtomTypeInRes::OXT => 'X', // todo: What should this be? Observed in glycine at the C terminus.
+        _ => {
+            return Err(ParamError::new(&format!(
+                "Invalid parent type in res on H assignment. AA: {aa}. {parent_tir:?}",
+            )));
+        }
+    };
+
+    // Manual overrides here. Perhaps a more general algorithm will prevent needing these.
+    // The naive approach of always applying 21 incremented to Cx2 doesn't always work,
+    // so these individual overrides may be the easiest approach.
+    // todo: See teh pattern here? Put in a mechanism to add the 2 prefix.
+    match aa {
+        AminoAcid::Thr => {
+            if *parent_tir == AtomTypeInRes::CG2 {
+                // HG21, 22, 23
+                let digit = h_num_this_parent + 21;
+                return Ok(Some(AtomTypeInRes::H(format!("HG{digit}"))));
+            }
+        }
+        AminoAcid::Arg => {
+            if *parent_tir == AtomTypeInRes::NH2 {
+                let digit = h_num_this_parent + 21;
+                return Ok(Some(AtomTypeInRes::H(format!("HH{digit}"))));
+            }
+        }
+        AminoAcid::Phe => match parent_tir {
+            AtomTypeInRes::CD2 => {
+                let digit = h_num_this_parent + 2;
+                return Ok(Some(AtomTypeInRes::H(format!("HD{digit}"))));
+            }
+            AtomTypeInRes::CE2 => {
+                let digit = h_num_this_parent + 2;
+                return Ok(Some(AtomTypeInRes::H(format!("HE{digit}"))));
+            }
+            _ => (),
+        },
+        AminoAcid::Leu => {
+            if *parent_tir == AtomTypeInRes::CD2 {
+                let digit = h_num_this_parent + 21;
+                return Ok(Some(AtomTypeInRes::H(format!("HD{digit}"))));
+            }
+        }
+        AminoAcid::Ile => {
+            if *parent_tir == AtomTypeInRes::CG2 {
+                let digit = h_num_this_parent + 21;
+                return Ok(Some(AtomTypeInRes::H(format!("HG{digit}"))));
+            }
+        }
+        // OE1 is a carbonyl oxygen on GLN (HE21/HE22 belong to NE2, not OE1).
+        // Without this, depth 'E' → [21,22] from the digit map causes HE21 to be
+        // placed on OE1, producing a bogus C-O-H bond and a missing valence angle.
+        AminoAcid::Gln if matches!(parent_tir, AtomTypeInRes::OE1 | AtomTypeInRes::OE2) => {
+            return Ok(None);
+        }
+        // Same issue for ASN: OD1 is carbonyl; HD21/HD22 belong to ND2.
+        AminoAcid::Asn if matches!(parent_tir, AtomTypeInRes::OD1 | AtomTypeInRes::OD2) => {
+            return Ok(None);
+        }
+        _ => (),
+    }
+
+    let Some(digits_this_aa) = h_digit_map.get(&aa) else {
+        return Err(ParamError::new(&format!(
+            "Missing AA {aa} in digits map, which has {:?}",
+            h_digit_map.keys()
+        )));
+    };
+
+    let Some(digits) = digits_this_aa.get(&depth) else {
+        // return Err(ParamError::new(&format!(
+        //     "Missing H digits: Depth: {depth} not in {digits_this_aa:?} - {parent_tir:?} , {aa}",
+        // )));
+        return Ok(None);
+    };
+
+    let digit = {
+        // Use Debug so variants like CE3/CZ3 carry the numeral
+        let suffix_digit = format!("{:?}", parent_tir)
+            .chars()
+            .rev()
+            .find(|c| c.is_ascii_digit())
+            .and_then(|c| c.to_digit(10))
+            .map(|d| d as usize);
+
+        if let Some(sd) = suffix_digit {
+            if let Some(pos) = digits.iter().position(|&d| d == sd as u8) {
+                &digits[pos] // exact match: CE3 → 3, CZ3 → 3, CZ2 → 2, etc.
+            } else if digits.iter().all(|&d| d < 10) {
+                // All H names at this depth are single-digit (e.g. HD1, HD2). The parent's
+                // suffix is absent, meaning this H doesn't exist in the current protonation
+                // state — e.g. ND1 (suffix=1) has no HD1 in HIE whose 'D'→[2].
+                return Ok(None);
+            } else {
+                // Multi-digit H names (e.g. HG21/22/23): the parent suffix doesn't map
+                // directly to the H digit, so fall back to attachment order.
+                digits
+                    .get(h_num_this_parent)
+                    .unwrap_or_else(|| &digits[digits.len() - 1])
+            }
+        } else {
+            // No numeric suffix on parent (e.g., OG, ND, etc.) → use attachment order
+            digits
+                .get(h_num_this_parent)
+                .unwrap_or_else(|| &digits[digits.len() - 1])
+        }
+    };
+
+    // todo: Handle the N term and C term cases; pass those params in?
+
+    // todo: Consider adding a completeness validator for the AA, ensuring all expected
+    // todo: Hs are present.
+
+    let val = if *digit == 0 {
+        format!("H{depth}") // e.g. HG. We use 0 as a flag when building the map.
+    } else {
+        format!("H{depth}{digit}")
+    };
+
+    let result = AtomTypeInRes::H(val);
+
+    if !validate_h_atom_type(depth, *digit, aa, h_digit_map)? {
+        return Err(ParamError::new(&format!(
+            "Invalid H type: {result} on {aa}. Parent: {parent_tir}"
+        )));
+    }
+
+    Ok(Some(result))
+}
+
+/// Adds hydrogens to a molecule, and populdates residue dihedral angles.
+/// This is useful in particular for mmCIF files from RCSB PDB, as they don't have these.
+/// Uses Amber (or similar)-provided parameters as a guide.
+///
+/// Returns dihedrals.
+/// todo: This needs to add bonds too!
+/// Resolve hard clashes introduced by idealized H placement.
+///
+/// The H-placement uses ideal per-residue geometry without checking the rest of
+/// the (folded) protein, so in tightly packed regions an added H can sit ~1 Å from
+/// a non-bonded atom of another residue and blow the system up within a few MD
+/// steps; energy minimization cannot always push them apart (bonded forces pin
+/// the H's). We remove any added H that is within `CLASH_DIST` of an atom outside
+/// its own residue. Same-residue atoms are excluded from the check: they are
+/// 1-2/1-3 bonded (or template-adjacent) and legitimately close.
+///
+/// Returns the number of H's removed.
+fn resolve_h_clashes(
+    atoms: &mut Vec<AtomGeneric>,
+    residues: &mut [ResidueGeneric],
+    chains: &mut [ChainGeneric],
+    new_sn_start: u32,
+) -> usize {
+    const CLASH_DIST: f64 = 1.2; // Å — clearly-overlapping non-bonded contact
+    const PARENT_DIST: f64 = 1.55; // Å — longest heavy-H bond (S-H ~1.35 Å)
+
+    // serial -> residue index, and residue index -> set of atom serials
+    let mut res_of: HashMap<u32, usize> = HashMap::new();
+    let mut res_atoms: Vec<HashSet<u32>> = Vec::with_capacity(residues.len());
+    for (ri, res) in residues.iter().enumerate() {
+        let set: HashSet<u32> = res.atom_sns.iter().copied().collect();
+        for sn in &set {
+            res_of.insert(*sn, ri);
+        }
+        res_atoms.push(set);
+    }
+
+    // serial -> index for fast lookup
+    let mut idx_of: HashMap<u32, usize> = HashMap::new();
+    for (i, a) in atoms.iter().enumerate() {
+        idx_of.insert(a.serial_number, i);
+    }
+
+    let h_serials: Vec<u32> = atoms
+        .iter()
+        .filter(|a| a.serial_number >= new_sn_start)
+        .map(|a| a.serial_number)
+        .collect();
+
+    let mut to_remove: HashSet<u32> = HashSet::new();
+
+    for &sn in &h_serials {
+        let Some(&hi) = idx_of.get(&sn) else {
+            continue;
+        };
+        let h_pos = atoms[hi].posit;
+
+        // parent = nearest heavy atom within PARENT_DIST
+        let mut parent_sn: Option<u32> = None;
+        let mut best = PARENT_DIST;
+        for (j, a) in atoms.iter().enumerate() {
+            if j == hi || a.element == Element::Hydrogen {
+                continue;
+            }
+            let d = (a.posit - h_pos).magnitude();
+            if d < best {
+                best = d;
+                parent_sn = Some(a.serial_number);
+            }
+        }
+        let Some(psn) = parent_sn else { continue };
+        let Some(&pri) = res_of.get(&psn) else {
+            continue;
+        };
+        let excluded = &res_atoms[pri];
+
+        // min distance to a non-excluded atom
+        let mut min_d = f64::INFINITY;
+        for (j, a) in atoms.iter().enumerate() {
+            if j == hi || excluded.contains(&a.serial_number) {
+                continue;
+            }
+            let d = (a.posit - h_pos).magnitude();
+            if d < min_d {
+                min_d = d;
+            }
+        }
+
+        if min_d < CLASH_DIST {
+            to_remove.insert(sn);
+        }
+    }
+
+    // Remove marked atoms (descending index), clean residue/chain refs.
+    let mut idxs: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| to_remove.contains(&a.serial_number))
+        .map(|(i, _)| i)
+        .collect();
+    idxs.sort_unstable_by(|a, b| b.cmp(a));
+    for i in idxs {
+        atoms.remove(i);
+    }
+    for res in residues.iter_mut() {
+        res.atom_sns.retain(|sn| !to_remove.contains(sn));
+    }
+    for ch in chains.iter_mut() {
+        ch.atom_sns.retain(|sn| !to_remove.contains(sn));
+    }
+
+    let n = to_remove.len();
+    if n > 0 {
+        eprintln!("Removed {n} H(s) to resolve clashes.");
+    }
+    n
+}
+
+/// Find Cys SG atoms that form a disulfide bridge (SG–SG distance < 2.4 Å).
+/// Used to prevent protonating bridged cysteines during H placement.
+pub fn find_disulfide_sgs(atoms: &[AtomGeneric]) -> HashSet<u32> {
+    let sg: Vec<usize> = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(&a.type_in_res, Some(AtomTypeInRes::SG)))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = HashSet::new();
+    for a in 0..sg.len() {
+        for b in (a + 1)..sg.len() {
+            let d = (atoms[sg[a]].posit - atoms[sg[b]].posit).magnitude();
+            if d < 2.4 {
+                out.insert(atoms[sg[a]].serial_number);
+                out.insert(atoms[sg[b]].serial_number);
+            }
+        }
+    }
+    out
+}
+
+pub fn populate_hydrogens_dihedrals(
+    atoms: &mut Vec<AtomGeneric>,
+    residues: &mut [ResidueGeneric],
+    chains: &mut [ChainGeneric],
+    ff_map: &ProtFfChargeMapSet,
+    ph: f32,
+    custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
+) -> Result<Vec<Dihedral>, ParamError> {
+    // todo: Move this fn to this module? Split this and its diehdral component, or not?
+
+    // Sets up write-once static muts.
+    init_local_bond_vecs(); // This is a bit hacky, and only needs to be run once.
+
+    let mut index_map = HashMap::new();
+    for (i, atom) in atoms.iter().enumerate() {
+        index_map.insert(atom.serial_number, i);
+    }
+
+    // Detect Cys-Cys disulfide bridges (SG–SG < 2.4 Å) so the hydrogen
+    // placement below does not protonate bonded SG atoms — otherwise every
+    // disulfide S gets a thiol H clashing inside the bridge (huge forces).
+    let disulfide_sg_sns = find_disulfide_sgs(atoms);
+
+    let mut dihedrals = Vec::with_capacity(residues.len());
+
+    let mut prev_cp_ca = None;
+
+    let res_len = residues.len();
+
+    // todo: The Clone avoids a double-borrow error below. Come back to /avoid if possible.
+    let res_clone = residues.to_owned();
+
+    // todo: Handle the N and C term A/R.
+    let digit_map = make_h_digit_map(&ff_map.internal, ph);
+
+    // Increment H serial number, starting with the final atom present prior to adding H + 1)
+    let mut highest_sn = 0;
+    for atom in atoms.iter() {
+        if atom.serial_number > highest_sn {
+            highest_sn = atom.serial_number;
+        }
+    }
+    let mut next_sn = highest_sn + 1;
+
+    for (res_i, res) in residues.iter_mut().enumerate() {
+        let mut n_next_pos = None;
+        // todo: Messy DRY from the aa_data_from_coords fn.
+        if res_i < res_len - 1 {
+            let res_next = &res_clone[res_i + 1];
+
+            let n_next = res_next.atom_sns.iter().find(|i| {
+                if let Some(&idx) = index_map.get(*i) {
+                    matches!(&atoms[idx].type_in_res, Some(tir) if *tir == AtomTypeInRes::N)
+                } else {
+                    false
+                }
+            });
+
+            if let Some(n_next) = n_next {
+                if let Some(&idx) = index_map.get(n_next) {
+                    n_next_pos = Some(atoms[idx].posit);
+                }
+            }
+        }
+
+        // filter_map skips any serial numbers not yet in index_map (e.g. H atoms
+        // pushed by a previous call that haven't been re-indexed, or atoms absent
+        // from the atoms list due to alternate conformations / filtering upstream).
+        let atoms_this_res: Vec<&_> = res
+            .atom_sns
+            .iter()
+            .filter_map(|i| index_map.get(i).map(|&idx| &atoms[idx]))
+            .collect();
+
+        // Determine custom variant and geometry-based Histidine choice
+        let mut custom_variant = None;
+        let mut custom_variant_used = false;
+        if let Some(map) = custom_protonation {
+            if let Some(&var) = map.get(&res_i) {
+                custom_variant = Some(var);
+                custom_variant_used = true;
+            }
+        }
+
+        if !custom_variant_used && matches!(res.res_type, ResidueType::AminoAcid(AminoAcid::His)) {
+            let var = resolve_his_tautomer_by_geometry(atoms, res);
+            custom_variant = Some(var);
+            custom_variant_used = true;
+        }
+
+        let this_digit_map = if custom_variant_used {
+            make_h_digit_map_custom(&ff_map.internal, ph, custom_variant)
+        } else {
+            digit_map.clone()
+        };
+
+        // todo: Handle the N term and C term cases; pass those params in.
+        let (dihedral, h_added_this_res, this_cp_ca) = aa_data_from_coords(
+            &atoms_this_res,
+            &res_clone,
+            &res.res_type,
+            prev_cp_ca,
+            n_next_pos,
+            &this_digit_map,
+            &disulfide_sg_sns,
+        )?;
+
+        // Get the first atom's chain; probably OK for assigning a chain to H.
+        let mut chain_i = 0;
+        if !atoms_this_res.is_empty() {
+            for (i, chain) in chains.iter().enumerate() {
+                if chain.atom_sns.contains(&atoms_this_res[0].serial_number) {
+                    chain_i = i;
+                    break;
+                }
+            }
+        }
+
+        for mut h in h_added_this_res {
+            h.serial_number = next_sn;
+            atoms.push(h);
+            index_map.insert(next_sn, atoms.len() - 1); // keep map in sync
+
+            res.atom_sns.push(next_sn);
+            chains[chain_i].atom_sns.push(next_sn);
+
+            next_sn += 1;
+        }
+
+        prev_cp_ca = this_cp_ca;
+        // res.dihedral = Some(dihedral);
+        dihedrals.push(dihedral);
+    }
+
+    // Resolve clashes introduced by idealized H placement: an H can sit < 1.2 Å
+    // from an atom of another residue in a folded protein and blow the system up
+    // within a few MD steps.
+    resolve_h_clashes(atoms, residues, chains, highest_sn + 1);
+
+    Ok(dihedrals)
+}

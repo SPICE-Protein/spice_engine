@@ -341,28 +341,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
-name = "dynamics"
-version = "0.2.0"
-dependencies = [
- "bincode",
- "bio_apis",
- "bio_files",
- "candle-core",
- "candle-nn",
- "ewald",
- "indicatif",
- "itertools",
- "lazy_static",
- "lin_alg",
- "mcubes",
- "na_seq",
- "rand 0.10.2",
- "rand_distr 0.6.0",
- "rayon",
- "wide",
-]
-
-[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -668,9 +646,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "http"
@@ -1022,7 +1000,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
- "rand 0.8.7",
+ "rand 0.8.8",
  "rand_distr 0.4.3",
  "simba",
  "typenum",
@@ -1397,9 +1375,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -1478,7 +1456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
 dependencies = [
  "num-traits",
- "rand 0.8.7",
+ "rand 0.8.8",
 ]
 
 [[package]]
@@ -1825,15 +1803,24 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spice_engine"
-version = "1.1.0"
+version = "1.3.0"
 dependencies = [
+ "bincode",
+ "bio_apis",
  "bio_files",
- "dynamics",
+ "candle-core",
+ "candle-nn",
+ "ewald",
  "indicatif",
+ "itertools",
+ "lazy_static",
  "lin_alg",
+ "mcubes",
  "na_seq",
  "numpy",
  "pyo3",
+ "rand 0.10.2",
+ "rand_distr 0.6.0",
  "rayon",
  "wide",
 ]
@@ -1853,7 +1840,7 @@ dependencies = [
  "approx",
  "nalgebra",
  "num-traits",
- "rand 0.8.7",
+ "rand 0.8.8",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ use lin_alg::f32::{Mat3 as Mat3F32, Vec3};
 use rand::RngExt;
 use rand_distr::StandardNormal;
 
-use crate::{
+use crate::engine::md_core::{
     CENTER_SIMBOX_RATIO, COMPUTATION_TIME_RATIO, ComMotionRemoval, ComputationDevice,
     HydrogenConstraint, KCAL_TO_NATIVE, MdState, Solvent,
     barostat::measure_pressure,
@@ -75,7 +75,18 @@ impl MdState {
     ///
     /// `External force` allows injection of a specific force into the system. It's indexed by atom.
     pub fn step(&mut self, dev: &ComputationDevice, dt: f32, external_force: Option<Vec<Vec3>>) {
-        if let Some(f_ext) = &external_force
+        self.step_with_external_force(dev, dt, external_force.as_deref());
+    }
+
+    /// Borrowing variant for RL callers. The force slice is consumed during the
+    /// step and is not cloned or retained by the MD state.
+    pub fn step_with_external_force(
+        &mut self,
+        dev: &ComputationDevice,
+        dt: f32,
+        external_force: Option<&[Vec3]>,
+    ) {
+        if let Some(f_ext) = external_force
             && f_ext.len() != self.atoms.len()
         {
             eprintln!(
@@ -89,6 +100,8 @@ impl MdState {
         }
 
         let start_entire_step = Instant::now();
+        self.last_step_neighbor_rebuild = false;
+        self.last_step_pme = false;
         let mut start = Instant::now(); // Re-used for different items
 
         let log_time = self.step_count.is_multiple_of(COMPUTATION_TIME_RATIO);
@@ -131,8 +144,8 @@ impl MdState {
                 // ~+70 K above target. `gamma` is read again in
                 // kick_and_calc_accel from self.cfg.integrator.
                 let _ = gamma;
-                // Refresh KE for the barostat / pressure calc.
-                self.kinetic_energy = self.measure_kinetic_energy();
+                // `kick_and_drift` already refreshed KE for this exact state;
+                // avoid a second full solute + rigid-water traversal here.
 
                 // Rattle after the thermostat run, as it updates velocities in a non-uniform manner.
                 if matches!(
@@ -165,7 +178,7 @@ impl MdState {
                 }
 
                 self.reset_f_acc_pe_virial();
-                self.apply_all_forces(dev, &external_force);
+                self.apply_all_forces(dev, external_force);
 
                 // Applying from our pre-reset calcs.
                 self.barostat.virial.constraints = virial_constr;
@@ -178,7 +191,7 @@ impl MdState {
                     &self.barostat.virial.to_kcal_mol(),
                 );
 
-                if let Some(bc) = &self.cfg.barostat_cfg {
+                let box_changed = if let Some(bc) = &self.cfg.barostat_cfg {
                     self.barostat.apply_isotropic(
                         dt as f64,
                         pressure,
@@ -187,12 +200,15 @@ impl MdState {
                         &mut self.cell,
                         &mut self.atoms,
                         &mut self.water,
-                    );
-                }
+                    )
+                } else {
+                    false
+                };
 
-                // The box dimensions changed; update PME so the next force computation
-                // uses the correct reciprocal lattice vectors.
-                self.regen_pme(dev);
+                // Rebuild PME only when the barostat actually changed the box.
+                if box_changed {
+                    self.regen_pme(dev);
+                }
 
                 if log_time {
                     let elapsed = start.elapsed().as_micros() as u64;
@@ -231,7 +247,7 @@ impl MdState {
                 }
 
                 self.reset_f_acc_pe_virial();
-                self.apply_all_forces(dev, &external_force);
+                self.apply_all_forces(dev, external_force);
 
                 if log_time {
                     start = Instant::now();
@@ -297,7 +313,7 @@ impl MdState {
                 // Barostat runs last in VV: velocities are fully updated and the thermostat has
                 // already set the correct KE, so the box/coordinate scaling happens cleanly.
                 // Scaled positions feed into the next step's force computation.
-                if let Some(bc) = &self.cfg.barostat_cfg {
+                let box_changed = if let Some(bc) = &self.cfg.barostat_cfg {
                     self.barostat.apply_isotropic(
                         dt as f64,
                         pressure,
@@ -306,11 +322,14 @@ impl MdState {
                         &mut self.cell,
                         &mut self.atoms,
                         &mut self.water,
-                    );
+                    )
+                } else {
+                    false
+                };
+                // Rebuild PME only when the barostat actually changed the box.
+                if box_changed {
+                    self.regen_pme(dev);
                 }
-                // The box dimensions changed; update PME so the next force computation
-                // uses the correct reciprocal lattice vectors.
-                self.regen_pme(dev);
 
                 if log_time {
                     let elapsed = start.elapsed().as_micros() as u64;
@@ -363,7 +382,7 @@ impl MdState {
 
                 // Compute forces at x(n+1).
                 self.reset_f_acc_pe_virial();
-                self.apply_all_forces(dev, &external_force);
+                self.apply_all_forces(dev, external_force);
 
                 self.barostat.virial.constraints = virial_constr;
 
@@ -393,7 +412,7 @@ impl MdState {
 
                 if let Some(bc) = &self.cfg.barostat_cfg {
                     // todo temp
-                    self.barostat.apply_isotropic(
+                    let box_changed = self.barostat.apply_isotropic(
                         dt as f64,
                         pressure,
                         self.cfg.temp_target as f64,
@@ -402,7 +421,9 @@ impl MdState {
                         &mut self.atoms,
                         &mut self.water,
                     );
-                    self.regen_pme(dev);
+                    if box_changed {
+                        self.regen_pme(dev);
+                    }
                 }
 
                 pressure
@@ -432,7 +453,10 @@ impl MdState {
         start = Instant::now(); // No ratio for neighbor times.
 
         self.update_max_displacement_since_rebuild();
+        let rebuild_before = self.computation_time.neighbor_rebuild_count;
         self.build_neighbors_if_needed(dev);
+        self.last_step_neighbor_rebuild =
+            self.computation_time.neighbor_rebuild_count > rebuild_before;
 
         let elapsed = start.elapsed().as_micros() as u64;
         self.computation_time.neighbor_all_sum += elapsed;
@@ -440,9 +464,9 @@ impl MdState {
         // We keeping the cell centered on the dynamics atoms. Note that we don't change the dimensions,
         // as these are under management by the barostat.
         if self.cfg.recenter_sim_box && self.step_count.is_multiple_of(CENTER_SIMBOX_RATIO) {
+            // Recentering changes only the box origin; PME depends on the box
+            // lengths, so its FFT/reciprocal workspace remains valid.
             self.cell.recenter(&self.atoms);
-            // todo: Will this interfere with carrying over state from the previous step?
-            self.regen_pme(dev);
         }
 
         if self.step_count.is_multiple_of(RESET_ANGLE_RATIO) && self.step_count != 0 {

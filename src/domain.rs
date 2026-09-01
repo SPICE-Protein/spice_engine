@@ -402,7 +402,7 @@ struct PointTemplate {
     /// restart starts from the build-time volume — reusing only positions
     /// leaves the box at the previous temperature's volume, and the density
     /// mismatch crashes cold restarts (fresh builds at that T are stable).
-    init_cell: dynamics::SimBox,
+    init_cell: crate::engine::md_core::SimBox,
     /// Environment the engine was built with.
     env: EnvParams,
 }
@@ -426,8 +426,8 @@ fn build_key(e: EnvParams) -> (u32, bool, u32) {
 /// per-point solvent init + minimization). A `None` or mismatching template
 /// triggers a fresh build.
 fn probe_point(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     env: EnvParams,
     build_opts: &BuildOptions,
@@ -608,8 +608,8 @@ fn log_progress(msg: String, inc: bool) {
 }
 
 fn eval_group_point(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     env: EnvParams,
     build_opts: &BuildOptions,
@@ -679,8 +679,8 @@ fn inferred_stable(env: EnvParams) -> StabilityPoint {
 /// `indices` must be ordered by temperature in the direction of the walk
 /// (ascending for "above", descending for "below").
 fn bold_walk(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     envs: &[EnvParams],
     indices: &[usize],
@@ -768,8 +768,8 @@ fn bold_walk(
 
 /// strategy — no T-scan is wasted on a pH that cannot even build.
 pub fn scan_stability(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     grid: &EnvGrid,
     build_opts: &BuildOptions,
@@ -1137,8 +1137,8 @@ fn report_point(
 /// `probe.precision`. Samples far fewer points than a uniform walk and locates
 /// the boundary more tightly.
 fn probe_ray_adaptive(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     anchor: EnvParams,
     axis: Axis,
@@ -1211,8 +1211,8 @@ fn probe_ray_adaptive(
 /// system is judged unstable, a build fails, or `max_steps` is reached. Each
 /// ray is an independent build+simulate, so all rays run in parallel via rayon.
 pub fn scan_radial(
-    dev: &dynamics::ComputationDevice,
-    param_set: &dynamics::params::FfParamSet,
+    dev: &crate::engine::md_core::ComputationDevice,
+    param_set: &crate::engine::md_core::params::FfParamSet,
     structure: &StructureInput,
     anchor: EnvParams,
     probes: &[AxisProbe],

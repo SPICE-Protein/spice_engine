@@ -5,7 +5,7 @@ use na_seq::Element;
 use rand::{RngExt, distr::Distribution, rngs::StdRng};
 use rand_distr::{ChiSquared, StandardNormal};
 
-use crate::{
+use crate::engine::md_core::{
     ComMotionRemoval, HydrogenConstraint, MdState, NATIVE_TO_KCAL,
     solvent::{H_MASS, MASS_WATER_MOL, O_MASS},
 };
@@ -70,47 +70,21 @@ impl MdState {
             let m_h0 = w.h0.mass;
             let m_h1 = w.h1.mass;
             let m_total = m_o + m_h0 + m_h1;
-            let r_com = (w.o.posit * m_o + w.h0.posit * m_h0 + w.h1.posit * m_h1) / m_total;
             let v_com = (w.o.vel * m_o + w.h0.vel * m_h0 + w.h1.vel * m_h1) / m_total;
 
-            let (r_o, r_h0, r_h1) = (w.o.posit - r_com, w.h0.posit - r_com, w.h1.posit - r_com);
-            let (v_o, v_h0, v_h1) = (w.o.vel - v_com, w.h0.vel - v_com, w.h1.vel - v_com);
-            let l = r_o.cross(v_o) * m_o + r_h0.cross(v_h0) * m_h0 + r_h1.cross(v_h1) * m_h1;
+            let v_o = w.o.vel - v_com;
+            let v_h0 = w.h0.vel - v_com;
+            let v_h1 = w.h1.vel - v_com;
 
-            // Inertia tensor about COM.
-            let inertia = |r: Vec3, mass: f32| {
-                let r2 = r.dot(r);
-                [
-                    [
-                        mass * (r2 - r.x * r.x),
-                        -mass * r.x * r.y,
-                        -mass * r.x * r.z,
-                    ],
-                    [
-                        -mass * r.y * r.x,
-                        mass * (r2 - r.y * r.y),
-                        -mass * r.y * r.z,
-                    ],
-                    [
-                        -mass * r.z * r.x,
-                        -mass * r.z * r.y,
-                        mass * (r2 - r.z * r.z),
-                    ],
-                ]
-            };
-            let mut i_arr = inertia(r_o, m_o);
-            for add in [inertia(r_h0, m_h0), inertia(r_h1, m_h1)] {
-                for i in 0..3 {
-                    for j in 0..3 {
-                        i_arr[i][j] += add[i][j];
-                    }
-                }
-            }
-            let i_mat = Mat3F32::from_arr(i_arr);
-            let omega = i_mat.solve_system(l); // ω = I⁻¹L
-
+            // For a rigid body, the rotational contribution is exactly the
+            // mass-weighted sum of squared velocities relative to COM:
+            // Σ m_i |v_i - V_com|² = L·ω.  This avoids constructing and
+            // solving a 3×3 inertia system for every water molecule on every
+            // kinetic-energy refresh.
             result += (m_total * v_com.magnitude_squared()) as f64; // M·V²
-            result += l.dot(omega) as f64; // L·ω = 2·(rotational KE)
+            result += (m_o * v_o.magnitude_squared()
+                + m_h0 * v_h0.magnitude_squared()
+                + m_h1 * v_h1.magnitude_squared()) as f64;
         }
 
         // Add in the 0.5 factor, and convert from amu • (Å/ps)² to kcal/mol.

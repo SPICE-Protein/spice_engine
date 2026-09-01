@@ -4,8 +4,8 @@
 //! 3. stability margin and RMSF metrics
 
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::structure::{AtomInput, StructureInput};
 use spice_engine::{
     BuildOptions, Metrics, MetricsConfig, build_mutant_by_solvent_reuse, build_system,

@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
 use na_seq::AminoAcidProtenationVariant;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::{BuildOptions, build_system};
 
 #[test]

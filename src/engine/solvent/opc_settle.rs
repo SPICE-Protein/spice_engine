@@ -6,10 +6,11 @@
 //! -[GROMACS](https://github.com/openmm/openmm/blob/b0c2c4d84ef1ac82984a577c7506912f5f91bafa/platforms/reference/include/ReferenceSETTLEAlgorithm.h#L4)
 //! Note that these also have CPU implementation files; QC them A/R
 //!
+//! todo: Compute SETTLE using the GPU.
 
 use lin_alg::f32::Vec3;
 
-use crate::{
+use crate::engine::md_core::{
     barostat::SimBox,
     solvent::{H_MASS, H_O_H_θ, MASS_WATER_MOL, O_EP_R, O_H_R, O_MASS, WaterMolOpc},
 };

@@ -31,8 +31,8 @@ pub fn validate_rna_input(input: &RnaStructureInput) -> Result<(), String> {
 /// separate from the protein builder and will be connected to the Amber/CHARMM
 /// RNA adapters by the S4RNA integration work.
 pub fn build_rna_from_input(
-    _dev: &dynamics::ComputationDevice,
-    _param_set: &dynamics::params::FfParamSet,
+    _dev: &crate::engine::md_core::ComputationDevice,
+    _param_set: &crate::engine::md_core::params::FfParamSet,
     input: &RnaStructureInput,
     opts: &crate::builder::BuildOptions,
 ) -> Result<crate::engine::SpiceEngine, String> {

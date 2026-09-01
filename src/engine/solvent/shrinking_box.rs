@@ -14,7 +14,7 @@ use lin_alg::{
 };
 use rand::distr::Uniform;
 
-use crate::{
+use crate::engine::md_core::{
     ComputationDevice, CustomSolventCount, MdConfig, MdOverrides, MdState, MolDynamics, ParamError,
     SimBox, SimBoxInit, Solvent,
     params::FfParamSet,
@@ -76,7 +76,7 @@ impl ShrinkingBoxCfg {
         ]
     }
 
-    pub(in crate::solvent) fn next_cell(
+    pub(in crate::engine::md_core::solvent) fn next_cell(
         self,
         current_cell: SimBox,
         target_cell: SimBox,

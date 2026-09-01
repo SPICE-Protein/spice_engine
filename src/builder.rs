@@ -1,10 +1,10 @@
 //! System construction: prepare a peptide from mmCIF and build the MD state.
 
-use bio_files::MmCif;
-use dynamics::params::{FfParamSet, prepare_peptide_mmcif};
-use dynamics::{
+use crate::engine::md_core::params::{FfParamSet, prepare_peptide_mmcif};
+use crate::engine::md_core::{
     ComputationDevice, FfMolType, HydrogenConstraint, MdConfig, MdState, MolDynamics, SimBoxInit,
 };
+use bio_files::MmCif;
 
 use crate::engine::SpiceEngine;
 use crate::env::EnvParams;
@@ -227,7 +227,7 @@ pub fn build_mutant_by_solvent_reuse(
         spme_alpha: opts.spme_alpha,
         neighbor_skin: opts.neighbor_skin,
         sim_box: SimBoxInit::Fixed((parent.state.cell.bounds_low, parent.state.cell.bounds_high)),
-        solvent: dynamics::Solvent::None,
+        solvent: crate::engine::md_core::Solvent::None,
         max_init_relaxation_iters: None, // No minimization here
         recenter_sim_box: false,
         ..Default::default()

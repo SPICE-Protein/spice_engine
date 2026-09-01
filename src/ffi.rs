@@ -25,9 +25,11 @@ use crate::metrics::{Metrics, MetricsConfig};
 use crate::structure::{AtomInput, StructureInput, build_from_input};
 
 /// Lazily loaded Amber parameter set (load once per process).
-fn param_set() -> &'static dynamics::params::FfParamSet {
-    static PS: OnceLock<dynamics::params::FfParamSet> = OnceLock::new();
-    PS.get_or_init(|| dynamics::params::FfParamSet::new_amber().expect("load amber params"))
+fn param_set() -> &'static crate::engine::md_core::params::FfParamSet {
+    static PS: OnceLock<crate::engine::md_core::params::FfParamSet> = OnceLock::new();
+    PS.get_or_init(|| {
+        crate::engine::md_core::params::FfParamSet::new_amber().expect("load amber params")
+    })
 }
 
 fn err<T>(msg: impl Into<String>) -> PyResult<T> {
@@ -206,7 +208,7 @@ impl PyEngine {
         tolerance: f32,
         strict_incomplete: bool,
     ) -> PyResult<Self> {
-        let dev = dynamics::ComputationDevice::Cpu;
+        let dev = crate::engine::md_core::ComputationDevice::Cpu;
         let opts = BuildOptions {
             env: EnvParams::new(ph, temp, pressure, ionic_strength_m),
             relax_iters: Some(relax_iters),
@@ -629,9 +631,9 @@ impl PyEngine {
     ///   "nve"             -> VerletVelocity with NO thermostat (energy-conservation probe)
     fn set_integrator(&mut self, mode: &str) -> PyResult<()> {
         let integrator = match mode {
-            "langevin_middle" => dynamics::Integrator::LangevinMiddle { gamma: 0.5 },
-            "langevin_strong" => dynamics::Integrator::LangevinMiddle { gamma: 10.0 },
-            "nve" => dynamics::Integrator::VerletVelocity { thermostat: None },
+            "langevin_middle" => crate::engine::md_core::Integrator::LangevinMiddle { gamma: 0.5 },
+            "langevin_strong" => crate::engine::md_core::Integrator::LangevinMiddle { gamma: 10.0 },
+            "nve" => crate::engine::md_core::Integrator::VerletVelocity { thermostat: None },
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown integrator mode '{other}' (expected langevin_middle | langevin_strong | nve)"
@@ -1031,7 +1033,7 @@ fn scan_impl<'py>(
     let opts = BuildOptions::default();
     let structure = structure.borrow();
     let pts = crate::domain::scan_stability(
-        &dynamics::ComputationDevice::Cpu,
+        &crate::engine::md_core::ComputationDevice::Cpu,
         param_set(),
         &structure.inner,
         &grid,
@@ -1309,7 +1311,7 @@ fn scan_radial<'py>(
     let opts = BuildOptions::default();
     let structure = structure.borrow();
     let rays = crate::domain::scan_radial(
-        &dynamics::ComputationDevice::Cpu,
+        &crate::engine::md_core::ComputationDevice::Cpu,
         param_set(),
         &structure.inner,
         anchor,

@@ -9,7 +9,7 @@ use bio_files::{AtomGeneric, BondGeneric, BondType, gromacs::gro::Gro};
 use lin_alg::{f32::Vec3 as Vec3F32, f64::Vec3};
 use na_seq::Element::{Carbon, Hydrogen, Oxygen};
 
-use crate::{FfMolType, MolDynamics, ParamError, util::build_adjacency_list};
+use crate::engine::md_core::{FfMolType, MolDynamics, ParamError, util::build_adjacency_list};
 
 #[allow(clippy::doc_lazy_continuation)]
 /// Using PubChem data as a reference. Partial charges are computed using ORCA. We use this input:

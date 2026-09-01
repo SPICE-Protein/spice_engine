@@ -2,7 +2,7 @@
 
 use lin_alg::{f32::Vec3, f64::Vec3 as Vec3F64};
 
-use crate::{
+use crate::engine::md_core::{
     MdState,
     solvent::{H_MASS, MASS_WATER_MOL, O_MASS},
 };

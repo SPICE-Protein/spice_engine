@@ -1,9 +1,12 @@
-//! The high-level SPICE MD engine: wraps `dynamics::MdState` with topology + env.
+//! The high-level SPICE MD engine: wraps `crate::engine::md_core::MdState` with topology + env.
 
 use std::collections::VecDeque;
 
-use dynamics::{ComputationDevice, MdState};
+use crate::engine::md_core::{ComputationDevice, MdState};
 use lin_alg::f32::Vec3;
+
+#[path = "engine/core/mod.rs"]
+pub mod md_core;
 
 use crate::env::EnvParams;
 use crate::forcefield::{
@@ -249,7 +252,7 @@ impl SpiceEngine {
     ) {
         self.state
             .distance_restraints
-            .push(dynamics::DistanceRestraint {
+            .push(crate::engine::md_core::DistanceRestraint {
                 atom_0_idx,
                 atom_1_idx,
                 r0,

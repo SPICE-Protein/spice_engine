@@ -2,9 +2,9 @@
 //! Kept as #[ignore] — run explicitly with `cargo test --release -- --ignored prep_debug`.
 
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use na_seq::{AtomTypeInRes, Element};
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::{FfParamSet, prepare_peptide_mmcif};
 use std::collections::HashSet;
 use std::path::Path;
 

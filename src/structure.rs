@@ -15,9 +15,9 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use crate::engine::md_core::ComputationDevice;
+use crate::engine::md_core::params::FfParamSet;
 use bio_files::{AtomGeneric, ChainGeneric, MmCif, ResidueEnd, ResidueGeneric, ResidueType};
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
 use na_seq::{AtomTypeInRes, Element};
 
 use crate::builder::{BuildOptions, build_system};

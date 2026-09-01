@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use bio_files::MmCif;
-use dynamics::ComputationDevice;
-use dynamics::params::FfParamSet;
+use spice_engine::engine::dynamics::ComputationDevice;
+use spice_engine::engine::dynamics::params::FfParamSet;
 use spice_engine::{BuildOptions, build_system};
 
 #[test]

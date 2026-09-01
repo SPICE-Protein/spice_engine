@@ -10,24 +10,13 @@
 use std::{fs, io, path::Path, time::Instant};
 
 use bincode::{Decode, Encode};
-
-fn load_from_bytes_bincode<T: Decode<()>>(bytes: &[u8]) -> io::Result<T> {
-    bincode::decode_from_slice(bytes, bincode::config::standard())
-        .map(|(value, _)| value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-fn save<T: Encode>(path: &Path, value: &T) -> io::Result<()> {
-    let bytes = bincode::encode_to_vec(value, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, bytes)
-}
 use bio_files::{gromacs, gromacs::gro::Gro};
 use lin_alg::f32::{Quaternion, Vec3};
 
-use crate::{
+use crate::engine::md_core::{
     AtomDynamics, ComputationDevice, MdState, Solvent,
     barostat::SimBox,
+    partial_charge_inference::{files::load_from_bytes_bincode, save},
     sa_surface,
     solvent::WaterMolOpc,
 };
@@ -54,7 +43,8 @@ const MIN_NONWATER_DIST_SQ: f32 = MIN_NONWATER_DIST * MIN_NONWATER_DIST;
 
 // Direct O-O overlap check — prevents truly coincident molecules.
 const MIN_WATER_O_O_DIST: f32 = 1.7;
-pub(in crate::solvent) const MIN_WATER_O_O_DIST_SQ: f32 = MIN_WATER_O_O_DIST * MIN_WATER_O_O_DIST;
+pub(in crate::engine::md_core::solvent) const MIN_WATER_O_O_DIST_SQ: f32 =
+    MIN_WATER_O_O_DIST * MIN_WATER_O_O_DIST;
 
 // PBC-boundary exclusion distance.
 // When a smaller box is filled from a larger template (e.g. 30 Å from a 60 Å template),
@@ -80,14 +70,12 @@ const NUM_EQUILIBRATION_STEPS_OTHER_SOLVENT: usize = 600;
 const DT_EQUILIBRATION: f32 = 0.0005;
 
 // We generate and use this externally, for example, when passing it to GROMACS in Molchanica.
-pub const WATER_TEMPLATE_60A: &[u8] =
-    include_bytes!("../../parameters/data/solvent/water_60A.water_init_template");
+pub const WATER_TEMPLATE_60A: &[u8] = include_bytes!("../param_data/water_60A.water_init_template");
 
 // Included with GROMACS. 4-point water model. 30Å per side?
-pub const WATER_TEMPLATE_TIP4: &str = include_str!("../../parameters/data/solvent/tip4p.gro");
+pub const WATER_TEMPLATE_TIP4: &str = include_str!("../param_data/tip4p.gro");
 // We generated this using a shrinking box.
-pub const OCTANOL_WATER_TEMPLATE: &str =
-    include_str!("../../parameters/data/solvent/octanol_water_saturated.gro");
+pub const OCTANOL_WATER_TEMPLATE: &str = include_str!("../param_data/octanol_water_saturated.gro");
 
 /// Contains variants of templates we have built into this library. These are
 /// included in the binary of applications which use this.
@@ -363,7 +351,10 @@ impl WaterInitTemplate {
 }
 
 /// Determine the number of solvent molecules to add, based on box size and solute.
-pub(in crate::solvent) fn n_water_mols(cell: &SimBox, solute_atoms: &[AtomDynamics]) -> usize {
+pub(in crate::engine::md_core::solvent) fn n_water_mols(
+    cell: &SimBox,
+    solute_atoms: &[AtomDynamics],
+) -> usize {
     let cell_volume = cell.volume();
     let mol_volume = sa_surface::vol_take_up_by_atoms(solute_atoms);
     let free_vol = cell_volume - mol_volume;
