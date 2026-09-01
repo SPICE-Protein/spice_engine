@@ -351,22 +351,10 @@ impl Metrics {
     fn surface_residues(&self, engine: &SpiceEngine) -> Vec<bool> {
         let n_res = engine.topology.sequence.len();
         let heavy = &engine.topology.heavy_indices;
-        let n_heavy = heavy.len();
         let mut surface = vec![false; n_res];
 
-        let n_atoms = engine.state.atoms.len();
-        let mut atom_to_res = vec![None; n_atoms];
-        for (res_idx, res) in engine.topology.residues.iter().enumerate() {
-            for &atom_idx in &res.atom_indices {
-                if atom_idx < n_atoms {
-                    atom_to_res[atom_idx] = Some(res_idx);
-                }
-            }
-        }
-
-        let heavy_positions: Vec<(f64, f64, f64)> = heavy.iter().map(|&i| pos(engine, i)).collect();
-
         let r2 = self.config.surface_radius * self.config.surface_radius;
+        let max_neighbors = self.config.surface_max_neighbors;
 
         for i in 0..n_res {
             let Some(&cai) = engine.topology.ca_indices.get(i) else {
@@ -374,21 +362,25 @@ impl Metrics {
             };
             let pc = pos(engine, cai);
             let mut count = 0usize;
-            for j in 0..n_heavy {
-                let hj = heavy[j];
-                if atom_to_res[hj] == Some(i) {
+            for &hj in heavy {
+                // Residues have few atoms, so a short local membership check
+                // avoids allocating a full atom-to-residue work array.
+                if engine.topology.residues[i].atom_indices.contains(&hj) {
                     continue;
                 }
-                let phj = heavy_positions[j];
+                let phj = pos(engine, hj);
                 let dx = pc.0 - phj.0;
                 let dy = pc.1 - phj.1;
                 let dz = pc.2 - phj.2;
                 let d2 = dx * dx + dy * dy + dz * dz;
                 if d2 < r2 {
                     count += 1;
+                    if count > max_neighbors {
+                        break;
+                    }
                 }
             }
-            surface[i] = count <= self.config.surface_max_neighbors;
+            surface[i] = count <= max_neighbors;
         }
         surface
     }
