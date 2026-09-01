@@ -217,29 +217,23 @@ fn backbone_hbonds(engine: &SpiceEngine, cutoff: f64) -> Vec<(usize, usize)> {
     let n = engine.topology.sequence.len();
     let mut out = Vec::new();
 
-    let mut o_positions = vec![None; n];
-    for i in 0..n {
-        if let Some(&oi) = engine.topology.o_indices.get(i) {
-            o_positions[i] = Some(pos(engine, oi));
-        }
-    }
-
-    let mut n_positions = vec![None; n];
-    for j in 0..n {
-        if let Some(&nj) = engine.topology.n_indices.get(j) {
-            n_positions[j] = Some(pos(engine, nj));
-        }
-    }
-
     let cutoff_sq = cutoff * cutoff;
 
+    // Read O/N coordinates directly from topology indices. Avoid allocating
+    // two Vec<Option<...>> work arrays on every metrics evaluation.
     for i in 0..n {
-        let Some(po) = o_positions[i] else { continue };
+        let Some(&oi) = engine.topology.o_indices.get(i) else {
+            continue;
+        };
+        let po = pos(engine, oi);
         for j in 0..n {
             if i == j {
                 continue;
             }
-            let Some(pn) = n_positions[j] else { continue };
+            let Some(&nj) = engine.topology.n_indices.get(j) else {
+                continue;
+            };
+            let pn = pos(engine, nj);
             let dx = po.0 - pn.0;
             let dy = po.1 - pn.1;
             let dz = po.2 - pn.2;
