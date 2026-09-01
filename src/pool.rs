@@ -109,6 +109,25 @@ impl EnginePool {
             .collect())
     }
 
+    /// Advance all workers serially to keep peak memory bounded on small hosts
+    /// (e.g. 2 vCPU / 6 GB). This avoids nesting the outer pool parallelism
+    /// with the inner MD Rayon kernels.
+    pub fn step_all_low_memory(&mut self, actions: &[Vec<f32>]) -> Result<Vec<StepResult>, String> {
+        if actions.len() != self.workers.len() {
+            return Err(format!(
+                "actions len {} != worker count {}",
+                actions.len(),
+                self.workers.len()
+            ));
+        }
+        Ok(self
+            .workers
+            .iter_mut()
+            .zip(actions)
+            .map(|(w, a)| w.force.step(&mut w.engine, a))
+            .collect())
+    }
+
     /// Collect the five metrics across all workers (aligned with `workers`).
     pub fn metrics_all(&self) -> Vec<MetricsResult> {
         self.workers
