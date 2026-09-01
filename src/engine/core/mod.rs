@@ -1839,11 +1839,15 @@ fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
         for &w_idx in &w_indices {
             insert_ion(state, w_idx, ff_type, elem, mass, q_scaled, sigma, eps);
         }
-        // Expand per-mol energy tracking for the new ion "molecules".
+        // Keep dense molecule-energy analysis bounded for low-memory RL runs.
         let n_mols = state.mol_start_indices.len();
-        state
-            .potential_energy_between_mols
-            .resize(n_mols.pow(2), 0.0);
+        if n_mols <= 256 && !state.potential_energy_between_mols.is_empty() {
+            state
+                .potential_energy_between_mols
+                .resize(n_mols * n_mols, 0.0);
+        } else {
+            state.potential_energy_between_mols.clear();
+        }
 
         remove_waters(state, w_indices);
 
@@ -1901,10 +1905,14 @@ impl MdState {
         }
         remove_waters(self, w_indices);
 
-        // Expand per-mol energy tracking for the new ion "molecules".
+        // Keep dense molecule-energy analysis bounded for low-memory RL runs.
         let n_mols = self.mol_start_indices.len();
-        self.potential_energy_between_mols
-            .resize(n_mols.pow(2), 0.0);
+        if n_mols <= 256 && !self.potential_energy_between_mols.is_empty() {
+            self.potential_energy_between_mols
+                .resize(n_mols * n_mols, 0.0);
+        } else {
+            self.potential_energy_between_mols.clear();
+        }
 
         self.lj_tables = LjTables::new(&self.atoms);
         self.thermo_dof = self.dof_for_thermo();
