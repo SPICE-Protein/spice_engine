@@ -215,6 +215,105 @@ fn benchmark_neighbor_skin_sweep() {
 /// one in dynamics; this confirms every measured step has fresh PME forces and
 /// finite energy/virial instead of silently consuming stale cached forces.
 /// Run with: `cargo test --release --test benchmark_md benchmark_pme_cache_regression -- --ignored --nocapture`
+/// Compare the optimized CPU nonbonded dispatcher with the scalar reference
+/// on identical coordinates. The environment switch is process-global, so this
+/// test is intentionally ignored and should be run with one test thread.
+/// Run with: `cargo test --release --test benchmark_md nonbonded_reference_vs_optimized -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "expensive reference-vs-optimized force comparison"]
+fn nonbonded_reference_vs_optimized() {
+    let dev = ComputationDevice::Cpu;
+    let params = FfParamSet::new_amber().expect("load Amber parameters");
+    let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
+    let engine =
+        build_system(&dev, &params, protein, &BuildOptions::default()).expect("build engine");
+
+    let mut reference = engine.state.clone();
+    for a in &mut reference.atoms {
+        a.force = lin_alg::f32::Vec3::new_zero();
+    }
+    for w in &mut reference.water {
+        w.o.force = lin_alg::f32::Vec3::new_zero();
+        w.m.force = lin_alg::f32::Vec3::new_zero();
+        w.h0.force = lin_alg::f32::Vec3::new_zero();
+        w.h1.force = lin_alg::f32::Vec3::new_zero();
+    }
+    reference.potential_energy = 0.0;
+    reference.potential_energy_nonbonded = 0.0;
+    unsafe { std::env::set_var("SPICE_NONBONDED_REFERENCE", "1") };
+    let reference_start = Instant::now();
+    reference.apply_nonbonded_forces(&dev);
+    let reference_us = reference_start.elapsed().as_micros();
+    let reference_forces: Vec<_> = reference.atoms.iter().map(|a| a.force).collect();
+    let reference_water: Vec<_> = reference
+        .water
+        .iter()
+        .map(|w| [w.o.force, w.m.force, w.h0.force, w.h1.force])
+        .collect();
+    let reference_energy = reference.potential_energy_nonbonded;
+    let reference_virial = reference.virial_components().1;
+    let reference_pressure = f64::NAN;
+
+    let mut optimized = engine.state;
+    for a in &mut optimized.atoms {
+        a.force = lin_alg::f32::Vec3::new_zero();
+    }
+    for w in &mut optimized.water {
+        w.o.force = lin_alg::f32::Vec3::new_zero();
+        w.m.force = lin_alg::f32::Vec3::new_zero();
+        w.h0.force = lin_alg::f32::Vec3::new_zero();
+        w.h1.force = lin_alg::f32::Vec3::new_zero();
+    }
+    optimized.potential_energy = 0.0;
+    optimized.potential_energy_nonbonded = 0.0;
+    unsafe { std::env::remove_var("SPICE_NONBONDED_REFERENCE") };
+    let optimized_start = Instant::now();
+    optimized.apply_nonbonded_forces(&dev);
+    let optimized_us = optimized_start.elapsed().as_micros();
+    let optimized_forces: Vec<_> = optimized.atoms.iter().map(|a| a.force).collect();
+    let optimized_water: Vec<_> = optimized
+        .water
+        .iter()
+        .map(|w| [w.o.force, w.m.force, w.h0.force, w.h1.force])
+        .collect();
+
+    assert_eq!(reference_forces.len(), optimized_forces.len());
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    for (a, b) in reference_forces.iter().zip(&optimized_forces) {
+        for (x, y) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)] {
+            max_abs = max_abs.max((x - y).abs());
+            max_rel = max_rel.max((x - y).abs() / x.abs().max(y.abs()).max(1.0));
+        }
+    }
+    for (wa, wb) in reference_water.iter().zip(&optimized_water) {
+        for (a, b) in wa.iter().zip(wb) {
+            for (x, y) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)] {
+                max_abs = max_abs.max((x - y).abs());
+                max_rel = max_rel.max((x - y).abs() / x.abs().max(y.abs()).max(1.0));
+            }
+        }
+    }
+    let optimized_energy = optimized.potential_energy_nonbonded;
+    let optimized_virial = optimized.virial_components().1;
+    let energy_abs = (reference_energy - optimized_energy).abs();
+    let virial_abs = (reference_virial - optimized_virial).abs();
+    let optimized_pressure = f64::NAN;
+    let pressure_abs = (reference_pressure - optimized_pressure).abs();
+    println!(
+        "reference_vs_optimized reference_us={reference_us} optimized_us={optimized_us} max_force_abs={max_abs:.6e} max_force_rel={max_rel:.6e} energy_abs={energy_abs:.6e} virial_abs={virial_abs:.6e} pressure_abs={pressure_abs:.6e} reference_energy={reference_energy:.6e} optimized_energy={optimized_energy:.6e}"
+    );
+    assert!(
+        max_rel < 5.0e-4,
+        "force mismatch: abs={max_abs} rel={max_rel}"
+    );
+    assert!(energy_abs < 1.0e-3, "energy mismatch: {energy_abs}");
+    assert!(virial_abs < 1.0e-2, "virial mismatch: {virial_abs}");
+    if reference_pressure.is_finite() && optimized_pressure.is_finite() {
+        assert!(pressure_abs < 1.0e-3, "pressure mismatch: {pressure_abs}");
+    }
+}
+
 #[test]
 #[ignore = "expensive solvated PME cache regression"]
 fn benchmark_pme_cache_regression() {

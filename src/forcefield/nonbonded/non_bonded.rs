@@ -1042,7 +1042,8 @@ pub(crate) fn alchemical_lj_soft_core_decouple(
     }
 
     let soft_sigma = sigma.max(SOFT_CORE_SIGMA_MIN);
-    let soft_sigma6 = soft_sigma.powi(6);
+    let soft_sigma2 = soft_sigma * soft_sigma;
+    let soft_sigma6 = soft_sigma2 * soft_sigma2 * soft_sigma2;
     let dist6 = dist_sq * dist_sq * dist_sq;
     let lambda_power = lambda.powi(SOFT_CORE_POWER);
     let r_sc6 = dist6 + SOFT_CORE_ALPHA * soft_sigma6 * lambda_power;
@@ -1054,14 +1055,17 @@ pub(crate) fn alchemical_lj_soft_core_decouple(
     let r_sc = r_sc6.powf(1.0 / 6.0);
     let inv_r_sc = 1.0 / r_sc;
     let sr = sigma * inv_r_sc;
-    let sr6 = sr.powi(6);
+    let sr2 = sr * sr;
+    let sr6 = sr2 * sr2 * sr2;
     let sr12 = sr6 * sr6;
     let hard_force_mag = 24.0 * eps * 2.0f32.mul_add(sr12, -sr6) * inv_r_sc;
     let hard_energy = 4.0 * eps * (sr12 - sr6);
     let hard_force = dir * hard_force_mag;
 
     let dist = dist_sq.sqrt();
-    let force_softening = (dist * inv_r_sc).powi(5);
+    let soft_ratio = dist * inv_r_sc;
+    let soft_ratio2 = soft_ratio * soft_ratio;
+    let force_softening = soft_ratio2 * soft_ratio2 * soft_ratio;
     let force = hard_force * (scale * force_softening);
     let energy = hard_energy * scale;
 
@@ -1072,7 +1076,10 @@ pub(crate) fn alchemical_lj_soft_core_decouple(
     };
     let dr_sc_dlambda =
         (SOFT_CORE_POWER as f32) * SOFT_CORE_ALPHA * soft_sigma6 * lambda_power_deriv
-            / (6.0 * r_sc.powi(5));
+            / (6.0 * {
+                let r_sc2 = r_sc * r_sc;
+                r_sc2 * r_sc2 * r_sc
+            });
     let dh_dl = -hard_energy - scale * hard_force_mag * dr_sc_dlambda;
 
     (force, energy, dh_dl)
