@@ -109,6 +109,17 @@ impl EnginePool {
             .collect())
     }
 
+    /// Advance workers using the configured memory policy. Set
+    /// `SPICE_LOW_MEMORY=1` on small hosts to avoid nesting outer pool
+    /// parallelism with each engine's inner MD Rayon kernels.
+    pub fn step_all_auto(&mut self, actions: &[Vec<f32>]) -> Result<Vec<StepResult>, String> {
+        if std::env::var_os("SPICE_LOW_MEMORY").is_some_and(|v| v == "1") {
+            self.step_all_low_memory(actions)
+        } else {
+            self.step_all(actions)
+        }
+    }
+
     /// Advance all workers serially to keep peak memory bounded on small hosts
     /// (e.g. 2 vCPU / 6 GB). This avoids nesting the outer pool parallelism
     /// with the inner MD Rayon kernels.
