@@ -314,21 +314,16 @@ impl Metrics {
         if n_heavy < 2 {
             return 0.0;
         }
-        let radii: Vec<f64> = heavy
-            .iter()
-            .map(|&i| config.vdw.radius(engine.state.atoms[i].element))
-            .collect();
-        let positions: Vec<(f64, f64, f64)> = heavy.iter().map(|&i| pos(engine, i)).collect();
-
         let mut clashes = 0usize;
         let r_factor = config.clash_ratio;
 
         for a in 0..n_heavy {
-            let pa = positions[a];
-            let ra = radii[a];
-            for b in (a + 1)..n_heavy {
-                let pb = positions[b];
-                let rb = radii[b];
+            let ia = heavy[a];
+            let pa = pos(engine, ia);
+            let ra = config.vdw.radius(engine.state.atoms[ia].element);
+            for &ib in &heavy[(a + 1)..] {
+                let pb = pos(engine, ib);
+                let rb = config.vdw.radius(engine.state.atoms[ib].element);
                 let r_sum = (ra + rb) * r_factor;
                 let r_sum_sq = r_sum * r_sum;
 
