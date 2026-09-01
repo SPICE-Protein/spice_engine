@@ -1,4 +1,7 @@
-//! For VDW and Coulomb forces
+//! Non-bonded force evaluation and PME support.
+//!
+//! The implementation is split by responsibility while keeping the original
+//! private namespace and numerical call graph intact.
 
 use std::ops::AddAssign;
 
@@ -11,9 +14,27 @@ use rayon::prelude::*;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use wide::f32x8 as WideF32x8;
 
-// Shared type and kernel definitions. Kept in one namespace so private helpers retain
-// their existing visibility and call graph while the file is split by responsibility.
-include!("types.inc.rs");
-include!("dispatch.inc.rs");
-include!("pme.inc.rs");
-include!("kernels.inc.rs");
+#[cfg(feature = "cuda")]
+use crate::engine::md_core::gpu_interface::force_nonbonded_gpu;
+use crate::engine::md_core::{
+    AtomDynamics, ComputationDevice, MdOverrides, MdState,
+    alchemical::{
+        SOFT_CORE_ALPHA, SOFT_CORE_POWER, SOFT_CORE_SIGMA_MIN, staged_decoupling_schedule,
+    },
+    barostat::SimBox,
+    forces::force_e_lj,
+    solvent::{ForcesOnWaterMol, O_EPS, O_H_R, O_SIGMA, WaterMolOpc, WaterSite},
+    validate_mol_start_indices,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::engine::md_core::{AtomDynamicsx8, AtomDynamicsx16};
+
+mod dispatch;
+mod kernels;
+mod pme;
+mod types;
+
+pub(super) use dispatch::*;
+pub(super) use kernels::*;
+pub(super) use pme::*;
+pub(crate) use types::*;
