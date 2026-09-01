@@ -13,7 +13,6 @@
 //! not all compiled yet; each still has dependencies on private `dynamics`
 //! internals that will be replaced incrementally.
 
-pub mod bonded;
 pub mod neighbors;
 pub mod nonbonded;
 pub mod parameters;
