@@ -14,8 +14,6 @@
 //! by burial count (non-self heavy atoms within Cα radius 8 Å ≤ threshold), with
 //! actual charge summed from atomic partial charges.
 
-use std::collections::HashSet;
-
 use na_seq::Element;
 
 use crate::engine::SpiceEngine;
@@ -177,10 +175,6 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
     let mut com = (0.0f64, 0.0f64, 0.0f64);
     let mut m_sum = 0.0f64;
 
-    let n_heavy = heavy.len();
-    let mut masses = Vec::with_capacity(n_heavy);
-    let mut positions = Vec::with_capacity(n_heavy);
-
     for &i in heavy {
         let m = engine.state.atoms[i].mass as f64;
         let p = pos(engine, i);
@@ -188,8 +182,6 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
         com.1 += m * p.1;
         com.2 += m * p.2;
         m_sum += m;
-        masses.push(m);
-        positions.push(p);
     }
     if m_sum <= 0.0 {
         return 0.0;
@@ -199,9 +191,9 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
     com.2 /= m_sum;
 
     let mut acc = 0.0f64;
-    for i in 0..n_heavy {
-        let m = masses[i];
-        let p = positions[i];
+    for &i in heavy {
+        let m = engine.state.atoms[i].mass as f64;
+        let p = pos(engine, i);
         let dx = p.0 - com.0;
         let dy = p.1 - com.1;
         let dz = p.2 - com.2;
@@ -473,15 +465,9 @@ impl Metrics {
             0.0
         };
 
-        // m3: SS loss
-        let cur = backbone_hbonds(engine, self.config.hbond_n_o);
-        let cur_set: HashSet<(usize, usize)> = cur.into_iter().collect();
-        let mut kept = 0usize;
-        for &(i, j) in &self.ss_ref {
-            if cur_set.contains(&(i, j)) {
-                kept += 1;
-            }
-        }
+        // m3: SS loss. Check only reference bonds directly; avoid building
+        // the current O(res²) bond vector and HashSet on every observation.
+        let kept = ss_kept_count(engine, &self.ss_ref, self.config.hbond_n_o);
         let m3 = if self.ss_ref.is_empty() {
             0.0
         } else {
