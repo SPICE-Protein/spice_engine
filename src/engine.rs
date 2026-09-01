@@ -61,7 +61,14 @@ impl SpiceEngine {
     /// Advance one integration step. `external_force` is per-atom (indexed by
     /// `state.atoms` order) — the hook for SAC bias forces.
     pub fn step(&mut self, external_force: Option<Vec<Vec3>>) -> StepResult {
-        self.state.step(&self.dev, self.dt_ps, external_force);
+        self.step_borrowed(external_force.as_deref())
+    }
+
+    /// Borrowing external-force path used by RL to avoid cloning the full
+    /// all-atom force vector on every action step.
+    pub fn step_borrowed(&mut self, external_force: Option<&[Vec3]>) -> StepResult {
+        self.state
+            .step_with_external_force(&self.dev, self.dt_ps, external_force);
 
         let u_kcal = self.state.potential_energy;
         let crashed = !u_kcal.is_finite() || u_kcal > CRASH_ENERGY_KCAL;

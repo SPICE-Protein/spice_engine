@@ -77,6 +77,7 @@ pub struct ForceAction {
     pub m: usize,
     /// Reusable Cα force scratch; avoids allocating the per-residue vector each step.
     force_ca_scratch: Vec<Vec3>,
+    force_full_scratch: Vec<Vec3>,
     /// Basis matrix `W`, row-major `[L*3, M]`.
     pub w: Vec<f32>,
     /// Force clamp (kcal/(mol·Å)); each component is `±clamp * tanh(·)`.
@@ -114,6 +115,7 @@ impl ForceAction {
         Self {
             m,
             force_ca_scratch: vec![Vec3::new_zero(); n_res],
+            force_full_scratch: Vec::new(),
             w,
             clamp,
             mask: ActionMask::new(n_res, mutation_every),
@@ -187,14 +189,19 @@ impl ForceAction {
                 self.clamp * fz.tanh(),
             );
         }
-        let mut f_full = vec![Vec3::new_zero(); engine.state.atoms.len()];
+        if self.force_full_scratch.len() != engine.state.atoms.len() {
+            self.force_full_scratch
+                .resize(engine.state.atoms.len(), Vec3::new_zero());
+        } else {
+            self.force_full_scratch.fill(Vec3::new_zero());
+        }
         for (res, f) in self.force_ca_scratch.iter().enumerate() {
             let Some(&ca) = engine.topology.ca_indices.get(res) else {
                 continue;
             };
-            f_full[ca] = *f;
+            self.force_full_scratch[ca] = *f;
         }
-        engine.step(Some(f_full))
+        engine.step_borrowed(Some(&self.force_full_scratch))
     }
 }
 
