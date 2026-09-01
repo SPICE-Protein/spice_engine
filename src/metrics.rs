@@ -259,9 +259,23 @@ pub(crate) fn ss_kept_count(engine: &SpiceEngine, refs: &[(usize, usize)], cutof
     if refs.is_empty() {
         return 0;
     }
-    let cur = backbone_hbonds(engine, cutoff);
-    let cur_set: HashSet<(usize, usize)> = cur.into_iter().collect();
-    refs.iter().filter(|hb| cur_set.contains(hb)).count()
+    let cutoff_sq = cutoff * cutoff;
+    refs.iter()
+        .filter(|&&(i, j)| {
+            let (Some(&oi), Some(&nj)) = (
+                engine.topology.o_indices.get(i),
+                engine.topology.n_indices.get(j),
+            ) else {
+                return false;
+            };
+            let po = pos(engine, oi);
+            let pn = pos(engine, nj);
+            let dx = po.0 - pn.0;
+            let dy = po.1 - pn.1;
+            let dz = po.2 - pn.2;
+            dx * dx + dy * dy + dz * dz < cutoff_sq
+        })
+        .count()
 }
 
 impl Metrics {
