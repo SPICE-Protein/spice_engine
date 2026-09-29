@@ -89,13 +89,15 @@ web-dist: wasm wasm-simd
 	@gzip -kf web/dist/spice_engine.wasm web/dist/spice_engine_simd.wasm
 	@ls -lh web/dist/
 
-## Fetch the latest web-wasm CI artifacts into web/dist/ (needs `gh`, a
-## completed run, and matches what nightly produces; unzip layout: the
-## artifact carries the two .wasm blobs, we gzip them for the loader).
+## Fetch the nightly wasm from the public GitHub Release into web/dist/ —
+## NO token needed (Actions artifacts themselves require auth even on public
+## repos, which is why the workflow mirrors the blobs to a rolling `nightly`
+## prerelease). Plain curl; also works as a direct <script>/fetch URL in a page.
+WEB_NIGHTLY_BASE := https://github.com/SPICE-Protein/spice_engine/releases/download/nightly
 web-nightly:
 	@mkdir -p web/dist
-	gh run download --repo SPICE-Protein/spice_engine -n spice_engine-wasm --dir web/dist
-	@gzip -kf web/dist/spice_engine.wasm web/dist/spice_engine_simd.wasm
+	curl -fSL $(WEB_NIGHTLY_BASE)/spice_engine.wasm.gz -o web/dist/spice_engine.wasm.gz
+	curl -fSL $(WEB_NIGHTLY_BASE)/spice_engine_simd.wasm.gz -o web/dist/spice_engine_simd.wasm.gz
 	@ls -lh web/dist/
 
 ## Serve the demo dir locally (builds the binaries if missing).

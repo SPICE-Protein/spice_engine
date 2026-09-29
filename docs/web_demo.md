@@ -6,8 +6,13 @@ directory: `web/loader.mjs` (ergonomic JS wrapper), `web/index.html` (canvas
 reference page), `web/mini.cif` (fast fixture), `web/smoke.mjs` / `web/selftest.mjs`
 (node correctness gates). **Wasm blobs are NOT committed** — `web/dist/` is
 gitignored; populate it with `make web-dist` (local build) or `make web-nightly`
-(pulls the latest `spice_engine-wasm` CI artifact, produced on every main push
-and on a nightly schedule). Serve with `make web-serve` → `http://localhost:8080`.
+(plain curl of the rolling **`nightly` prerelease** — Actions artifacts require
+authentication even on public repos, so the workflow mirrors the four blobs
+(raw + gz, scalar + simd128) to a public release on every main push and nightly
+run). The release assets are also a legitimate direct `fetch()` URL for a page
+that wants to skip local staging entirely:
+`https://github.com/SPICE-Protein/spice_engine/releases/download/nightly/spice_engine.wasm.gz`.
+Serve with `make web-serve` → `http://localhost:8080`.
 
 ## Why this works at all
 
@@ -29,7 +34,8 @@ make wasm
 make wasm-simd
 #   → …/spice_engine_simd.wasm
 
-# stage web/dist/{,simd.}wasm(.gz) for the demo (or make web-nightly = CI artifact)
+# stage web/dist/{,simd.}wasm(.gz) for the demo (or make web-nightly = curl the
+# public nightly Release, no token needed)
 make web-dist
 
 # end-to-end correctness gate (node): instantiate → build 2LYZ → step → read back
