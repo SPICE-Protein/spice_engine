@@ -3,10 +3,16 @@ use std::cell::RefCell;
 use super::*;
 
 /// Abramowitz-Stegun erfc approximation used by the x86_64 SIMD path.
+///
+/// NOTE: never `wide`'s `.recip()` here — on SSE/AVX it is the raw
+/// `_mm*_*_rcp_ps` (relative error ~1.5e-4) while on NEON/simd128 it is an
+/// exact division. A force kernel must not branch its physics on the ISA:
+/// the production x86 wheels must reproduce the arm64-validated numbers
+/// (caught by the CI x86 numeric gate, v1.3.10). Use IEEE division.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn erfc_approx_x8(x: WideF32x8) -> WideF32x8 {
-    let t = (WideF32x8::splat(1.0) + WideF32x8::splat(0.3275911) * x).recip();
+    let t = WideF32x8::splat(1.0) / (WideF32x8::splat(1.0) + WideF32x8::splat(0.3275911) * x);
     let poly = ((((WideF32x8::splat(1.061405429) * t + WideF32x8::splat(-1.453152027)) * t
         + WideF32x8::splat(1.421413741))
         * t
@@ -172,7 +178,8 @@ fn std_simd_lanes_x86(
     let dx = WideF32x8::new(diffs.map(|v| v.x));
     let dy = WideF32x8::new(diffs.map(|v| v.y));
     let dz = WideF32x8::new(diffs.map(|v| v.z));
-    let inv_dist = (dx * dx + dy * dy + dz * dz).sqrt().recip();
+    // IEEE division (see erfc_approx_x8's ISA note): NOT `.recip()`.
+    let inv_dist = WideF32x8::splat(1.0) / (dx * dx + dy * dy + dz * dz).sqrt();
     let sigma = WideF32x8::new(sigmas);
     let epsilon = WideF32x8::new(epsilons);
     let c4 = WideF32x8::new(c4s);
@@ -185,7 +192,7 @@ fn std_simd_lanes_x86(
     let lj_mag = WideF32x8::splat(24.0) * epsilon * (WideF32x8::splat(2.0) * sr12 - sr6) * inv_dist
         - WideF32x8::splat(4.0) * c4 * inv4 * inv_dist;
     let lj_energy = WideF32x8::splat(4.0) * epsilon * (sr12 - sr6) - c4 * inv4;
-    let dist = inv_dist.recip();
+    let dist = WideF32x8::splat(1.0) / inv_dist;
     let alpha_r = dist * WideF32x8::splat(spme_alpha);
     let erfc = erfc_approx_x8(alpha_r);
     let qprod = WideF32x8::new(q_products);
@@ -276,7 +283,8 @@ fn std_simd_lanes_arm(
     let dx = WideF32x8::new(diffs.map(|v| v.x));
     let dy = WideF32x8::new(diffs.map(|v| v.y));
     let dz = WideF32x8::new(diffs.map(|v| v.z));
-    let inv_dist = (dx * dx + dy * dy + dz * dz).sqrt().recip();
+    // IEEE division (see erfc_approx_x8's ISA note): NOT `.recip()`.
+    let inv_dist = WideF32x8::splat(1.0) / (dx * dx + dy * dy + dz * dz).sqrt();
     let sigma = WideF32x8::new(sigmas);
     let epsilon = WideF32x8::new(epsilons);
     let c4 = WideF32x8::new(c4s);
@@ -292,7 +300,7 @@ fn std_simd_lanes_arm(
     let fx = (dx * inv_dist * lj_mag).to_array();
     let fy = (dy * inv_dist * lj_mag).to_array();
     let fz = (dz * inv_dist * lj_mag).to_array();
-    let distances = inv_dist.recip().to_array();
+    let distances = (WideF32x8::splat(1.0) / inv_dist).to_array();
     let lj_e = lj_energy.to_array();
     let mut out = [StdLaneOut::default(); 8];
     for lane in 0..8 {

@@ -36,7 +36,10 @@ impl PairBatch8 {
     #[inline]
     pub fn eval_lj_coulomb(self, coulomb_k: f32) -> PairResult8 {
         let dist_sq = self.dx * self.dx + self.dy * self.dy + self.dz * self.dz;
-        let inv_dist = dist_sq.sqrt().recip();
+        // IEEE division: wide's `.recip()` is the raw `rcp_ps` approximation
+        // on SSE/AVX (~1.5e-4 relative) but exact on NEON/simd128 — same
+        // reason pair16 uses splat(1.0)/sqrt. Physics must not branch on ISA.
+        let inv_dist = f32x8::splat(1.0) / dist_sq.sqrt();
         let sr = self.sigma * inv_dist;
         let sr2 = sr * sr;
         let sr6 = sr2 * sr2 * sr2;

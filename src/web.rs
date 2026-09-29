@@ -738,8 +738,7 @@ pub extern "C" fn spice_esp(handle: i32, points_ptr: *const f64, points_len: usi
             Ok(v) => v,
             Err(e) => return set_err(e),
         };
-        let points: Vec<[f64; 3]> =
-            flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let points: Vec<[f64; 3]> = flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         let out = with_engine_ref(handle, move |e| {
             e.state.electrostatic_potential(points.as_slice())
         });
@@ -773,8 +772,7 @@ pub extern "C" fn spice_efield(
             Ok(v) => v,
             Err(e) => return set_err(e),
         };
-        let points: Vec<[f64; 3]> =
-            flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let points: Vec<[f64; 3]> = flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         let pos_flat = match read_f64(positions_ptr, positions_len) {
             Ok(v) => v.to_vec(),
             Err(e) => return set_err(e),
@@ -790,7 +788,8 @@ pub extern "C" fn spice_efield(
                         .collect(),
                 )
             };
-            e.state.electrostatic_field(points.as_slice(), pos.as_deref())
+            e.state
+                .electrostatic_field(points.as_slice(), pos.as_deref())
         });
         match out {
             Ok(v) => set_res(v.into_iter().flatten().collect()),
@@ -821,7 +820,9 @@ pub extern "C" fn spice_pme_positions(handle: i32) -> i32 {
 pub extern "C" fn spice_atom_sasa(handle: i32, probe: f64, n_sphere: i32) -> i32 {
     guarded(|| {
         if !(0.5..=5.0).contains(&probe) {
-            return set_err(format!("probe_radius {probe} A out of sane range [0.5, 5.0]"));
+            return set_err(format!(
+                "probe_radius {probe} A out of sane range [0.5, 5.0]"
+            ));
         }
         let n = n_sphere.max(1) as usize;
         let out = with_engine_ref(handle, move |e| e.state.atom_sasa(probe, n));
@@ -948,7 +949,9 @@ fn species_stats(e: &SpiceEngine) -> [f64; 6] {
     } else {
         0.0
     };
-    [solute_ke, water_ke, solute_dof, water_dof, solute_t, water_t]
+    [
+        solute_ke, water_ke, solute_dof, water_dof, solute_t, water_t,
+    ]
 }
 
 #[unsafe(no_mangle)]
@@ -1046,19 +1049,15 @@ pub extern "C" fn spice_water_rigid_split(handle: i32) -> i32 {
             for w in &s.water {
                 n_water += 1;
                 let m_total = w.o.mass + w.h0.mass + w.h1.mass;
-                let r_com = (w.o.posit * w.o.mass
-                    + w.h0.posit * w.h0.mass
-                    + w.h1.posit * w.h1.mass)
-                    / m_total;
-                let v_com = (w.o.vel * w.o.mass
-                    + w.h0.vel * w.h0.mass
-                    + w.h1.vel * w.h1.mass)
-                    / m_total;
+                let r_com =
+                    (w.o.posit * w.o.mass + w.h0.posit * w.h0.mass + w.h1.posit * w.h1.mass)
+                        / m_total;
+                let v_com =
+                    (w.o.vel * w.o.mass + w.h0.vel * w.h0.mass + w.h1.vel * w.h1.mass) / m_total;
                 for atom in [&w.o, &w.h0, &w.h1] {
                     total_accum += (atom.mass as f64) * atom.vel.magnitude_squared() as f64;
                 }
-                let (r_o, r_h0, r_h1) =
-                    (w.o.posit - r_com, w.h0.posit - r_com, w.h1.posit - r_com);
+                let (r_o, r_h0, r_h1) = (w.o.posit - r_com, w.h0.posit - r_com, w.h1.posit - r_com);
                 let (v_o, v_h0, v_h1) = (w.o.vel - v_com, w.h0.vel - v_com, w.h1.vel - v_com);
                 let l = r_o.cross(v_o) * w.o.mass
                     + r_h0.cross(v_h0) * w.h0.mass
@@ -1066,9 +1065,21 @@ pub extern "C" fn spice_water_rigid_split(handle: i32) -> i32 {
                 let inertia = |r: Vec3, mass: f32| {
                     let r2 = r.dot(r);
                     [
-                        [mass * (r2 - r.x * r.x), -mass * r.x * r.y, -mass * r.x * r.z],
-                        [-mass * r.y * r.x, mass * (r2 - r.y * r.y), -mass * r.y * r.z],
-                        [-mass * r.z * r.x, -mass * r.z * r.y, mass * (r2 - r.z * r.z)],
+                        [
+                            mass * (r2 - r.x * r.x),
+                            -mass * r.x * r.y,
+                            -mass * r.x * r.z,
+                        ],
+                        [
+                            -mass * r.y * r.x,
+                            mass * (r2 - r.y * r.y),
+                            -mass * r.y * r.z,
+                        ],
+                        [
+                            -mass * r.z * r.x,
+                            -mass * r.z * r.y,
+                            mass * (r2 - r.z * r.z),
+                        ],
                     ]
                 };
                 let mut i_arr = inertia(r_o, w.o.mass);
@@ -1080,8 +1091,8 @@ pub extern "C" fn spice_water_rigid_split(handle: i32) -> i32 {
                     }
                 }
                 let omega = Mat3F32::from_arr(i_arr).solve_system(l);
-                rigid_accum += (m_total as f64) * (v_com.magnitude_squared() as f64)
-                    + l.dot(omega) as f64;
+                rigid_accum +=
+                    (m_total as f64) * (v_com.magnitude_squared() as f64) + l.dot(omega) as f64;
             }
             let total_ke = 0.5 * total_accum * NATIVE_TO_KCAL;
             let rigid_ke = 0.5 * rigid_accum * NATIVE_TO_KCAL;
@@ -1139,8 +1150,7 @@ pub extern "C" fn spice_env_info(handle: i32) -> i32 {
 pub extern "C" fn spice_exclusion_diagnostics(handle: i32) -> i32 {
     guarded(|| {
         let out = with_engine_ref(handle, |e| {
-            let (e12, s14, bonds, angles, dihedrals, pairs) =
-                e.state.exclusion_diagnostics();
+            let (e12, s14, bonds, angles, dihedrals, pairs) = e.state.exclusion_diagnostics();
             json!({
                 "excluded_12_13": e12, "scaled_1_4": s14, "bonds_topology": bonds,
                 "angles": angles, "dihedrals": dihedrals, "neighbor_pairs": pairs,
@@ -1169,17 +1179,27 @@ pub extern "C" fn spice_debug_state_dump(handle: i32) -> i32 {
             let mut sites: Vec<Vec<f64>> = Vec::new();
             for (i, a) in s.atoms.iter().enumerate() {
                 sites.push(vec![
-                    a.posit.x as f64, a.posit.y as f64, a.posit.z as f64,
-                    a.partial_charge as f64, a.lj_sigma as f64, a.lj_eps as f64,
-                    0.0, i as f64,
+                    a.posit.x as f64,
+                    a.posit.y as f64,
+                    a.posit.z as f64,
+                    a.partial_charge as f64,
+                    a.lj_sigma as f64,
+                    a.lj_eps as f64,
+                    0.0,
+                    i as f64,
                 ]);
             }
             for (j, w) in s.water.iter().enumerate() {
                 for (site, kind) in [(&w.o, 1.0f64), (&w.h0, 2.0), (&w.h1, 3.0), (&w.m, 4.0)] {
                     sites.push(vec![
-                        site.posit.x as f64, site.posit.y as f64, site.posit.z as f64,
-                        site.partial_charge as f64, site.lj_sigma as f64, site.lj_eps as f64,
-                        kind, j as f64 + 1.0,
+                        site.posit.x as f64,
+                        site.posit.y as f64,
+                        site.posit.z as f64,
+                        site.partial_charge as f64,
+                        site.lj_sigma as f64,
+                        site.lj_eps as f64,
+                        kind,
+                        j as f64 + 1.0,
                     ]);
                 }
             }
@@ -1190,7 +1210,9 @@ pub extern "C" fn spice_debug_state_dump(handle: i32) -> i32 {
             for w in s.water.iter() {
                 for site in [&w.o, &w.h0, &w.h1, &w.m] {
                     forces.push(vec![
-                        site.force.x as f64, site.force.y as f64, site.force.z as f64,
+                        site.force.x as f64,
+                        site.force.y as f64,
+                        site.force.z as f64,
                     ]);
                 }
             }
@@ -1280,13 +1302,15 @@ pub extern "C" fn spice_atom_labels(handle: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn spice_sequence(handle: i32) -> i32 {
-    guarded(|| match with_engine_ref(handle, |e| e.topology.sequence.clone()) {
-        Ok(seq) => {
-            set_out_str(&seq);
-            0
-        }
-        Err(_) => set_err("invalid handle"),
-    })
+    guarded(
+        || match with_engine_ref(handle, |e| e.topology.sequence.clone()) {
+            Ok(seq) => {
+                set_out_str(&seq);
+                0
+            }
+            Err(_) => set_err("invalid handle"),
+        },
+    )
 }
 
 /// Selection query. IN JSON: {"res_seq":[i32...], "names":[...]?,
@@ -1341,10 +1365,8 @@ pub extern "C" fn spice_contact_count(handle: i32, spec_ptr: *const u8, spec_len
             Err(e) => return set_err(e),
         };
         let read = |k: &str| -> Result<Vec<usize>, String> {
-            serde_json::from_value(
-                spec.get(k).cloned().unwrap_or(Value::Array(vec![])),
-            )
-            .map_err(|e| format!("{k}: {e}"))
+            serde_json::from_value(spec.get(k).cloned().unwrap_or(Value::Array(vec![])))
+                .map_err(|e| format!("{k}: {e}"))
         };
         let a = match read("a") {
             Ok(v) => v,
@@ -1354,10 +1376,7 @@ pub extern "C" fn spice_contact_count(handle: i32, spec_ptr: *const u8, spec_len
             Ok(v) => v,
             Err(e) => return set_err(e),
         };
-        let cutoff = spec
-            .get("cutoff")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(4.0);
+        let cutoff = spec.get("cutoff").and_then(|v| v.as_f64()).unwrap_or(4.0);
         let out = with_engine_ref(handle, move |e| {
             let n = e.state.atoms.len();
             match a.iter().chain(b.iter()).find(|&&i| i >= n) {
@@ -1385,12 +1404,12 @@ pub extern "C" fn spice_bottleneck(handle: i32, spec_ptr: *const u8, spec_len: u
             Ok(v) => v,
             Err(e) => return set_err(e),
         };
-        let path: Vec<[f64; 3]> = match serde_json::from_value(
-            spec.get("path").cloned().unwrap_or(Value::Array(vec![])),
-        ) {
-            Ok(p) => p,
-            Err(e) => return set_err(format!("path: {e}")),
-        };
+        let path: Vec<[f64; 3]> =
+            match serde_json::from_value(spec.get("path").cloned().unwrap_or(Value::Array(vec![])))
+            {
+                Ok(p) => p,
+                Err(e) => return set_err(format!("path: {e}")),
+            };
         if path.len() < 2 {
             return set_err("path needs at least 2 points ([start, end] is fine)");
         }
@@ -1410,10 +1429,7 @@ pub extern "C" fn spice_bottleneck(handle: i32, spec_ptr: *const u8, spec_len: u
         });
         match out {
             Ok(profile) => {
-                let bottleneck = profile
-                    .iter()
-                    .cloned()
-                    .fold(f64::INFINITY, f64::min);
+                let bottleneck = profile.iter().cloned().fold(f64::INFINITY, f64::min);
                 set_out(&json!({ "profile": profile, "bottleneck": bottleneck }));
                 0
             }
@@ -1432,9 +1448,9 @@ pub extern "C" fn spice_metrics(handle: i32) -> i32 {
         let out = with_engine_ref(handle, move |e| {
             METS.with(|m| {
                 let m = m.borrow();
-                m.get(idx).and_then(|slot| slot.as_ref()).map(|met| {
-                    met.compute(e)
-                })
+                m.get(idx)
+                    .and_then(|slot| slot.as_ref())
+                    .map(|met| met.compute(e))
             })
         });
         match out {
@@ -1688,13 +1704,15 @@ pub extern "C" fn spice_clear_trend(handle: i32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn spice_has_trend(handle: i32) -> i32 {
-    guarded(|| match with_engine_ref(handle, |e| e.has_trend_monitor()) {
-        Ok(has) => {
-            set_out(&json!({ "has": has }));
-            0
-        }
-        Err(_) => set_err("invalid handle"),
-    })
+    guarded(
+        || match with_engine_ref(handle, |e| e.has_trend_monitor()) {
+            Ok(has) => {
+                set_out(&json!({ "has": has }));
+                0
+            }
+            Err(_) => set_err("invalid handle"),
+        },
+    )
 }
 
 /// Bisect knob: skip the Langevin thermostat on rigid water.
@@ -1713,13 +1731,7 @@ pub extern "C" fn spice_set_skip_water_thermostat(handle: i32, skip: i32) -> i32
 
 /// Harmonic distance restraint (AF3-style ligand coordination, SMD pulls).
 #[unsafe(no_mangle)]
-pub extern "C" fn spice_add_restraint(
-    handle: i32,
-    i0: u32,
-    i1: u32,
-    r0: f32,
-    k: f32,
-) -> i32 {
+pub extern "C" fn spice_add_restraint(handle: i32, i0: u32, i1: u32, r0: f32, k: f32) -> i32 {
     guarded(|| {
         let r = with_engine(handle, move |e| {
             e.add_distance_restraint(i0 as usize, i1 as usize, r0, k)
@@ -1750,10 +1762,12 @@ pub extern "C" fn spice_update_restraint(handle: i32, idx: u32, r0: f32, k: f32)
 /// Release ALL restraints — the unbiased window of quench-and-refold.
 #[unsafe(no_mangle)]
 pub extern "C" fn spice_clear_restraints(handle: i32) -> i32 {
-    guarded(|| match with_engine(handle, |e| e.clear_distance_restraints()) {
-        Ok(()) => 0,
-        Err(_) => set_err("invalid handle"),
-    })
+    guarded(
+        || match with_engine(handle, |e| e.clear_distance_restraints()) {
+            Ok(()) => 0,
+            Err(_) => set_err("invalid handle"),
+        },
+    )
 }
 
 /// Post-build equilibration (ffi `equilibrate`): NVT strain-relief ramp +
@@ -1776,8 +1790,18 @@ pub extern "C" fn spice_equilibrate(handle: i32, cfg_ptr: *const u8, cfg_len: us
             }
         };
         let d = crate::equilibrate::EquilConfig::default();
-        let g = |k: &str, dflt: f32| spec.get(k).and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(dflt);
-        let gu = |k: &str, dflt: usize| spec.get(k).and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(dflt);
+        let g = |k: &str, dflt: f32| {
+            spec.get(k)
+                .and_then(|v| v.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(dflt)
+        };
+        let gu = |k: &str, dflt: usize| {
+            spec.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(dflt)
+        };
         let cfg = crate::equilibrate::EquilConfig {
             ramp_steps: gu("ramp_steps", d.ramp_steps),
             t_start_k: g("t_start_k", d.t_start_k),
@@ -1789,9 +1813,11 @@ pub extern "C" fn spice_equilibrate(handle: i32, cfg_ptr: *const u8, cfg_len: us
                 .unwrap_or(d.restrain_hydrogens),
             friction_gamma: g("friction_gamma", d.friction_gamma),
         };
-        let r = with_engine(handle, move |e| match crate::equilibrate::equilibrate(e, &cfg) {
-            Ok(()) => Ok(observables(e)),
-            Err(msg) => Err(msg),
+        let r = with_engine(handle, move |e| {
+            match crate::equilibrate::equilibrate(e, &cfg) {
+                Ok(()) => Ok(observables(e)),
+                Err(msg) => Err(msg),
+            }
         });
         match r {
             Ok(Ok(o)) => {
