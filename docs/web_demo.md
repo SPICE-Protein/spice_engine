@@ -1,10 +1,10 @@
-# spice_engine on the web (WebAssembly) — v1.3.9
+# spice_engine on the web (WebAssembly) — v1.3.10
 
 This is the **authoritative in-tree reference** for the browser build. The runnable
 artifact + JS loader + a minimal reference page live in this repo's `web/`
 directory: `web/loader.mjs` (ergonomic JS wrapper), `web/index.html` (canvas
 reference page), `web/mini.cif` (fast fixture), `web/smoke.mjs` / `web/selftest.mjs`
-(node correctness gates). **Wasm blobs are NOT committed** — `web/dist/` is
+(node correctness gates; `web/api.test.mjs` drives the whole Web API end-to-end). **Wasm blobs are NOT committed** — `web/dist/` is
 gitignored; populate it with `make web-dist` (local build) or `make web-nightly`
 — a tokenless curl of the latest CI artifact via **[nightly.link](https://nightly.link)**:
 `https://nightly.link/SPICE-Protein/spice_engine/workflows/web-wasm/main/spice_engine-wasm.zip`
@@ -42,6 +42,9 @@ make web-verify     # both variants
 
 # type-check only
 make web-check
+
+# Web API facade end-to-end (spins its own http server; needs web/dist staged)
+make web-apitest
 ```
 
 The command behind them:
@@ -93,16 +96,52 @@ so the wasm exposes a raw `extern "C"` surface (`src/web.rs`). Exactly two JS im
 helper, exact metric keys typed in `web/api.d.ts`; end-to-end test `node web/api.test.mjs`).
 `loader.mjs` underneath keeps the direct ABI mapping; everything below is the raw export list.
 
+**v1.3.10 ports the Python FFI's analysis + control surface.** The engine core was already
+pyo3-free for every probe in `ffi.rs`, so the wasm exports are the same `&SpiceEngine` calls,
+same JSON key spellings — scripts translate 1:1 between Python and JS. Numeric probes (ESP,
+field, SASA, PME positions, Ca/pseudo-labels, per-residue forces) write their float arrays
+into a second OUT channel — read `spice_res_ptr`/`spice_res_len` (f64 elements) before the
+next numeric call (views detach on `memory.grow`, so copy). JSON probes (metrics m1-m5,
+energy terms, species temperatures + KE/DOF, thermo info, water rigid split, env info,
+exclusion diagnostics, computation time, atom names/labels, sequence, debug state dump,
+clash/force reports, rigid-scale probe) come through the usual OUT buffer. Selection-style
+calls (select_atoms / contact_count / bottleneck / set_trend / equilibrate / efield with
+time-averaged positions) take a JSON argument. Control additions: distance restraints
+(add/retarget/clear — SMD pulls are expressible in the tab), trend monitor (arm via preset
+`rl_fail_fast`/`default` or knobs; fires `crashed=true` + `trend_alarm`), integrator switch
+(`langevin_middle`/`langevin_strong`/`nve`), skip-water-thermostat bisect knob,
+`equilibrate` (synchronous ramp+hold — at mini scale ~15 steps block the tab for a fraction
+of a second, budget accordingly), pseudo-label reset, and `efield_json`/`efield_omega` build
+knobs (external field, static or oscillating). NOT ported: `mutate_with_solvent_reuse`
+(RL build optimization), the RL 16-dim action pre-mapping (JS bias arrays are already
+per-atom), `mask_fraction` (client-side trivial), and NumPy interop (typed arrays are native).
+
+`spice_pme_positions` is the engine's charge-site packing: solute atoms **wrapped to [0,L)**,
+then per water **M, H0, H1** — the uncharged O is excluded — so its length is
+`3 * n_sites` but not the same site composition as `spice_positions` (O/H0/H1). Feed it to
+`spice_efield`'s optional positions argument for time-averaged structure queries.
+
 Exports: `spice_init`, `spice_version`, `spice_alloc`/`spice_free`, `spice_out_ptr`/
-`spice_out_len`, `spice_last_error`, `spice_build_mmcif`, `spice_step`,
-`spice_step_action`, `spice_observables`, `spice_positions` (+ `_ptr`/`_len` for positions
-and roles), `spice_set_temperature`, `spice_set_gamma`, `spice_set_timestep`,
+`spice_out_len`, `spice_res_ptr`/`spice_res_len`, `spice_last_error`, `spice_build_mmcif`,
+`spice_step`, `spice_step_action`, `spice_observables`, `spice_positions` (+ `_ptr`/`_len`
+for positions and roles), `spice_set_temperature`, `spice_set_gamma`, `spice_set_timestep`,
 `spice_set_pressure`, `spice_set_force_overrides`, `spice_reset_velocities`,
-`spice_free_engine`.
+`spice_free_engine`, and the v1.3.10 parity set: `spice_esp`, `spice_efield`,
+`spice_pme_positions`, `spice_atom_sasa`, `spice_coords_ca`, `spice_pseudo_labels`,
+`spice_reset_pseudo_labels`, `spice_per_residue_max_force`, `spice_metrics`,
+`spice_energy_terms`, `spice_species_temperatures`, `spice_thermo_info`,
+`spice_water_rigid_split`, `spice_env_info`, `spice_exclusion_diagnostics`,
+`spice_debug_state_dump`, `spice_atom_names`, `spice_atom_labels`, `spice_sequence`,
+`spice_select_atoms`, `spice_contact_count`, `spice_bottleneck`, `spice_clash_report`,
+`spice_force_report`, `spice_rigid_scale_probe`, `spice_computation_time`,
+`spice_set_integrator`, `spice_set_trend`, `spice_reset_trend`, `spice_clear_trend`,
+`spice_has_trend`, `spice_set_skip_water_thermostat`, `spice_add_restraint`,
+`spice_update_restraint`, `spice_clear_restraints`, `spice_equilibrate`.
 
 `spice_build_mmcif(cif, params_json)` accepts the same build knobs as the native
 `Engine.build` (ph / temp_k / pressure_bar / ionic_strength_m / relax_iters / tolerance /
-strict_incomplete / box_pad_a / divalent / redox / cosolvents_json / salts_json).
+strict_incomplete / box_pad_a / divalent / redox / cosolvents_json / salts_json; v1.3.10
+adds efield_json / efield_omega).
 
 **Positions site order:** solute atoms, then per water `O, H0, H1` (the OPC EP/charge site
 `M` is not emitted). `roles`: `0` solute heavy, `1` solute H, `2` water O, `3` water H.

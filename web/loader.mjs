@@ -1,5 +1,6 @@
 // spice_engine browser (WebAssembly) loader — a thin, dependency-free wrapper around the raw
-// extern-"C" ABI exported by the `spice_engine` wasm build (v1.3.9 web port).
+// extern-"C" ABI exported by the `spice_engine` wasm build (v1.3.9 web port; v1.3.10 adds
+// the FFI-parity analysis/control probes — prefer api.mjs for application code).
 //
 // The wasm module is NOT wasm-bindgen-processed (there is no CLI offline), so
 // its surface is integers and pointers: handles into a Rust-side engine
@@ -214,6 +215,236 @@ class SpiceEngine {
   }
   resetVelocities() {
     if (this.spice.exports.spice_reset_velocities(this.handle) < 0) throw new Error("reset_velocities failed");
+  }
+
+  // ---- v1.3.10 analysis + control parity (mirrors the Python FFI) ----------
+  // JSON-in / JSON-out calls share `this._json(rc)`; numeric probes return a
+  // fresh Float64Array COPIED out of the RES scratch (same view-detach rule as
+  // positions()). Points/forces are passed as flat Float64Array [x,y,z,...].
+
+  _call(name) {
+    const rc = this.spice.exports[name](this.handle);
+    return this._json(rc);
+  }
+  _res() {
+    const ptr = this.spice.exports.spice_res_ptr();
+    const len = this.spice.exports.spice_res_len();
+    return new Float64Array(this.spice.memory.buffer.slice(ptr, ptr + len * 8));
+  }
+  _flat(points) {
+    // Accept flat typed array | plain array | array of triples -> flat Float64Array.
+    if (points instanceof Float64Array) return points;
+    if (Array.isArray(points) && points.length && Array.isArray(points[0])) {
+      const out = new Float64Array(points.length * 3);
+      points.forEach((p, i) => { out[3 * i] = p[0]; out[3 * i + 1] = p[1]; out[3 * i + 2] = p[2]; });
+      return out;
+    }
+    return Float64Array.from(points);
+  }
+  _probe(name, points) {
+    const f = this._flat(points);
+    const bytes = new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
+    const ptr = this.spice._put(bytes);
+    let rc;
+    try {
+      rc = this.spice.exports[name](this.handle, ptr, f.length);
+    } finally {
+      this.spice._drop(ptr, bytes.length);
+    }
+    if (rc < 0) {
+      const e = this.spice._outJson();
+      throw new Error(`${name} failed: ${e && e.error ? e.error : rc}`);
+    }
+    return this._res();
+  }
+  _jsonArg(name, spec) {
+    const bytes = enc.encode(JSON.stringify(spec ?? {}));
+    const ptr = this.spice._put(bytes);
+    let rc, out;
+    try {
+      rc = this.spice.exports[name](this.handle, ptr, bytes.length);
+      out = this._json(rc);
+    } finally {
+      this.spice._drop(ptr, bytes.length);
+    }
+    return out;
+  }
+
+  /** Electrostatic potential (kcal/mol/e) at probe points via the engine PME.
+   *  Absolute values are gauge-arbitrary — use DIFFERENCES phi(p)-phi(ref). */
+  esp(points) { return this._probe("spice_esp", points); }
+
+  /** Electrostatic field E = -grad phi (3 doubles per point), one analytic PME
+   *  pass. `positions`: optional PME-order snapshot (see pmePositions()). */
+  efield(points, positions = null) {
+    const f = this._flat(points);
+    const pf = positions ? this._flat(positions) : new Float64Array(0);
+    const b1 = new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
+    const b2 = pf.length ? new Uint8Array(pf.buffer, pf.byteOffset, pf.byteLength) : null;
+    const p1 = this.spice._put(b1);
+    const p2 = b2 ? this.spice._put(b2) : 0;
+    let rc;
+    try {
+      rc = this.spice.exports.spice_efield(this.handle, p1, f.length, p2, pf.length);
+    } finally {
+      this.spice._drop(p1, b1.length);
+      if (b2) this.spice._drop(p2, b2.length);
+    }
+    if (rc < 0) {
+      const e = this.spice._outJson();
+      throw new Error(`spice_efield failed: ${e && e.error ? e.error : rc}`);
+    }
+    return this._res();
+  }
+  pmePositions() { return this._probeRes("spice_pme_positions"); }
+  _probeRes(name) {
+    const rc = this.spice.exports[name](this.handle);
+    if (rc < 0) {
+      const e = this.spice._outJson();
+      throw new Error(`${name} failed: ${e && e.error ? e.error : rc}`);
+    }
+    return this._res();
+  }
+
+  /** Per-atom SASA (A^2, Shrake-Rupley) for solute/ion atoms; water is not an
+   *  occluder. One value per state.atoms entry (== info.n_atoms). */
+  atomSasa({ probeRadius = 1.4, nSphere = 200 } = {}) {
+    const rc = this.spice.exports.spice_atom_sasa(this.handle, probeRadius, nSphere);
+    if (rc < 0) {
+      const e = this.spice._outJson();
+      throw new Error(`spice_atom_sasa failed: ${e && e.error ? e.error : rc}`);
+    }
+    return this._res();
+  }
+  coordsCa() { return this._probeRes("spice_coords_ca"); }
+  pseudoLabels() { return this._probeRes("spice_pseudo_labels"); }
+  perResidueMaxForce() { return this._probeRes("spice_per_residue_max_force"); }
+  resetPseudoLabels() {
+    if (this.spice.exports.spice_reset_pseudo_labels(this.handle) < 0) throw new Error("reset_pseudo_labels failed");
+  }
+
+  metrics() { return this._call("spice_metrics"); }          // five metrics + rg/rmsf/margin
+  energyTerms() { return this._call("spice_energy_terms"); } // {total,nonbonded,bonded}
+  speciesTemperatures() { return this._call("spice_species_temperatures"); }
+  thermoInfo() { return this._call("spice_thermo_info"); }
+  waterRigidSplit() { return this._call("spice_water_rigid_split"); }
+  envInfo() { return this._call("spice_env_info"); }
+  exclusionDiagnostics() { return this._call("spice_exclusion_diagnostics"); }
+  debugStateDump() { return this._call("spice_debug_state_dump"); } // LARGE json — don't poll per frame
+  computationTime() { return this._call("spice_computation_time"); }
+
+  atomNames() { return this._call("spice_atom_names"); }   // true PDB names, state.atoms order
+  atomLabels() { return this._call("spice_atom_labels"); } // {element,residue,seq_id,serial}[]
+  sequence() {
+    const rc = this.spice.exports.spice_sequence(this.handle);
+    if (rc < 0) throw new Error("spice_sequence failed");
+    return this.spice._outText();
+  }
+
+  /** {resSeq:[...], names:[...]?, sidechainHeavy?:bool} -> state.atoms indices. */
+  selectAtoms(spec) {
+    const wire = {
+      res_seq: spec.resSeq ?? spec.res_seq ?? [],
+      names: spec.names ?? null,
+      sidechain_heavy: spec.sidechainHeavy ?? spec.sidechain_heavy ?? false,
+    };
+    return this._jsonArg("spice_select_atoms", wire);
+  }
+  contacts(a, b, cutoff = 4.0) {
+    const r = this._jsonArg("spice_contact_count", { a, b, cutoff });
+    return r.count;
+  }
+  /** {path:[[x,y,z],...], spacing?, exclude?, includeWater?} -> {profile, bottleneck}. */
+  bottleneck(spec) {
+    const wire = {
+      path: spec.path,
+      spacing: spec.spacing ?? 0.5,
+      exclude: spec.exclude ?? [],
+      include_water: spec.includeWater ?? spec.include_water ?? false,
+    };
+    return this._jsonArg("spice_bottleneck", wire);
+  }
+  clashReport(minForce = 50) {
+    const rc = this.spice.exports.spice_clash_report(this.handle, minForce);
+    return this._json(rc);
+  }
+  forceReport(minForce = 50) {
+    const rc = this.spice.exports.spice_force_report(this.handle, minForce);
+    return this._json(rc);
+  }
+  /** Audit probe: dilate by lam, return {u_kcal, virial_kcal, pressure_bar}.
+   *  MUTATES forces/PE — re-step (or probe with 1.0) before continuing a run. */
+  rigidScaleProbe(lam) {
+    const rc = this.spice.exports.spice_rigid_scale_probe(this.handle, lam);
+    return this._json(rc);
+  }
+
+  /** mode: "langevin_middle" | "langevin_strong" | "nve". */
+  setIntegrator(mode) {
+    const bytes = enc.encode(mode);
+    const ptr = this.spice._put(bytes);
+    let rc;
+    try {
+      rc = this.spice.exports.spice_set_integrator(this.handle, ptr, bytes.length);
+    } finally {
+      this.spice._drop(ptr, bytes.length);
+    }
+    if (rc < 0) {
+      const e = this.spice._outJson();
+      throw new Error(`spice_set_integrator failed: ${e && e.error ? e.error : rc}`);
+    }
+  }
+  /** Arm fail-fast trend monitor: {preset:"rl_fail_fast"|"default"} or knobs. */
+  setTrend(cfg) {
+    const bytes = enc.encode(JSON.stringify(cfg ?? {}));
+    const ptr = this.spice._put(bytes);
+    let rc;
+    try {
+      rc = this.spice.exports.spice_set_trend(this.handle, ptr, bytes.length);
+    } finally {
+      this.spice._drop(ptr, bytes.length);
+    }
+    if (rc < 0) return this._json(rc); // throws with the error message
+  }
+  resetTrend() {
+    if (this.spice.exports.spice_reset_trend(this.handle) < 0) throw new Error("reset_trend failed");
+  }
+  clearTrend() {
+    if (this.spice.exports.spice_clear_trend(this.handle) < 0) throw new Error("clear_trend failed");
+  }
+  hasTrend() { return this._call("spice_has_trend").has; }
+  setSkipWaterThermostat(skip) {
+    if (this.spice.exports.spice_set_skip_water_thermostat(this.handle, skip ? 1 : 0) < 0) {
+      throw new Error("set_skip_water_thermostat failed");
+    }
+  }
+
+  addRestraint(i0, i1, r0, k) {
+    if (this.spice.exports.spice_add_restraint(this.handle, i0, i1, r0, k) < 0) {
+      throw new Error("add_restraint failed");
+    }
+  }
+  /** true if restraint idx existed (SMD ramp retarget). */
+  updateRestraint(idx, r0, k) {
+    return this.spice.exports.spice_update_restraint(this.handle, idx, r0, k) === 1;
+  }
+  clearRestraints() {
+    if (this.spice.exports.spice_clear_restraints(this.handle) < 0) throw new Error("clear_restraints failed");
+  }
+
+  /** Equilibration ramp+hold, synchronous: {rampSteps, tStartK, kRestraint,
+   *  holdSteps, restrainHydrogens, frictionGamma} (defaults match Python).
+   *  Returns observables JSON; throws on mid-ramp blow-up. */
+  equilibrate(cfg = {}) {
+    const wire = {
+      ramp_steps: cfg.rampSteps, t_start_k: cfg.tStartK, k_restraint: cfg.kRestraint,
+      hold_steps: cfg.holdSteps, restrain_hydrogens: cfg.restrainHydrogens,
+      friction_gamma: cfg.frictionGamma,
+    };
+    for (const k of Object.keys(wire)) if (wire[k] === undefined) delete wire[k];
+    const out = this._jsonArg("spice_equilibrate", wire);
+    if (out && out.error) throw new Error(`equilibrate failed: ${out.error}`);
+    return out;
   }
 
   free() {

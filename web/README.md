@@ -7,9 +7,9 @@ feature-graph, ABI design notes and measured performance budget:
 
 | file | role |
 |---|---|
-| `api.mjs` | **the Web API front-ends should use** — ergonomic facade over the loader: `Sim.load(cif, {env})`, `step/stepAction`, `set({tempK,soluteK,...})`, `setForcesOff`, `snapshot()`, `animate(onFrame)`, `dispose()`. Zero deps, browser + node ≥ 18 |
+| `api.mjs` | **the Web API front-ends should use** — ergonomic facade over the loader: `Sim.load(cif, {env})`, `step/stepAction`, `set({tempK,soluteK,...})`, `setForcesOff`, `snapshot()`, `animate(onFrame)`, `dispose()`, plus the v1.3.10 FFI-parity probes (`esp/field/sasa/select/contacts/bottleneck/metrics/equilibrate/restraints/trend/integrator/debugStateDump/…` — same keys as the Python engine). Zero deps, browser + node ≥ 18 |
 | `api.d.ts` | TypeScript declarations for `api.mjs` (exact wasm ABI metric keys) |
-| `api.test.mjs` | self-contained end-to-end test of the Web API (spins its own http server; run with `node web/api.test.mjs`) |
+| `api.test.mjs` | self-contained end-to-end test of the Web API including every parity probe (`make web-apitest`) |
 | `loader.mjs` | lower-level JS wrapper over the raw `extern "C"` ABI (`loadSpice({url})` → `SpiceEngine` handle class; gzip via client-side `DecompressionStream`) |
 | `index.html` | minimal reference page — build → `requestAnimationFrame` stepping → canvas dots coloured by atom role, toy force-term switches, dual-bath temperature inputs |
 | `mini.cif` | 5-residue fast fixture (~1.5 k sites, builds in ~3 s in-tab) |

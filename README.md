@@ -89,7 +89,8 @@ make wasm        # → …/wasm32-unknown-unknown/release/spice_engine.wasm (~5 
 make web-smoke   # node correctness gate: instantiate → build → step → read back
 make web-dist    # stage web/dist/ for the demo (wasm blobs are NOT committed)
 make web-nightly # …or pull the latest CI artifact via nightly.link (no token, no toolchain)
-make web-serve   # serve web/ → http://localhost:8080 (loader.mjs + reference page)
+make web-serve   # serve web/ → http://localhost:8080 (api.mjs + loader.mjs + reference page)
+make web-apitest # Web API end-to-end incl. all FFI-parity probes
 ```
 
 ### Python usage
@@ -144,7 +145,11 @@ stop(); sim.dispose();
 
 Runs in browsers and node ≥ 18, no server. Protocol rule inherited from the
 engine: always pair `soluteK` with `tempK` — a single bath leaves the solute at
-~0.72-0.78× setpoint. Raw `extern "C"` ABI and full contract: `docs/web_demo.md`.
+~0.72-0.78× setpoint. From v1.3.10 the wasm also carries the Python FFI's whole
+analysis/control surface (ESP & field probes, SASA, selections/contacts/bottleneck,
+the five metrics, restraints + SMD ramps, trend fail-fast, integrator switch,
+equilibrate, debug dumps — same JSON keys as Python). Raw `extern "C"` ABI and
+full contract: `docs/web_demo.md`.
 
 ### Stability-domain search
 
@@ -176,5 +181,6 @@ On the Python side you can also drive each point with `Engine.build` + `step` + 
 | v1.3.x | environment knob set (divalent 12-6-4 / redox / efield / cosolvents) · L-BFGS relaxation · ion-strength audit + genion-style placement · solvent-reuse with index-copy | ✅ |
 | v1.3.8 | **pressure closure** (PME molecular exclusions, k-space virial sign, SETTLE constraint virial billed, water-water energy fully booked) · dual-bath thermostat with exact OU per step · trend fail-fast for RL | ✅ |
 | v1.3.9 | **WebAssembly browser port** (`web` feature, hand-rolled extern-"C" ABI, dependency-graph surgery — native output bit-identical) | ✅ |
+| v1.3.10 | **Web API + Python-FFI parity on wasm** — `web/api.mjs` facade; ESP/field/SASA/metrics/restraints/trend/equilibrate & the rest of the analysis + control surface in the browser tab | ✅ |
 
 **Known limitations**: builder starts are density-calibrated, not perfect — the 2LYZ reference build sits at a roughly constant +12 kbar offset (a flat build-time signature, not a drift; the calibration pass is open work), and very long runs from crystal geometries still want an equilibration ramp before production. Results produced before v1.3.8 predate the fixed force/virial bookkeeping and need revalidation. The wasm tab build is single-threaded and budgeted for small systems (~10–17 ns/day at 1.5 k sites); SharedArrayBuffer threading and WebGPU are explicit non-goals.

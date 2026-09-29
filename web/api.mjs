@@ -44,6 +44,8 @@ const ENV_KEYS = {
   redoxReducing: "redox_reducing",
   cosolventsJson: "cosolvents_json",
   saltsJson: "salts_json",
+  efieldJson: "efield_json",   // [Ex, Ey, Ez] kcal/(mol·e·A)
+  efieldOmega: "efield_omega", // rad/ps, 0 = static
 };
 
 function toBuildParams(env = {}) {
@@ -165,6 +167,82 @@ export class Sim {
     this._need();
     return this.engine.observables();
   }
+
+  // ---- v1.3.10 analysis + control surface (Python-FFI parity) --------------
+  // Everything below mirrors src/ffi.rs read-only diagnostics and runtime
+  // controls; numeric probes return Float64Array copies, JSON probes return
+  // parsed objects with the SAME key spellings as the Python engine.
+
+  /** True PDB atom names in solute-atom order (ions report their species label). */
+  atomNames() { this._need(); return this.engine.atomNames(); }
+  atomLabels() { this._need(); return this.engine.atomLabels(); }
+  sequence() { this._need(); return this.engine.sequence(); }
+
+  /** Residue selection -> solute-atom indices. `spec`: {resSeq, names?, sidechainHeavy?}. */
+  select(spec) { this._need(); return this.engine.selectAtoms(spec); }
+  /** Pairs of index sets closer than `cutoff` Å (min image). */
+  contacts(a, b, cutoff = 4.0) { this._need(); return this.engine.contacts(a, b, cutoff); }
+  /** Channel clearance: {path:[[x,y,z],...], spacing?, exclude?, includeWater?} -> {profile, bottleneck}. */
+  bottleneck(spec) { this._need(); return this.engine.bottleneck(spec); }
+
+  /** Per-atom SASA Å² (Shrake-Rupley; solute+ions only, water is the probe model). */
+  sasa({ probeRadius = 1.4, nSphere = 200 } = {}) {
+    this._need();
+    return this.engine.atomSasa({ probeRadius, nSphere });
+  }
+  /** Electrostatic potential (kcal/mol/e) at points ([x,y,z] triples or flat
+   *  Float64Array). Gauge-arbitrary absolute values — report DIFFERENCES. */
+  esp(points) { this._need(); return this.engine.esp(points); }
+  /** Electrostatic field E = -grad phi (3 per point), one analytic PME pass.
+   *  {positions} (in `pmePositions()` order) evaluates a time-averaged frame. */
+  field(points, { positions = null } = {}) {
+    this._need();
+    return this.engine.efield(points, positions);
+  }
+  pmePositions() { this._need(); return this.engine.pmePositions(); }
+  coordsCa() { this._need(); return this.engine.coordsCa(); }
+  pseudoLabels() { this._need(); return this.engine.pseudoLabels(); }
+  resetPseudoLabels() { this._need(); this.engine.resetPseudoLabels(); return this; }
+  perResidueMaxForce() { this._need(); return this.engine.perResidueMaxForce(); }
+
+  /** The five physical metrics + rg/rmsf/stability_margin (reference snapshot
+   *  taken at build time, exactly like Python `Engine.metrics()`). */
+  metrics() { this._need(); return this.engine.metrics(); }
+  energyTerms() { this._need(); return this.engine.energyTerms(); }
+  speciesTemperatures() { this._need(); return this.engine.speciesTemperatures(); }
+  thermoInfo() { this._need(); return this.engine.thermoInfo(); }
+  waterRigidSplit() { this._need(); return this.engine.waterRigidSplit(); }
+  envInfo() { this._need(); return this.engine.envInfo(); }
+  exclusionDiagnostics() { this._need(); return this.engine.exclusionDiagnostics(); }
+  /** LARGE audit dump (sites/forces/exclusions/virial buckets) — analysis, not per-frame. */
+  debugStateDump() { this._need(); return this.engine.debugStateDump(); }
+  computationTime() { this._need(); return this.engine.computationTime(); }
+  clashReport(minForce = 50) { this._need(); return this.engine.clashReport(minForce); }
+  forceReport(minForce = 50) { this._need(); return this.engine.forceReport(minForce); }
+  /** Audit probe (MUTATES forces/PE): {u_kcal, virial_kcal, pressure_bar} at lam-dilated state. */
+  rigidScaleProbe(lam) { this._need(); return this.engine.rigidScaleProbe(lam); }
+
+  /** "langevin_middle" | "langevin_strong" | "nve" (energy-conservation probe). */
+  setIntegrator(mode) { this._need(); this.engine.setIntegrator(mode); return this; }
+  /** Arm the fail-fast trend monitor: "rl_fail_fast" | "default" | knob object. */
+  setTrend(cfg) {
+    this._need();
+    this.engine.setTrend(typeof cfg === "string" ? { preset: cfg } : cfg);
+    return this;
+  }
+  resetTrend() { this._need(); this.engine.resetTrend(); return this; }
+  clearTrend() { this._need(); this.engine.clearTrend(); return this; }
+  hasTrend() { this._need(); return this.engine.hasTrend(); }
+  setSkipWaterThermostat(on) { this._need(); this.engine.setSkipWaterThermostat(on); return this; }
+
+  /** Harmonic distance restraint (ligand coordination / SMD pulls). */
+  addRestraint(i0, i1, r0, k) { this._need(); this.engine.addRestraint(i0, i1, r0, k); return this; }
+  updateRestraint(idx, r0, k) { this._need(); return this.engine.updateRestraint(idx, r0, k); }
+  clearRestraints() { this._need(); this.engine.clearRestraints(); return this; }
+
+  /** NVT strain-relief ramp + hold (Synchronous — blocks the tab ~steps*ms).
+   *  Defaults match Python; resets the metrics/pseudo-label history on success. */
+  equilibrate(opts = {}) { this._need(); return this.engine.equilibrate(opts); }
 
   /**
    * Drive the loop for a renderer: steps then calls onFrame(this, metrics).

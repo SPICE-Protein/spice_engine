@@ -192,11 +192,11 @@ rays = se.scan_radial(s, anchor_ph=7.0, anchor_temp=310.0, ...)   # boundary rad
 - Feature detection via `hasattr(Engine, "mutate_with_solvent_reuse")` etc. is safe (methods only ever added).
 - DeprecationWarnings on trailing scalars are notices, not blocks; removal keeps at least one major-version window and is announced in these docs.
 
-## 11. Browser (WebAssembly) build — v1.3.9
+## 11. Browser (WebAssembly) build — v1.3.10
 
 The engine compiles to `wasm32-unknown-unknown` and runs a full solvated MD in the tab. This is a **new feature-gated build target**, not a new runtime model — the pure-Rust engine core was always pyo3-free (`ffi.rs` is the only Python seam), so the port is dependency + shim surgery, zero hot-path physics changes. Native numbers are bit-identical (the `web` build never compiles the touched native code paths; the default-feature native build is unchanged and its full test suite is green at 1.3.9).
 
-**API surface + demo** live in this repo's `web/` directory (`web/loader.mjs` JS wrapper + `web/index.html` reference page + prebuilt `web/dist/*.wasm.gz`; run `make web-serve` to open it in a browser tab). Authoritative doc: `docs/web_demo.md`.
+**API surface + demo** live in this repo's `web/` directory (`web/api.mjs` application facade + `web/loader.mjs` ABI wrapper + `web/index.html` reference page; `web/dist/` is gitignored — stage it with `make web-dist`, or fetch the CI artifact token-free via `make web-nightly`; run `make web-serve` to open it in a browser tab). Authoritative doc: `docs/web_demo.md`.
 
 | capability | status |
 |---|---|
@@ -206,6 +206,9 @@ The engine compiles to `wasm32-unknown-unknown` and runs a full solvated MD in t
 | observables (energy split, pressure, species T, Rg, ionic, net charge) | ✅ mirrors the FFI step dict |
 | positions/roles snapshot (solute + OPC O/H0/H1) | ✅ re-sliced views survive `memory.grow` |
 | toy mode (per-term force disable) | ✅ `spice_set_force_overrides` |
+| **FFI-parity analysis probes** (v1.3.10) | ✅ ESP / field / pme_positions / SASA / select / contacts / bottleneck / metrics(m1-m5) / per-residue force / clash & force reports / thermo & species & env & exclusion info / water rigid split / computation time / debug state dump / rigid-scale probe |
+| **FFI-parity control** (v1.3.10) | ✅ trend monitor (arm/reset/clear), integrator switch (incl. NVE), distance restraints (add/retarget/clear), skip-water-thermostat, pseudo-label reset, `equilibrate` ramp, external-field build knobs (`efield_json`/`efield_omega`) |
+| solvent-reuse mutation / RL action pre-mapping / NumPy interop | ❌ not ported (RL-build machinery; JS passes per-atom bias arrays directly and gets typed arrays natively) |
 | rayon parallelism | ⚠ single-thread (wasm has no threads without SharedArrayBuffer+workers — out of scope) |
 | CHARMM36m / Martini3 / candle charge-GNN / network downloads | ❌ compiled out (`web` feature); native-only |
 
