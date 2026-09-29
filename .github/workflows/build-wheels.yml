@@ -25,6 +25,20 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  # Why: the x86 numeric kernels (pair16 AVX-512 + non_bonded std lanes) only
+  # ever COMPILE in CI — the arm64 dev host never builds them, and CI previously
+  # skipped tests entirely. Kaggle factory v3 proved the cost: every job exploded
+  # in equilibration (U~1e8) on the x86 wheel while identical inputs ran fine on
+  # arm64 NEON and on x86 with SPICE_NONBONDED_REFERENCE=1. This job makes ubuntu
+  # actually EXECUTE the x86 kernels against their scalar references.
+  x86-libtests:
+    name: x86 numeric lib tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --lib
+
   build:
     name: wheel (${{ matrix.os }} / ${{ matrix.target }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
