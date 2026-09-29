@@ -21,7 +21,7 @@ The engine core (v1.3.9) lives in `src/engine/` (the migrated `md_core` dynamics
 
 - **Conditional environment** (v1.3 knob set): `EnvParams` drives build-time protonation (pH), thermostat/barostat setpoints, background NaCl ionic strength, **divalent salts** (Mg²⁺/Ca²⁺/Sr²⁺/Ba²⁺, 12-6-4), **redox** (disulfide reduction, CYX→CYS seeding), **external electric field** (static or oscillating), and **cosolvents** (urea / TMAO / GdmCl, CHARMM 2020 parameters). ΔT / Δγ / ΔT(dual-bath) / pressure hot-switch mid-run.
 - **Observability** (read-only, `analysis.rs`): probe **electrostatic potential** and its analytic **field**, per-atom **SASA**, PDB-name atom selection, contact counts and channel **bottleneck clearance**, per-term energies + virial buckets, species (solute vs water) temperatures, Rg, net charge, effective ionic strength, a `debug_rigid_scale_probe` for same-config audits, and an optional sliding-window **trend detector** for RL fail-fast.
-- **Three frontiers, one core**: the same engine compiles to a **PyO3 extension** (`python` feature), an **rlib** for Rust consumers (`EnginePool`), and a **WebAssembly** module (`web` feature) driven by a hand-rolled `extern "C"` ABI — full PME MD in the browser, no server. See `docs/web_demo.md` and the in-repo demo under `web/` (`loader.mjs` JS wrapper + `index.html` reference page; wasm blobs come from `make web-dist` or the tokenless nightly GitHub Release via `make web-nightly` — never committed; `make web-serve` to try it in a tab).
+- **Three frontiers, one core**: the same engine compiles to a **PyO3 extension** (`python` feature), an **rlib** for Rust consumers (`EnginePool`), and a **WebAssembly** module (`web` feature) driven by a hand-rolled `extern "C"` ABI — full PME MD in the browser, no server. See `docs/web_demo.md` and the in-repo demo under `web/` (`loader.mjs` JS wrapper + `index.html` reference page; wasm blobs come from `make web-dist` or a tokenless nightly.link download via `make web-nightly` — never committed; `make web-serve` to try it in a tab).
 - **RL actions** (`actions.rs`): `a ∈ R¹⁶` × low-rank basis `W[L,3]×16` → per-residue Cα bias forces (tanh-clamped to ±0.5 kcal/(mol·Å)); `ActionMask` re-randomises a residue subset every 20 steps; `EnvDelta{ΔT, ΔpH}`.
 - **Stability-domain search** (`domain.rs`): scans a (T, pH) grid, using M to judge whether the protein keeps its native fold at each environmental point, and outputs the stability domain.
 
@@ -87,7 +87,7 @@ CONDA_PREFIX=/path/to/envs/spice VIRTUAL_ENV=/path/to/envs/spice \
 make wasm        # → …/wasm32-unknown-unknown/release/spice_engine.wasm (~5 MB / 1.8 MB gz)
 make web-smoke   # node correctness gate: instantiate → build → step → read back
 make web-dist    # stage web/dist/ for the demo (wasm blobs are NOT committed)
-make web-nightly # …or curl the public nightly Release (no token, no toolchain)
+make web-nightly # …or pull the latest CI artifact via nightly.link (no token, no toolchain)
 make web-serve   # serve web/ → http://localhost:8080 (loader.mjs + reference page)
 ```
 

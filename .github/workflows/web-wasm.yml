@@ -16,9 +16,10 @@ on:
   push:
     branches: [main, master]
   pull_request:
-  # Nightly: the web demo does NOT commit wasm blobs (web/dist is gitignored);
-  # this schedule is the canonical producer of the artifact the loader/page
-  # consumes via `make web-nightly` (or Actions → spice_engine-wasm).
+  # Nightly: the web demo does NOT commit wasm blobs (web/dist is gitignored).
+  # This run is the canonical producer; consumers get the artifact WITHOUT a
+  # GitHub token via nightly.link (public repos are served by default):
+  #   https://nightly.link/SPICE-Protein/spice_engine/workflows/web-wasm/main/spice_engine-wasm.zip
   schedule:
     - cron: '0 18 * * *'   # 18:00 UTC
   workflow_dispatch:
@@ -31,8 +32,6 @@ jobs:
   wasm:
     name: wasm32 + node smoke
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # rolling `nightly` release publish/clobber
     steps:
       - uses: actions/checkout@v4
 
@@ -85,23 +84,6 @@ jobs:
       # Files land at the artifact ROOT (directory contents are stored
       # relative to the directory) — `make web-nightly` downloads straight
       # into web/dist/.
-      # Actions artifacts require authentication to download even on public
-      # repos — the rolling `nightly` prerelease is the UNAUTHENTICATED home
-      # for the blobs (plain curl / direct browser fetch / the loader's url=).
-      - name: Publish rolling nightly release
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create nightly \
-            --title "nightly wasm build" \
-            --prerelease --latest=false \
-            --notes "Rolling target of web-wasm.yml: spice_engine.wasm(.gz) scalar + spice_engine_simd.wasm(.gz). Overwritten on every main push and nightly run. Download without a token: https://github.com/SPICE-Protein/spice_engine/releases/download/nightly/spice_engine.wasm.gz" 2>/dev/null || true
-          gh release upload nightly \
-            wasm-dist/spice_engine.wasm wasm-dist/spice_engine.wasm.gz \
-            wasm-dist/spice_engine_simd.wasm wasm-dist/spice_engine_simd.wasm.gz \
-            --clobber
-
       - name: Upload wasm artifacts
         uses: actions/upload-artifact@v4
         with:
