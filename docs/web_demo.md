@@ -86,7 +86,12 @@ so the wasm exposes a raw `extern "C"` surface (`src/web.rs`). Exactly two JS im
   `panic = "abort"`): a Rust panic returns a negative code and writes `{"error": …}`,
   never a wasm trap.
 
-## API (see the demo `loader.mjs` for the ergonomic JS wrapper)
+## API
+
+**Recommended surface: `web/api.mjs`** — a zero-dependency facade (`Sim.load(cif, {env})` →
+`step/stepAction/set/setForcesOff/snapshot/animate/dispose`, camelCase env keys, rAF render-loop
+helper, exact metric keys typed in `web/api.d.ts`; end-to-end test `node web/api.test.mjs`).
+`loader.mjs` underneath keeps the direct ABI mapping; everything below is the raw export list.
 
 Exports: `spice_init`, `spice_version`, `spice_alloc`/`spice_free`, `spice_out_ptr`/
 `spice_out_len`, `spice_last_error`, `spice_build_mmcif`, `spice_step`,

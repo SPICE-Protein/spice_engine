@@ -21,7 +21,7 @@ The engine core (v1.3.9) lives in `src/engine/` (the migrated `md_core` dynamics
 
 - **Conditional environment** (v1.3 knob set): `EnvParams` drives build-time protonation (pH), thermostat/barostat setpoints, background NaCl ionic strength, **divalent salts** (Mg²⁺/Ca²⁺/Sr²⁺/Ba²⁺, 12-6-4), **redox** (disulfide reduction, CYX→CYS seeding), **external electric field** (static or oscillating), and **cosolvents** (urea / TMAO / GdmCl, CHARMM 2020 parameters). ΔT / Δγ / ΔT(dual-bath) / pressure hot-switch mid-run.
 - **Observability** (read-only, `analysis.rs`): probe **electrostatic potential** and its analytic **field**, per-atom **SASA**, PDB-name atom selection, contact counts and channel **bottleneck clearance**, per-term energies + virial buckets, species (solute vs water) temperatures, Rg, net charge, effective ionic strength, a `debug_rigid_scale_probe` for same-config audits, and an optional sliding-window **trend detector** for RL fail-fast.
-- **Three frontiers, one core**: the same engine compiles to a **PyO3 extension** (`python` feature), an **rlib** for Rust consumers (`EnginePool`), and a **WebAssembly** module (`web` feature) driven by a hand-rolled `extern "C"` ABI — full PME MD in the browser, no server. See `docs/web_demo.md` and the in-repo demo under `web/` (`loader.mjs` JS wrapper + `index.html` reference page; wasm blobs come from `make web-dist` or a tokenless nightly.link download via `make web-nightly` — never committed; `make web-serve` to try it in a tab).
+- **Three frontiers, one core**: the same engine compiles to a **PyO3 extension** (`python` feature), an **rlib** for Rust consumers (`EnginePool`), and a **WebAssembly** module (`web` feature) driven by a hand-rolled `extern "C"` ABI — full PME MD in the browser, no server. See `docs/web_demo.md` and the in-repo demo under `web/` (`api.mjs` Web API + `loader.mjs` ABI wrapper + `index.html` reference page; wasm blobs come from `make web-dist` or a tokenless nightly.link download via `make web-nightly` — never committed; `make web-serve` to try it in a tab).
 - **RL actions** (`actions.rs`): `a ∈ R¹⁶` × low-rank basis `W[L,3]×16` → per-residue Cα bias forces (tanh-clamped to ±0.5 kcal/(mol·Å)); `ActionMask` re-randomises a residue subset every 20 steps; `EnvDelta{ΔT, ΔpH}`.
 - **Stability-domain search** (`domain.rs`): scans a (T, pH) grid, using M to judge whether the protein keeps its native fold at each environmental point, and outputs the stability domain.
 
@@ -57,7 +57,8 @@ spice_engine/  (crate: spice_engine)
 │   ├── web.rs        WebAssembly extern-"C" API (feature `web`, wasm32 only; v1.3.9)
 │   └── ffi.rs        PyO3 Python bindings (feature `python`)
 ├── docs/             capabilities.md (API reference) · web_demo.md (browser port)
-├── web/              browser demo — loader.mjs · index.html · smoke.mjs/selftest.mjs ·
+├── web/              browser demo — api.mjs (Web API) + api.d.ts · loader.mjs · index.html ·
+│                     smoke.mjs / selftest.mjs / api.test.mjs ·
 │                     mini.cif fixture · dist/ gitignored (make web-dist / web-nightly)
 ├── tests/            Rust integration tests (md_smoke / npt_virial / dual_bath /
 │                     topology_regression / ion_layout_golden / repack_ions / …)
@@ -115,6 +116,35 @@ print(np.asarray(eng.coords_ca()))      # current Cα
 eng.set_temperature(320.0)        # environment ΔT hot-switch
 eng.reset_pseudo_labels()
 ```
+
+### Browser JS API
+
+The wasm build ships a zero-dependency ESM facade — `web/api.mjs` (typed by
+`web/api.d.ts`, guarded end-to-end by `web/api.test.mjs` / `make web-apitest`):
+
+```js
+import { Sim } from "./web/api.mjs";
+
+const sim = await Sim.load(cifText, {                       // mmCIF text, same build knobs as Python
+  env: { tempK: 300, soluteK: 300, ionicStrengthM: 0.15, boxPadA: 6 },
+  wasm: "dist/spice_engine.wasm.gz",                        // or make web-nightly to fetch the CI artifact
+});
+console.log(sim.info);                                      // { nAtoms, nSites, nWater, netChargeE, ... }
+
+const stop = sim.animate((s, m) => {                        // requestAnimationFrame loop
+  const { coords, roles } = s.snapshot();                   // Float32Array/Int32Array copies for your renderer
+  draw(coords, roles);
+  label.textContent = `${m.u_total_kcal.toFixed(1)} kcal/mol`;
+}, { stepsPerFrame: 2 });
+
+sim.set({ tempK: 320, soluteK: 320 });                      // hot dual-bath switch (pass soluteK!)
+sim.setForcesOff({ longRange: true });                      // toy-force experiments
+stop(); sim.dispose();
+```
+
+Runs in browsers and node ≥ 18, no server. Protocol rule inherited from the
+engine: always pair `soluteK` with `tempK` — a single bath leaves the solute at
+~0.72-0.78× setpoint. Raw `extern "C"` ABI and full contract: `docs/web_demo.md`.
 
 ### Stability-domain search
 

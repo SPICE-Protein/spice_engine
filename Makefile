@@ -19,7 +19,7 @@ else
   DEV_RUSTFLAGS :=
 endif
 
-.PHONY: build check test install wheel clean web-check wasm wasm-simd web-smoke web-verify web-serve web-dist web-nightly
+.PHONY: build check test install wheel clean web-check wasm wasm-simd web-smoke web-verify web-serve web-dist web-nightly web-apitest
 
 ## Compile the native lib only (fast feedback, no Python bindings).
 build:
@@ -100,6 +100,10 @@ web-nightly:
 	@unzip -o -j web/dist/.nightly.zip -d web/dist/ >/dev/null && rm web/dist/.nightly.zip
 	@gzip -kf web/dist/spice_engine.wasm web/dist/spice_engine_simd.wasm
 	@ls -lh web/dist/
+
+## End-to-end test of the Web API facade (spins its own http server).
+web-apitest:
+	node --max-old-space-size=4096 web/api.test.mjs
 
 ## Serve the demo dir locally (builds the binaries if missing).
 web-serve:
