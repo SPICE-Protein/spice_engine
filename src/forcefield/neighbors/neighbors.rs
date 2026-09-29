@@ -4,11 +4,12 @@
 //!
 //! We generally use cell-wrapped distances for solvent, and direct distances for non-solvent.
 
-use std::time::Instant;
+use crate::engine::md_core::clock::Mono;
 
 use lin_alg::f32::Vec3;
 
 use crate::{ComputationDevice, MdState, barostat::SimBox};
+use crate::forcefield::neighbors::ClusterPairStream;
 
 /// By index for fast lookups; separate fields, as these indices are applied differently for non-solvent atoms
 /// and solvent.
@@ -35,6 +36,12 @@ pub struct NeighborsNb {
     /// These values are set up at init.
     pub half_skin_sq: f32,
     pub skin_sq_w_cutoff: f32,
+    /// Standard-atom coordinates in structure-of-arrays layout.
+    pub(crate) soa_x: Vec<f32>,
+    pub(crate) soa_y: Vec<f32>,
+    pub(crate) soa_z: Vec<f32>,
+    /// Compact cluster-sorted standard pair candidates.
+    pub(crate) std_cluster_stream: ClusterPairStream,
 }
 
 impl NeighborsNb {
@@ -101,6 +108,10 @@ impl MdState {
             .map(|m| self.cell.wrap(m.o.posit))
             .collect();
 
+        self.neighbors_nb.soa_x = atom_posits.iter().map(|p| p.x).collect();
+        self.neighbors_nb.soa_y = atom_posits.iter().map(|p| p.y).collect();
+        self.neighbors_nb.soa_z = atom_posits.iter().map(|p| p.z).collect();
+
         // Compute a static mask. We use this to prevent building static-static neighbors; this is an
         // optimization, as their displacement will always be 0.
         let is_static: Vec<_> = self.atoms.iter().map(|a| a.static_).collect();
@@ -132,6 +143,12 @@ impl MdState {
             self.neighbors_nb.skin_sq_w_cutoff,
         );
 
+        let std_pairs: Vec<(u32, u32)> = self.neighbors_nb.std_std.iter().enumerate()
+            .flat_map(|(i, row)| row.iter().filter_map(move |&j| (j > i).then_some((i as u32, j as u32))))
+            .collect();
+        self.neighbors_nb.std_cluster_stream = ClusterPairStream::from_pairs(&std_pairs, 16)
+            .expect("fixed non-zero cluster size");
+
         self.setup_pairs();
 
 
@@ -142,7 +159,7 @@ impl MdState {
     /// Call during each step; determines if we need to rebuild neighbors, and if so, do it.
     pub(crate) fn build_neighbors_if_needed(&mut self, dev: &ComputationDevice) {
         if self.neighbors_nb.max_displacement_sq >= self.neighbors_nb.half_skin_sq {
-            let start = Instant::now();
+            let start = Mono::now();
 
             self.build_all_neighbors(dev);
             self.computation_time.neighbor_rebuild_count += 1;

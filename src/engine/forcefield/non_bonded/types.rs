@@ -1,4 +1,27 @@
 use super::*;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+#[derive(Default)]
+struct IndexHasher(u64);
+
+impl Hasher for IndexHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0u64;
+        for (shift, byte) in bytes.iter().take(8).enumerate() {
+            value |= (*byte as u64) << (shift * 8);
+        }
+        self.0 = value;
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+}
+
+type IndexMap<K, V> = HashMap<K, V, BuildHasherDefault<IndexHasher>>;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
@@ -7,85 +30,15 @@ pub(crate) struct NumericSimdPair {
     pub(super) src: u32,
     pub(super) sigma: f32,
     pub(super) epsilon: f32,
+    /// 12-6-4 pair constant (0 = bitwise no-op in the fused kernel).
+    pub(super) c4: f32,
     pub(super) charge_product: f32,
 }
 
-/// Preclassified compact standard-atom/water pair. The water molecule is
-/// represented by its index (not a BodyRef/site enum); the fixed OPC site
-/// expansion happens inside the dedicated kernel. Parameters that are
-/// invariant for the pair are captured at neighbor rebuild time.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub(super) struct NumericWaterPair {
-    pub(crate) std: u32,
-    pub(crate) water: u32,
-    pub(crate) sigma: f32,
-    pub(crate) epsilon: f32,
-    pub(crate) charge_product_m: f32,
-    pub(crate) charge_product_h0: f32,
-    pub(crate) charge_product_h1: f32,
-}
-
-/// Eight-lane compact water pair input.  Indices and parameters are prepared
-/// during neighbour-list construction; the kernel itself performs no table or
-/// enum lookup.
-#[cfg(target_arch = "aarch64")]
-#[derive(Clone, Copy, Debug)]
-pub(super) struct WaterPairBatch8 {
-    pub std: [u32; 8],
-    pub water: [u32; 8],
-    pub sigma: WideF32x8,
-    pub epsilon: WideF32x8,
-    pub q_m: WideF32x8,
-    pub q_h0: WideF32x8,
-    pub q_h1: WideF32x8,
-}
-
-#[cfg(target_arch = "aarch64")]
-impl WaterPairBatch8 {
-    fn from_pairs(pairs: &[NumericWaterPair]) -> Option<Self> {
-        if pairs.len() < 8 {
-            return None;
-        }
-        let mut std = [0u32; 8];
-        let mut water = [0u32; 8];
-        let mut sigma = [0.0; 8];
-        let mut epsilon = [0.0; 8];
-        let mut q_m = [0.0; 8];
-        let mut q_h0 = [0.0; 8];
-        let mut q_h1 = [0.0; 8];
-        for (lane, p) in pairs[..8].iter().enumerate() {
-            std[lane] = p.std;
-            water[lane] = p.water;
-            sigma[lane] = p.sigma;
-            epsilon[lane] = p.epsilon;
-            q_m[lane] = p.charge_product_m;
-            q_h0[lane] = p.charge_product_h0;
-            q_h1[lane] = p.charge_product_h1;
-        }
-        Some(Self {
-            std,
-            water,
-            sigma: WideF32x8::new(sigma),
-            epsilon: WideF32x8::new(epsilon),
-            q_m: WideF32x8::new(q_m),
-            q_h0: WideF32x8::new(q_h0),
-            q_h1: WideF32x8::new(q_h1),
-        })
-    }
-}
-
-#[cfg(feature = "cuda")]
-use crate::engine::md_core::gpu_interface::force_nonbonded_gpu;
 use crate::engine::md_core::{
-    AtomDynamics, ComputationDevice, MdOverrides, MdState,
-    alchemical::{
-        SOFT_CORE_ALPHA, SOFT_CORE_POWER, SOFT_CORE_SIGMA_MIN, staged_decoupling_schedule,
-    },
+    AtomDynamics, MdOverrides,
     barostat::SimBox,
-    forces::force_e_lj,
-    solvent::{ForcesOnWaterMol, O_EPS, O_H_R, O_SIGMA, WaterMolOpc, WaterSite},
-    validate_mol_start_indices,
+    solvent::{ForcesOnWaterMol, O_EPS, O_SIGMA, WaterMolOpc, WaterSite},
 };
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
@@ -148,10 +101,16 @@ pub enum LjTableIndices {
 /// Water-solvent is not included, as it's a single, hard-coded parameter pair.
 #[derive(Default, Clone)]
 pub struct LjTables {
-    /// Non-solvent, non-solvent interactions. Upper triangle.
-    pub std: Vec<(f32, f32)>,
-    /// Water, non-solvent interactions.
-    pub water_std: Vec<(f32, f32)>,
+    /// Non-solvent, non-solvent interactions. Upper triangle, (σ, ε, c4).
+    /// `c4` is the pair 12-6-4 constant: geometric mean when BOTH atoms
+    /// carry one (PGY-style site×ion pair), else 0 — two ions never induce
+    /// through a shared site, and single-sided solute C4 is reserved for
+    /// the ion–water-O channel (water_std) so existing protein behavior is
+    /// bit-for-bit untouched.
+    pub std: Vec<(f32, f32, f32)>,
+    /// Water O, non-solvent interactions: (σ, ε, c4) with c4 = the solute
+    /// atom's own ion–water Li–Merz constant (0 for every non-ion).
+    pub water_std: Vec<(f32, f32, f32)>,
     pub n_std: usize,
 }
 
@@ -197,8 +156,8 @@ impl LjTables {
                 if i_1 <= i_0 {
                     continue;
                 }
-                let (σ, ε) = combine_lj_params(atom_0, atom_1);
-                std.push((σ, ε));
+                let (σ, ε, c4) = combine_lj_params(atom_0, atom_1);
+                std.push((σ, ε, c4));
             }
         }
 
@@ -207,7 +166,9 @@ impl LjTables {
         for atom in atoms {
             let σ = 0.5 * (atom.lj_sigma + O_SIGMA);
             let ε = (atom.lj_eps * O_EPS).sqrt();
-            water_std.push((σ, ε));
+            // One-sided by Li–Merz design: the ION's pair constant acts on
+            // the water oxygen; the water carries none of its own.
+            water_std.push((σ, ε, atom.lj_c4));
         }
 
         Self {
@@ -217,8 +178,10 @@ impl LjTables {
         }
     }
 
-    /// Get (σ, ε)
-    pub fn lookup(&self, i: &LjTableIndices) -> (f32, f32) {
+    /// Get (σ, ε, c4) — c4 follows the pair conventions documented on
+    /// [`LjTables`]; 0 disables the 12-6-4 term for the pair (bit-identical
+    /// to plain 12-6 in both the scalar and SIMD kernels).
+    pub fn lookup(&self, i: &LjTableIndices) -> (f32, f32, f32) {
         match i {
             LjTableIndices::StdStd((i_0, i_1)) => {
                 // Map to (i<j), then index into the packed upper triangle (row-major).
@@ -243,7 +206,7 @@ impl LjTables {
                 self.std[idx]
             }
             LjTableIndices::StdWater(ix) => self.water_std[*ix],
-            LjTableIndices::WaterWater => (O_SIGMA, O_EPS),
+            LjTableIndices::WaterWater => (O_SIGMA, O_EPS, 0.0),
         }
     }
 }
@@ -304,45 +267,71 @@ pub struct NonBondedPair {
     pub water_full: bool,
 }
 
+/// Compact CPU scalar pair record. It intentionally mirrors only the fields
+/// consumed by the scalar kernel and is independent from the legacy GPU pair
+/// representation stored in `MdState::cpu_pairs`.
+#[derive(Clone)]
+pub(crate) struct CompactNonBondedPair {
+    pub tgt: BodyRef,
+    pub src: BodyRef,
+    pub scale_14: bool,
+    pub lj_indices: LjTableIndices,
+    pub calc_lj: bool,
+    pub calc_coulomb: bool,
+    pub symmetric: bool,
+    pub alch_interaction: bool,
+    pub water_full: bool,
+}
+
+impl From<&NonBondedPair> for CompactNonBondedPair {
+    fn from(p: &NonBondedPair) -> Self {
+        Self {
+            tgt: p.tgt,
+            src: p.src,
+            scale_14: p.scale_14,
+            lj_indices: p.lj_indices.clone(),
+            calc_lj: p.calc_lj,
+            calc_coulomb: p.calc_coulomb,
+            symmetric: p.symmetric,
+            alch_interaction: p.alch_interaction,
+            water_full: p.water_full,
+        }
+    }
+}
+
 /// Continuous worker-local standard-atom force accumulator.
 #[derive(Clone, Default)]
 pub(super) struct StdForceSoA {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    z: Vec<f64>,
+    /// Sparse target-owned forces. Workers only allocate entries they touch.
+    values: IndexMap<usize, Vec3F64>,
 }
 impl StdForceSoA {
-    fn resize_zero(&mut self, n: usize) {
-        self.x.clear();
-        self.x.resize(n, 0.0);
-        self.y.clear();
-        self.y.resize(n, 0.0);
-        self.z.clear();
-        self.z.resize(n, 0.0);
+    fn resize_zero(&mut self, _n: usize) {
+        self.values.clear();
     }
     #[inline]
     fn add(&mut self, i: usize, f: Vec3F64) {
-        self.x[i] += f.x;
-        self.y[i] += f.y;
-        self.z[i] += f.z;
+        *self.values.entry(i).or_insert_with(Vec3F64::new_zero) += f;
     }
     #[inline]
     fn get(&self, i: usize) -> Vec3F64 {
-        Vec3F64::new(self.x[i], self.y[i], self.z[i])
+        self.values
+            .get(&i)
+            .copied()
+            .unwrap_or_else(Vec3F64::new_zero)
     }
     #[inline]
     fn set(&mut self, i: usize, f: Vec3F64) {
-        self.x[i] = f.x;
-        self.y[i] = f.y;
-        self.z[i] = f.z;
+        self.values.insert(i, f);
     }
-    fn into_vec(self) -> Vec<Vec3F64> {
-        self.x
-            .into_iter()
-            .zip(self.y)
-            .zip(self.z)
-            .map(|((x, y), z)| Vec3F64::new(x, y, z))
-            .collect()
+    fn into_vec(self, n: usize) -> Vec<Vec3F64> {
+        let mut out = vec![Vec3F64::new_zero(); n];
+        for (i, f) in self.values {
+            if i < n {
+                out[i] = f;
+            }
+        }
+        out
     }
 }
 
@@ -385,7 +374,7 @@ thread_local! {
 /// Returns (forces on non-solvent atoms, forces on solvent molecules, virial, potential energy total,
 /// potential energy between molecule pairs. (kcal/mol)
 pub(super) fn calc_force_cpu(
-    pairs: &[NonBondedPair],
+    pairs: &[CompactNonBondedPair],
     atoms_std: &[AtomDynamics],
     water: &[WaterMolOpc],
     cell: &SimBox,
@@ -402,7 +391,10 @@ pub(super) fn calc_force_cpu(
     let n_std = atoms_std.len();
     let n_wat = water.len();
     let n_mol = mol_start_indices.len();
-    let track_molecule_energy = n_mol <= 256;
+    // Dense molecule-pair energy is opt-in: it is O(n_mol²) in every Rayon
+    // worker and is not part of the production force contract.
+    let track_molecule_energy =
+        n_mol <= 256 && std::env::var_os("SPICE_DENSE_MOLECULE_ENERGY").is_some_and(|v| v == "1");
     let atom_to_mol = atom_to_mol_indices(n_std, mol_start_indices);
 
     let result = pairs
@@ -456,9 +448,13 @@ pub(super) fn calc_force_cpu(
                                 let (lo, hi) = f_wat.split_at_mut(mi);
                                 (&mut hi[0], &mut lo[mj])
                             };
-                            // Water-water energy is intentionally discarded
-                            // (solvent-only energy isn't part of the total).
-                            let _ = f_water_water_cpu(
+                            // v1.3.8 pressure-audit closure: the scalar tail
+                            // must book water-water direct energy exactly like
+                            // the SIMD lanes do (eval_water_batches always
+                            // folded it). Discarding it here made U depend on
+                            // batch parity — same system, different energy per
+                            // 8-lane tail alignment.
+                            e_pair = f_water_water_cpu(
                                 &mut virial,
                                 f_wa,
                                 f_wb,
@@ -470,7 +466,7 @@ pub(super) fn calc_force_cpu(
                                 spme_alpha,
                                 coulomb_cutoff,
                                 lj_cutoff,
-                            );
+                            ) as f32;
                         }
                         (BodyRef::NonWater(i), BodyRef::Water { mol, .. }) => {
                             let mut f_i = f_std.get(i);
@@ -546,14 +542,13 @@ pub(super) fn calc_force_cpu(
                     }
                 }
 
-                // We are not interested, in this point, at potential energy that only involves solvent atoms.
-                // We skip solvent-solvent.
-                let involves_std =
-                    matches!(p.tgt, BodyRef::NonWater(_)) || matches!(p.src, BodyRef::NonWater(_));
-
-                if involves_std {
-                    energy += e_pair as f64;
-                }
+                // v1.3.8 pressure-audit closure: solvent–solvent direct energy
+                // is part of the total now. The old skip was paired with the
+                // scalar-tail discard above; with the SIMD fold always having
+                // counted water-water, excluding it here double-standard'd U
+                // by batch parity. std–std, std–solvent, solvent–solvent all
+                // fold into the same bucket.
+                energy += e_pair as f64;
 
                 if p.alch_interaction {
                     alch_dh_dl += dh_dl_pair as f64;
@@ -588,11 +583,7 @@ pub(super) fn calc_force_cpu(
         .reduce(
             || {
                 (
-                    StdForceSoA {
-                        x: vec![0.0; n_std],
-                        y: vec![0.0; n_std],
-                        z: vec![0.0; n_std],
-                    },
+                    StdForceSoA::default(),
                     vec![ForcesOnWaterMol::default(); n_wat],
                     0.0_f64,
                     0.0_f64,
@@ -606,10 +597,8 @@ pub(super) fn calc_force_cpu(
             },
             |(mut f_on_std, mut f_on_water, virial_a, e_a, mut em_a, dhdl_a),
              (db, wb, virial_b, e_b, em_b, dhdl_b)| {
-                for i in 0..n_std {
-                    f_on_std.x[i] += db.x[i];
-                    f_on_std.y[i] += db.y[i];
-                    f_on_std.z[i] += db.z[i];
+                for (i, force) in db.values.iter() {
+                    f_on_std.add(*i, *force);
                 }
                 for i in 0..n_wat {
                     f_on_water[i].f_o += wb[i].f_o;
@@ -626,7 +615,7 @@ pub(super) fn calc_force_cpu(
                 // Recycle the db, wb, em_b vectors into thread-local caches
                 CACHED_STD_FORCES.with(|c| {
                     let mut b = c.borrow_mut();
-                    if b.x.capacity() < db.x.capacity() {
+                    if b.values.capacity() < db.values.capacity() {
                         *b = db;
                     }
                 });
@@ -656,7 +645,7 @@ pub(super) fn calc_force_cpu(
         );
     let (f_std, f_wat, virial, energy, energy_between_mols, dhdl) = result;
     (
-        f_std.into_vec(),
+        f_std.into_vec(n_std),
         f_wat,
         virial,
         energy,

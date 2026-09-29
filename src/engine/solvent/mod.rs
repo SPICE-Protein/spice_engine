@@ -76,7 +76,7 @@ const H_O_H_θ_HALF: f32 = 0.5 * H_O_H_θ;
 const SIGMA_FACTOR: f32 = 2. / 1.122_462_048_309_373;
 
 // Van der Waals / JL params. Only O carries this.
-const O_RSTAR: f32 = 1.777_167_268;
+pub(crate) const O_RSTAR: f32 = 1.777_167_268;
 pub const O_SIGMA: f32 = O_RSTAR * SIGMA_FACTOR;
 pub const O_EPS: f32 = 0.212_800_813_0;
 
@@ -343,7 +343,39 @@ impl WaterMolOpc {
         // Unit vectors defining the body frame
         let z_local = orientation.rotate_vec(Z_VEC);
         let e_local = orientation.rotate_vec(X_VEC);
+        Self::place(o_pos, vel, z_local, e_local)
+    }
 
+    /// Place sites from the canonical OPC internal geometry (O–H = `O_H_R`,
+    /// HOH = `H_O_H_θ`, O–EP = `O_EP_R`) given the oxygen position and two
+    /// orientation axes: `bisector` (H-O-H bisector, pointing toward the H side)
+    /// and `h_side` (roughly toward h0, in the molecular plane). Used wherever
+    /// the starting geometry comes from an external template whose bond lengths
+    /// must NOT leak into the simulation (the `water_60A` template carries
+    /// TIP3P-distance H sites; overlaying OPC charges on those over-deepens
+    /// every H-bond and spikes the box virial — see pressure-fix notes).
+    pub(crate) fn from_axes(
+        o_pos: Vec3F32,
+        vel: Vec3F32,
+        bisector: Vec3F32,
+        h_side: Vec3F32,
+    ) -> Self {
+        let z_local = bisector.to_normalized();
+        // Make h_side perpendicular to the bisector (it comes from raw template
+        // positions, so it is only approximately so).
+        let perp = h_side - z_local * h_side.dot(z_local);
+        let e_local = if perp.magnitude_squared() > 1e-8 {
+            perp.to_normalized()
+        } else {
+            // Degenerate template geometry: fall back to any in-plane axis.
+            let seed = if z_local.x.abs() < 0.9 { X_VEC } else { Z_VEC };
+            let p = seed - z_local * seed.dot(z_local);
+            p.to_normalized()
+        };
+        Self::place(o_pos, vel, z_local, e_local)
+    }
+
+    fn place(o_pos: Vec3F32, vel: Vec3F32, z_local: Vec3F32, e_local: Vec3F32) -> Self {
         // Place Hs in the plane spanned by ex, ez with the right HOH angle.
         // Let the bisector be ez, and put the hydrogens symmetrically around it.
 
@@ -409,7 +441,6 @@ impl WaterMolOpc {
         self.m.force = Vec3F32::new_zero();
     }
 
-    // todo: Experimenting
     /// Places the M (EP) site based on current O and H positions.
     /// Call this after Initialization, Settle, or Barostat scaling.
     pub(crate) fn update_virtual_site(&mut self) {

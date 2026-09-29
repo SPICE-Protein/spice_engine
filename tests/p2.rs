@@ -1,9 +1,8 @@
 //! P2 integration test: five physical metrics + force-basis actions.
 
 use bio_files::MmCif;
-use lin_alg::f32::Vec3;
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::FfParamSet;
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::FfParamSet;
 use spice_engine::{
     ActionMask, BuildOptions, EnvDelta, ForceAction, Metrics, MetricsConfig, build_system,
 };

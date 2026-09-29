@@ -254,19 +254,40 @@ impl MdState {
             let mut c = 0;
 
             // Both SHAKE and LINCS (`Linear`) constrain each H–heavy bond, so
-            // each H loses one DOF regardless of which solver is active. (The
-            // rattle projection in `kick_and_calc_accel` removes the bond
-            // velocity before the KE is measured, so counting the H as a full
-            // 3 DOF deflates the reported temperature ~1.19× on 2LYZ.)
-            for atom in &self.atoms {
-                if matches!(
-                    self.cfg.hydrogen_constraint,
-                    HydrogenConstraint::Shake { shake_tolerance: _ }
-                        | HydrogenConstraint::Linear { .. }
-                ) && atom.element == Element::Hydrogen
-                    && !atom.static_
-                {
-                    c += 1;
+            // each *constrained* H loses one DOF regardless of which solver
+            // is active. (The rattle projection in `kick_and_calc_accel`
+            // removes the bond velocity before the KE is measured, so
+            // counting the H as a full 3 DOF deflates the reported
+            // temperature ~1.19× on 2LYZ.)
+            //
+            // v1.3.2 (R4 fix): the deduction is keyed on ACTUAL constraints —
+            // `bond_rigid_constraints` is populated from the solute
+            // force-field bond table, so every solute H still loses a DOF
+            // exactly as before (bit-identical DOF for constraint-mode
+            // protein systems), while hydrogens of *inserted* species
+            // (cosolvent N–H held by harmonic distance_restraints, not by
+            // SHAKE) are no longer over-deducted. Rigid WATER is separate
+            // accounting (SETTLE's 6 DOF per molecule above).
+            if matches!(
+                self.cfg.hydrogen_constraint,
+                HydrogenConstraint::Shake { shake_tolerance: _ }
+                    | HydrogenConstraint::Linear { .. }
+            ) {
+                let mut constrained: Vec<usize> = self
+                    .force_field_params
+                    .bond_rigid_constraints
+                    .keys()
+                    .flat_map(|(a, b)| [*a, *b])
+                    .collect();
+                constrained.sort_unstable();
+                constrained.dedup();
+                for (i, atom) in self.atoms.iter().enumerate() {
+                    if atom.element == Element::Hydrogen
+                        && !atom.static_
+                        && constrained.binary_search(&i).is_ok()
+                    {
+                        c += 1;
+                    }
                 }
             }
 
@@ -463,5 +484,65 @@ impl MdState {
             w.h1.vel = v_com_new + omega_new.cross(r_h1);
             w.update_virtual_site();
         }
+    }
+}
+
+#[cfg(test)]
+mod dof_tests {
+    use super::*;
+    use crate::engine::md_core::AtomDynamics;
+    use na_seq::Element;
+
+    fn h_atom() -> AtomDynamics {
+        AtomDynamics {
+            element: Element::Hydrogen,
+            mass: 1.008,
+            ..Default::default()
+        }
+    }
+    fn c_atom() -> AtomDynamics {
+        AtomDynamics {
+            element: Element::Carbon,
+            mass: 12.011,
+            ..Default::default()
+        }
+    }
+
+    /// R4 regression: only hydrogens actually enumerated in
+    /// `bond_rigid_constraints` (the SHAKE/LINCS table from the solute FF)
+    /// lose a DOF. An inserted-species hydrogen held by harmonic
+    /// restraints instead must NOT be deducted.
+    #[test]
+    fn dof_deducts_only_actually_constrained_hydrogens() {
+        let mut st = MdState::default();
+        st.cfg.zero_com_drift = false; // isolate the H accounting
+        st.cfg.hydrogen_constraint = HydrogenConstraint::Shake {
+            shake_tolerance: 1e-6,
+        };
+        // 0: heavy, 1: solute H (rigid-bonded to 0), 2: cosolvent H (no
+        // rigid entry — only a distance restraint in a real build).
+        st.atoms = vec![c_atom(), h_atom(), h_atom()];
+        st.force_field_params
+            .bond_rigid_constraints
+            .insert((0, 1), (1.0, 1.0));
+        // 3 atoms × 3 DOF = 9, minus the ONE truly constrained H = 8.
+        // The old blanket rule would have said 7.
+        assert_eq!(st.dof_for_thermo(), 8);
+    }
+
+    /// With constraints disabled no H is deducted at all, and a pure-solute
+    /// system (every H rigid) keeps the historical count bit-for-bit.
+    #[test]
+    fn dof_unconstrained_and_all_constrained_cases() {
+        let mut st = MdState::default();
+        st.cfg.zero_com_drift = false;
+        st.atoms = vec![c_atom(), h_atom()];
+        st.cfg.hydrogen_constraint = HydrogenConstraint::Flexible;
+        assert_eq!(st.dof_for_thermo(), 6);
+        st.cfg.hydrogen_constraint = HydrogenConstraint::Linear { order: 1, iter: 1 };
+        st.force_field_params
+            .bond_rigid_constraints
+            .insert((0, 1), (1.0, 1.0));
+        assert_eq!(st.dof_for_thermo(), 5); // 6 − 1 constrained H (as before)
     }
 }

@@ -3,8 +3,8 @@
 
 use bio_files::MmCif;
 use na_seq::{AtomTypeInRes, Element};
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::{FfParamSet, prepare_peptide_mmcif};
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::{FfParamSet, prepare_peptide_mmcif};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -36,6 +36,7 @@ fn debug_prep() {
         7.0,
         None,
         true,
+        0.0,
     )
     .unwrap();
     let n = protein.atoms.len();
@@ -243,7 +244,7 @@ fn debug_prep() {
         }
     }
     // bonds involving 992 (the NH2)
-    let mut b992: Vec<(u32, u32)> = bonds
+    let b992: Vec<(u32, u32)> = bonds
         .iter()
         .filter(|b| b.atom_0_sn == 992 || b.atom_1_sn == 992)
         .map(|b| (b.atom_0_sn, b.atom_1_sn))

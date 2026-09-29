@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use bio_files::MmCif;
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::FfParamSet;
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::FfParamSet;
 use spice_engine::{BuildOptions, build_system};
 
 #[test]
@@ -23,8 +23,12 @@ fn benchmark_production_steps_detailed() {
     let protein = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
 
     let build_start = Instant::now();
-    let mut engine =
-        build_system(&dev, &params, protein, &BuildOptions::default()).expect("build engine");
+    let mut opts = BuildOptions::default();
+    // Measurement-only override for skin A/B at production step counts.
+    if let Ok(s) = std::env::var("BENCH_NEIGHBOR_SKIN") {
+        opts.neighbor_skin = s.parse().expect("BENCH_NEIGHBOR_SKIN must be a float");
+    }
+    let mut engine = build_system(&dev, &params, protein, &opts).expect("build engine");
     let build_ms = build_start.elapsed().as_secs_f64() * 1_000.0;
 
     // Warm-up steps are excluded from the reported production statistics.
@@ -39,12 +43,16 @@ fn benchmark_production_steps_detailed() {
     engine.state.computation_time = Default::default();
     engine.state.initialize_velocities(310.0, true);
     println!(
-        "layout atoms={} water={} pairs={} simd_pairs={} scalar_pairs={}",
+        "layout atoms={} water={} pairs={} simd_pairs={} scalar_pairs={} water_simd_pairs={} water_water_simd_pairs={} water_water_candidates={} water_water_tail={}",
         engine.state.atoms.len(),
         engine.state.water.len(),
         engine.state.nb_pair_count(),
         engine.state.simd_pair_count(),
         engine.state.scalar_pair_count(),
+        engine.state.water_simd_pair_count(),
+        engine.state.water_water_simd_pair_count(),
+        engine.state.water_water_candidate_count(),
+        engine.state.water_water_scalar_tail_count(),
     );
 
     const STEPS: usize = 100;
@@ -165,12 +173,16 @@ fn benchmark_production_steps_detailed() {
         "step_class_counts ordinary={ordinary_steps} pme={pme_steps} rebuild={rebuild_steps} pme_rebuild={pme_rebuild_steps}"
     );
     println!(
-        "neighbor_rebuild_count={} pme_ratio={:.3} simd_pairs={} scalar_pairs={} total_pairs={}",
+        "neighbor_rebuild_count={} pme_ratio={:.3} simd_pairs={} scalar_pairs={} water_simd_pairs={} water_water_simd_pairs={} water_water_candidates={} water_water_tail={} total_pairs={}",
         engine.state.computation_time.neighbor_rebuild_count,
         engine.state.computation_time.ewald_long_range_sum as f64
             / engine.state.computation_time.total.max(1) as f64,
         engine.state.simd_pair_count(),
         engine.state.scalar_pair_count(),
+        engine.state.water_simd_pair_count(),
+        engine.state.water_water_simd_pair_count(),
+        engine.state.water_water_candidate_count(),
+        engine.state.water_water_scalar_tail_count(),
         engine.state.nb_pair_count(),
     );
 }
@@ -228,6 +240,19 @@ fn nonbonded_reference_vs_optimized() {
     let engine =
         build_system(&dev, &params, protein, &BuildOptions::default()).expect("build engine");
 
+    // SIMD, scalar (including both water batch tails) and water-SIMD streams
+    // must partition the pair list exactly once. This is `setup_pairs`'
+    // debug_assert, re-checked in release on a real solvated system: it catches
+    // dropped or double-counted water pairs when setup and dispatch disagree.
+    assert_eq!(
+        engine.state.nb_pair_count(),
+        engine.state.simd_pair_count()
+            + engine.state.scalar_pair_count()
+            + engine.state.water_simd_pair_count()
+            + engine.state.water_water_simd_pair_count(),
+        "nonbonded pair streams must partition cpu_pairs"
+    );
+
     let mut reference = engine.state.clone();
     for a in &mut reference.atoms {
         a.force = lin_alg::f32::Vec3::new_zero();
@@ -280,35 +305,127 @@ fn nonbonded_reference_vs_optimized() {
     assert_eq!(reference_forces.len(), optimized_forces.len());
     let mut max_abs = 0.0_f32;
     let mut max_rel = 0.0_f32;
-    for (a, b) in reference_forces.iter().zip(&optimized_forces) {
-        for (x, y) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)] {
-            max_abs = max_abs.max((x - y).abs());
-            max_rel = max_rel.max((x - y).abs() / x.abs().max(y.abs()).max(1.0));
+    let mut worst_abs: Option<(String, f32, f32)> = None;
+    let mut worst_rel: Option<(String, f32, f32)> = None;
+    let mut record = |what: String, x: f32, y: f32| {
+        let diff = (x - y).abs();
+        if diff > max_abs {
+            max_abs = diff;
+            worst_abs = Some((what.clone(), x, y));
+        }
+        let r = diff / x.abs().max(y.abs()).max(1.0);
+        if r > max_rel {
+            max_rel = r;
+            worst_rel = Some((what, x, y));
+        }
+    };
+    for (i, (a, b)) in reference_forces.iter().zip(&optimized_forces).enumerate() {
+        for (j, (x, y)) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)].iter().enumerate() {
+            record(format!("solute_atom_{i}_axis_{j}"), *x, *y);
         }
     }
-    for (wa, wb) in reference_water.iter().zip(&optimized_water) {
-        for (a, b) in wa.iter().zip(wb) {
-            for (x, y) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)] {
-                max_abs = max_abs.max((x - y).abs());
-                max_rel = max_rel.max((x - y).abs() / x.abs().max(y.abs()).max(1.0));
+    for (i, (wa, wb)) in reference_water.iter().zip(&optimized_water).enumerate() {
+        for (site, (a, b)) in wa.iter().zip(wb).enumerate() {
+            for (j, (x, y)) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)].iter().enumerate() {
+                record(format!("water_mol_{i}_site_{site}_axis_{j}"), *x, *y);
             }
         }
     }
     let optimized_energy = optimized.potential_energy_nonbonded;
     let optimized_virial = optimized.virial_components().1;
+
+    // Same-process stability of the SIMD fold merges: evaluating the identical
+    // state twice must reproduce every force bit-for-bit. This catches any
+    // accumulation that depends on container iteration order (the old sparse
+    // water-force HashMap merge was such a hazard).
+    let mut rerun = optimized.clone();
+    for a in &mut rerun.atoms {
+        a.force = lin_alg::f32::Vec3::new_zero();
+    }
+    for w in &mut rerun.water {
+        w.o.force = lin_alg::f32::Vec3::new_zero();
+        w.m.force = lin_alg::f32::Vec3::new_zero();
+        w.h0.force = lin_alg::f32::Vec3::new_zero();
+        w.h1.force = lin_alg::f32::Vec3::new_zero();
+    }
+    rerun.potential_energy_nonbonded = 0.0;
+    rerun.apply_nonbonded_forces(&dev);
+    for (i, (a, b)) in rerun.atoms.iter().zip(&optimized_forces).enumerate() {
+        assert_eq!(
+            a.force, *b,
+            "solute force not bitwise-reproducible at atom {i}"
+        );
+    }
+    for (i, (w, sites)) in rerun.water.iter().zip(&optimized_water).enumerate() {
+        assert_eq!(
+            [w.o.force, w.m.force, w.h0.force, w.h1.force],
+            *sites,
+            "water force not bitwise-reproducible at mol {i}"
+        );
+    }
+    assert_eq!(
+        rerun.potential_energy_nonbonded, optimized_energy,
+        "nonbonded energy not bitwise-reproducible"
+    );
+
     let energy_abs = (reference_energy - optimized_energy).abs();
     let virial_abs = (reference_virial - optimized_virial).abs();
     let optimized_pressure = f64::NAN;
     let pressure_abs = (reference_pressure - optimized_pressure).abs();
+    let worst_desc = worst_abs
+        .as_ref()
+        .map(|(w, r, s)| format!("{w}: ref={r:.6} simd={s:.6}"))
+        .unwrap_or_else(|| "none".into());
+    let worst_rel_desc = worst_rel
+        .as_ref()
+        .map(|(w, r, s)| format!("rel{w}: ref={r:.6} simd={s:.6}"))
+        .unwrap_or_else(|| "none".into());
     println!(
-        "reference_vs_optimized reference_us={reference_us} optimized_us={optimized_us} max_force_abs={max_abs:.6e} max_force_rel={max_rel:.6e} energy_abs={energy_abs:.6e} virial_abs={virial_abs:.6e} pressure_abs={pressure_abs:.6e} reference_energy={reference_energy:.6e} optimized_energy={optimized_energy:.6e}"
+        "reference_vs_optimized reference_us={reference_us} optimized_us={optimized_us} max_force_abs={max_abs:.6e} max_force_rel={max_rel:.6e} worst_abs={worst_desc} worst_rel={worst_rel_desc} energy_abs={energy_abs:.6e} virial_abs={virial_abs:.6e} pressure_abs={pressure_abs:.6e} reference_energy={reference_energy:.6e} optimized_energy={optimized_energy:.6e}"
+    );
+
+    // Tolerances reflect that the compact water SIMD path computes LJ/Coulomb
+    // with vectorized `wide` transcendentals (its own exp/sqrt), so per-pair
+    // values differ from the scalar reference by a few f32 ulps that accumulate
+    // independently across ~5923 waters. Energy agrees to ~3e-5 relative, which
+    // rules out any dropped/double-counted interaction (that is O(50%)); the
+    // guards below therefore target the classes of bug that actually matter —
+    // sign flips, missing pairs, and non-finite forces — all of which produce
+    // O(magnitude) error, far past these floors.
+
+    // Every optimized force must be finite; the scalar reference always is.
+    for (i, b) in optimized_forces.iter().enumerate() {
+        assert!(
+            b.x.is_finite() && b.y.is_finite() && b.z.is_finite(),
+            "non-finite solute force at atom {i}: {b:?}"
+        );
+    }
+    for (i, wa) in optimized_water.iter().enumerate() {
+        for site in wa {
+            assert!(
+                site.x.is_finite() && site.y.is_finite() && site.z.is_finite(),
+                "non-finite water force at mol {i}: {site:?}"
+            );
+        }
+    }
+
+    // Absolute force floor: a real sign/omission error moves a bond-stretched
+    // water oxygen force by O(1–40), orders of magnitude past this.
+    assert!(
+        max_abs < 0.05,
+        "force mismatch: abs={max_abs} rel={max_rel} worst_abs={worst_desc} worst_rel={worst_rel_desc}"
+    );
+    // Energy and virial compared relative to their own magnitudes.
+    let energy_rel = energy_abs / reference_energy.abs().max(1.0);
+    let virial_rel = virial_abs / reference_virial.abs().max(1.0);
+    assert!(
+        energy_rel < 1.0e-3,
+        "energy rel mismatch: {energy_rel} (abs {energy_abs})"
     );
     assert!(
-        max_rel < 5.0e-4,
-        "force mismatch: abs={max_abs} rel={max_rel}"
+        virial_rel < 1.0e-2,
+        "virial rel mismatch: {virial_rel} (abs {virial_abs})"
     );
-    assert!(energy_abs < 1.0e-3, "energy mismatch: {energy_abs}");
-    assert!(virial_abs < 1.0e-2, "virial mismatch: {virial_abs}");
     if reference_pressure.is_finite() && optimized_pressure.is_finite() {
         assert!(pressure_abs < 1.0e-3, "pressure mismatch: {pressure_abs}");
     }

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>spice_engine · all-atom MD in the browser</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, monospace; margin: 0; background:#0d1117; color:#c9d1d9; }
+  header { padding: 12px 16px; border-bottom:1px solid #21262d; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  .sub { color:#8b949e; font-size:12px; }
+  main { display:flex; gap:16px; padding:16px; flex-wrap:wrap; }
+  .panel { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:12px; }
+  canvas { background:#010409; border-radius:6px; display:block; image-rendering:pixelated; }
+  button { background:#238636; color:#fff; border:0; border-radius:6px; padding:6px 12px; font:inherit; cursor:pointer; }
+  button.sec { background:#21262d; color:#c9d1d9; }
+  button.off { background:#b62324; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  textarea { width:340px; height:90px; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; font:11px/1.4 ui-monospace,monospace; }
+  pre { background:#010409; border-radius:6px; padding:10px; max-height:420px; overflow:auto; width:360px; font-size:12px; margin:0; }
+  label { font-size:12px; color:#8b949e; }
+  .stat { font-size:12px; }
+  .k { color:#7ee787; } .w { color:#79c0ff; } .bad { color:#ff7b72; }
+</style>
+</head>
+<body>
+<header>
+  <h1>spice_engine · all-atom MD in the browser</h1>
+  <div class="sub">ff19SB protein + OPC water + PME electrostatics, integrating live in your tab. A thin front-end over the <code>loader.mjs</code> API — bring your own renderer. This is the simulator, not a structure predictor.</div>
+</header>
+<main>
+  <div class="panel">
+    <div class="row">
+      <button id="load">Load mini system (5 res)</button>
+      <button id="build2lyz" class="sec">Build 2LYZ (paste)</button>
+    </div>
+    <div class="row">
+      <label>or paste mmCIF:<br><textarea id="cif" placeholder="paste _atom_site mmCIF here…"></textarea></label>
+    </div>
+    <div class="row">
+      <button id="build" class="sec">Build from textarea</button>
+    </div>
+    <hr style="border-color:#21262d"/>
+    <div class="row">
+      <button id="run">Run</button>
+      <button id="pause" class="sec">Pause</button>
+      <button id="resetv" class="sec">Reset velocities</button>
+    </div>
+    <div class="row">
+      <label>steps/frame <input id="spf" type="number" value="3" min="1" max="50" style="width:56px"/></label>
+    </div>
+    <div class="row sub">toy physics — toggle force terms off:</div>
+    <div class="row">
+      <button id="t-bonded" class="sec">bonded</button>
+      <button id="t-coulomb" class="sec">coulomb</button>
+      <button id="t-lj" class="sec">LJ</button>
+      <button id="t-pme" class="sec">PME</button>
+    </div>
+    <div class="row">
+      <label>T<sub>solute</sub> <input id="tsol" type="number" value="300" style="width:60px"/></label>
+      <label>T<sub>solvent</sub> <input id="tsolv" type="number" value="300" style="width:60px"/></label>
+      <button id="applyT" class="sec">apply</button>
+    </div>
+    <div class="stat" id="status">idle.</div>
+    <canvas id="view" width="360" height="360"></canvas>
+  </div>
+  <div class="panel">
+    <div class="sub">observables (per step):</div>
+    <pre id="obs">—</pre>
+  </div>
+</main>
+<script type="module">
+import { loadSpice } from "./loader.mjs";
+
+const $ = (id) => document.getElementById(id);
+const status = (m, cls="") => { $("status").innerHTML = m; $("status").className = "stat "+cls; };
+const COLORS = ["#7ee787","#8b949e","#79c0ff","#a5d6ff"]; // role 0 heavy, 1 H, 2 water O, 3 water H
+
+let spice=null, eng=null, raf=0, running=false, lastPos=null;
+const toy = { bonded:0, coulomb:0, lj:0, longRange:0 };
+
+async function ensureRuntime() {
+  if (spice) return;
+  status("fetching + instantiating wasm (~5 MB)…");
+  spice = await loadSpice({ url: "dist/spice_engine.wasm.gz" }, { log: (m)=>console.log("[spice]",m) });
+  status("wasm ready · engine v"+spice.version());
+}
+
+const MINIPARAMS = { ph:7, temp_k:300, pressure_bar:0, relax_iters:150, tolerance:2.0, strict_incomplete:false, box_pad_a:6 };
+
+async function buildFromText(text, params) {
+  await ensureRuntime();
+  stop();
+  eng?.free();
+  status("building solvated system (relaxation in wasm, be patient)…");
+  await new Promise(r=>requestAnimationFrame(r));
+  try {
+    eng = spice.build(text, params ?? MINIPARAMS);
+  } catch (e) { status("build error: "+e.message, "bad"); return; }
+  const i = eng.info;
+  status(`built: ${i.n_residues} res · ${i.n_atoms} atoms · ${i.n_water} water · ${i.n_sites} sites · q=${i.net_charge_e.toFixed(2)}e`);
+  lastPos = eng.positions();
+  draw();
+}
+
+async function loadMini() {
+  const t = await (await fetch("mini.cif")).text();
+  $("cif").value = "";
+  await buildFromText(t, MINIPARAMS);
+}
+
+function frame() {
+  if (!running || !eng) return;
+  const n = Math.max(1, parseInt($("spf").value)||1);
+  try {
+    for (let k=0;k<n;k++) {
+      const m = eng.step();
+      $("obs").textContent = JSON.stringify({
+        step: m.step_count, t_ps: +m.time_ps.toFixed(3),
+        "U(kcal)": +m.u_total_kcal.toFixed(1),
+        "U_nb": +m.u_nonbonded_kcal.toFixed(1),
+        "U_bond": +m.u_bonded_kcal.toFixed(1),
+        "P(bar)": Math.round(m.pressure_bar),
+        "T_sol(K)": +m.solute_t_k.toFixed(1),
+        "Wat(K)": +m.water_t_k.toFixed(1),
+        Rg: +m.rg.toFixed(2),
+        dt_ps: m.dt_ps,
+      }, null, 2);
+    }
+  } catch (e) { stop(); status("stopped: "+e.message, "bad"); return; }
+  lastPos = eng.positions();
+  draw();
+  raf = requestAnimationFrame(frame);
+}
+
+function draw() {
+  if (!lastPos) return;
+  const ctx = $("view").getContext("2d");
+  const W=$("view").width, H=$("view").height;
+  ctx.fillStyle="#010409"; ctx.fillRect(0,0,W,H);
+  const c=lastPos.coords, r=lastPos.roles;
+  let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+  for (let i=0;i<r.length;i++){ const x=c[i*3],y=c[i*3+1]; if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; }
+  const pad=8, sx=(W-2*pad)/Math.max(1e-3,maxx-minx), sy=(H-2*pad)/Math.max(1e-3,maxy-miny), s=Math.min(sx,sy);
+  for (let i=0;i<r.length;i++){
+    ctx.fillStyle=COLORS[r[i]];
+    const px=pad+(c[i*3]-minx)*s, py=pad+(c[i*3+1]-miny)*s;
+    ctx.fillRect(px,py, r[i]===1||r[i]===3?1.5:2.5, r[i]===1||r[i]===3?1.5:2.5);
+  }
+}
+
+function start(){ if(!eng) return; running=true; raf=requestAnimationFrame(frame); }
+function stop(){ running=false; cancelAnimationFrame(raf); }
+
+function applyToy() {
+  if(!eng) return;
+  eng.setForceOverrides({ bonded:toy.bonded, coulomb:toy.coulomb, lj:toy.lj, longRange:toy.longRange });
+  for (const k of ["bonded","coulomb","lj","pme"]) {
+    const btn=$("t-"+k); const key = k==="pme"?"longRange":k;
+    btn.className = toy[key]? "off" : "sec";
+  }
+}
+
+$("load").onclick = loadMini;
+$("build").onclick = ()=>{ const t=$("cif").value.trim(); if(!t){status("paste an mmCIF first","bad");return;} buildFromText(t, MINIPARAMS); };
+$("build2lyz").onclick = async ()=>{ status("note: full 2LYZ needs a paste or your own fetch — it builds in ~60 s in scalar wasm. Type its mmCIF above and press Build."); };
+$("run").onclick = ()=>{ ensureRuntime().then(start); };
+$("pause").onclick = ()=>{ stop(); status(running?"paused":"paused"); };
+$("resetv").onclick = ()=>{ eng?.resetVelocities(); };
+$("applyT").onclick = ()=>{ if(eng) eng.setTemperature(parseFloat($("tsolv").value), { soluteK: parseFloat($("tsol").value) }); };
+for (const [k,btnkey] of [["bonded","t-bonded"],["coulomb","t-coulomb"],["lj","t-lj"],["longRange","t-pme"]]) {
+  $(btnkey).onclick = ()=>{ toy[k]=toy[k]?0:1; applyToy(); };
+}
+</script>
+</body>
+</html>

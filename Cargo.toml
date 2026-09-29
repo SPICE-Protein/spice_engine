@@ -1,6 +1,6 @@
 [package]
 name = "spice_engine"
-version = "1.3.0"
+version = "1.3.9"
 edition = "2024"
 
 [lib]
@@ -8,39 +8,85 @@ name = "spice_engine"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+libm = "0.2"
+realfft = "3.5"
+rustfft = "6.4"
 # v1.3 embeds the MD engine locally so SIMD/data-layout work is independent.
 # Forked MD engine + k-space. HTTPS git URLs so CI (no SSH key) and any clone
 # can fetch the PUBLIC SPICE-Protein forks anonymously. Dev: swap to local
 # `path` deps while hacking.
-bio_files = "0.5.2"
-ewald = "0.1.14"
+# v1.3.9 web: `default-features = false` so the SPICE fork's `network`
+# (download-by-ID → ureq/rustls/ring) rides OUR `network` feature instead of
+# being unconditional — wasm32 cannot build `ring`.
+bio_files = { version = "0.5.2", default-features = false }
+ewald = "0.1.16"
 lin_alg = { version = "1.4.3", features = ["encode", "random"] }
 na_seq = "0.3.15"
 rayon = "1.11.0"
 wide = "0.7.33"
-rand = "0.10.1"
-rand_distr = "0.6.0"
 itertools = "0.14.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 bincode = "2.0.1"
-bio_apis = "0.2.5"
+bio_apis = { version = "0.2.5", optional = true }
 mcubes = "0.1.7"
-candle-core = "0.9.1"
-candle-nn = "0.9.1"
+# Optional: the geostd charge GNN (partial_charge_inference). The wasm build
+# drops candle (and its getrandom-on-wasm compile error + 1.6 MB model).
+candle-core = { version = "0.9.1", optional = true }
+candle-nn = { version = "0.9.1", optional = true }
 lazy_static = "1.5.0"
-indicatif = "0.17.8"
 pyo3 = { version = "0.29.2", optional = true, features = ["extension-module"] }
 numpy = { version = "0.29.0", optional = true }
+
+# `rand::rng()` (OS entropy) pulls getrandom, which compile-errors on
+# wasm32-unknown-unknown without wasm_js glue we deliberately avoid. Native
+# keeps the full default feature set — bit-identical resolution to 1.3.8.
+# Wasm gets StdRng-only (seeded via `engine::utility::entropy::session_rng`).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = "0.10.1"
+rand_distr = "0.6.0"
+# v1.3.9 web: indicatif's default clock is `web-time` → `wasm-bindgen`/`js-sys`,
+# which a raw extern-C wasm cannot load without a wasm-bindgen post-process step
+# we deliberately avoid. On the browser target it is replaced by the no-op shim
+# in `engine::utility::progress` (see core/mod.rs #[path] chain), so the crate
+# is simply not compiled. Native keeps the real progress bars.
+indicatif = "0.17.8"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
+rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
 
 # arm64 (Apple Silicon) fix: ewald's SIMD imports are gated on x86_64.
 # Must be in the ROOT manifest for cargo to honor it — this redirects BOTH
 # spice_engine's and dynamics' crates-io `ewald` to the fork (PmeRecip Clone +
-# fast erfc/exp + arm64 fix), so all three share ONE ewald source.
+# fast erfc/exp + arm64 fix + 0.1.16 statrs-default-features-off), so all
+# three share ONE ewald source.
 [patch.crates-io]
 ewald = { git = "https://github.com/SPICE-Protein/ewald.git" }
+# Dev path patch while iterating (offline box); switch to the git URL once the
+# web-demo branch merges into main, same drill as ewald above:
+# bio_files = { git = "https://github.com/SPICE-Protein/bio_files.git" }
+bio_files = { path = "../bio_files" }
 
 [features]
+# Native/dev default: full capability, bit-identical to 1.3.8 resolution.
+default = ["inference", "network", "heavy-forcefields"]
 # Build the Python extension (maturin passes `--features python`).
 python = ["dep:pyo3", "dep:numpy"]
+# geostd small-molecule charge inference (candle GNN + 1.6 MB model).
+inference = ["dep:candle-core", "dep:candle-nn"]
+# Download-by-ID helpers (bio_apis direct use + bio_files' network chain).
+network = ["dep:bio_apis", "bio_files/network"]
+# Browser boundary: extern "C" API in `src/web.rs`. Build with
+# `--no-default-features --features web --target wasm32-unknown-unknown`.
+web = []
+# The SE `forcefield` tree's non-Amber families (CHARMM36m + Martini3) embed
+# ~28 MB of `.rtf`/`.prm`/`.itp` via `include_str!`. The demo drives Amber
+# FF19SB only, so the browser build drops them (30 MB → a few MB of wasm Data).
+# On native this feature is ON, so `Charmm36m`/`Martini3` load real parameters
+# exactly as before; OFF, their constructors return a clean "not compiled" error
+# instead of embedding the blobs. Golden/FF behavior is unchanged when ON.
+heavy-forcefields = []
 
 # Deployment-focused release profile: fast + small binaries.
 # NOTE: keep the default unwind strategy — pyo3 relies on catch_unwind to turn

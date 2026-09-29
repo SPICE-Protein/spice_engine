@@ -37,16 +37,27 @@ impl ForceField for Charmm36m {
     }
 
     fn prepare(&self) -> Result<Self::Prepared, ForceFieldError> {
-        Ok(Charmm36mPrepared {
-            protein_topology: include_str!("data/charmm/top_all36_prot.rtf"),
-            protein_parameters: include_str!("data/charmm/par_all36m_prot.prm"),
-            nucleic_topology: include_str!("data/charmm/top_all36_na.rtf"),
-            nucleic_parameters: include_str!("data/charmm/par_all36_na.prm"),
-            lipid_topology: include_str!("data/charmm/top_all36_lipid.rtf"),
-            lipid_parameters: include_str!("data/charmm/par_all36_lipid.prm"),
-            cgenff_topology: include_str!("data/charmm/top_all36_cgenff.rtf"),
-            cgenff_parameters: include_str!("data/charmm/par_all36_cgenff.prm"),
-        })
+        // v1.3.9 web: the ~12 MB CHARMM `.rtf`/`.prm` blobs are `include_str!`
+        // only under `heavy-forcefields` (default ON = bit-identical to 1.3.8).
+        // The browser build turns the feature off so they never land in the
+        // wasm Data section; asking for CHARMM there is a clean, honest error.
+        #[cfg(feature = "heavy-forcefields")]
+        {
+            Ok(Charmm36mPrepared {
+                protein_topology: include_str!("data/charmm/top_all36_prot.rtf"),
+                protein_parameters: include_str!("data/charmm/par_all36m_prot.prm"),
+                nucleic_topology: include_str!("data/charmm/top_all36_na.rtf"),
+                nucleic_parameters: include_str!("data/charmm/par_all36_na.prm"),
+                lipid_topology: include_str!("data/charmm/top_all36_lipid.rtf"),
+                lipid_parameters: include_str!("data/charmm/par_all36_lipid.prm"),
+                cgenff_topology: include_str!("data/charmm/top_all36_cgenff.rtf"),
+                cgenff_parameters: include_str!("data/charmm/par_all36_cgenff.prm"),
+            })
+        }
+        #[cfg(not(feature = "heavy-forcefields"))]
+        Err(ForceFieldError(
+            "charmm36m parameters are not compiled into this build (enable the `heavy-forcefields` feature)".to_string(),
+        ))
     }
 }
 

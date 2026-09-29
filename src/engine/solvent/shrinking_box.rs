@@ -237,7 +237,7 @@ pub fn pack_solvent_with_shrinking_box_cfg(
     let mut solvent_centers: Vec<Vec3F64> = Vec::with_capacity(solvent_count);
     let solvent_spacing = Vec3F64::new(sx, sy, sz);
 
-    let mut rng = rand::rng();
+    let mut rng = crate::engine::md_core::entropy::session_rng();
     let distro = Uniform::<f64>::new(0.0, 1.0).unwrap();
 
     for idx in 0..solvent_count {

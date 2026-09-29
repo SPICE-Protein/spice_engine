@@ -62,10 +62,13 @@ impl MdState {
             a_0.force += f;
             a_1.force -= f;
 
-            // Local virial: Σ r_i · F_i.
-
+            // Pair-virial convention shared with the nonbonded kernels:
+            // W = Σ_pairs (r_i − r_j)·f_on_i, which makes pressure
+            // P = (2K + W)/3V respond correctly (compression raises P).
+            // `f` here is the force on atom 0 (due to atom 1), so the bond
+            // vector must point 0 → 1-relative: (r_0 − r_1).
             // todo: You already calc min_image and the diff in bonded_forces; consolidate.
-            let r_virial = self.cell.min_image(a_1.posit - a_0.posit);
+            let r_virial = self.cell.min_image(a_0.posit - a_1.posit);
             let virial = r_virial.dot(f); // f is force on atom 0 due to atom 1
             self.barostat.virial.bonded += virial as f64;
 
@@ -219,8 +222,9 @@ impl MdState {
             let fi_c = dri * (self.atoms[i].mass * inv_dt2);
             // fj_c would be drj * (m_j/dt^2), but we only need one consistently.
 
-            // Use minimum-image bond vector
-            let rij = self.cell.min_image(rj_new - ri_new);
+            // Use minimum-image bond vector in the same (r_i − r_j)·f_on_i
+            // convention as the pair kernels above.
+            let rij = self.cell.min_image(ri_new - rj_new);
 
             // Pair virial contribution (scalar)
             self.barostat.virial.constraints += rij.dot(fi_c) as f64;

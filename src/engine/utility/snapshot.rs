@@ -887,7 +887,9 @@ impl MdState {
             self.snapshot_queue_for_trr.clear();
         }
 
-        // todo: Make sure this fails gracefully if mdtraj isn't available.
+        // `write_xtc` surfaces an unavailable/failed XTC backend as `Err`
+        // (never a panic), so a missing mdtraj costs these frames and the
+        // log line below, not the simulation.
         if !self.snapshot_queue_for_xtc.is_empty() {
             let frames: Vec<_> = self
                 .snapshot_queue_for_xtc

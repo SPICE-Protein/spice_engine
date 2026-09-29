@@ -109,7 +109,7 @@ pub fn f_nonbonded_cpu(
             && !overrides.lj_disabled
         {
             let schedule = staged_decoupling_schedule(lambda as f64);
-            let (σ, ε) = lj_tables.lookup(lj_indices);
+            let (σ, ε, _) = lj_tables.lookup(lj_indices);
             let (mut f, mut e, mut dh_dl) =
                 alchemical_lj_soft_core_decouple(Vec3::new_zero(), 0.0, σ, ε, schedule.lj_lambda);
             dh_dl *= schedule.lj_dlambda_dlambda;
@@ -147,14 +147,14 @@ pub fn f_nonbonded_cpu(
     let (f_lj, energy_lj, dh_dl_lj) = if !calc_lj || dist > lj_cutoff || overrides.lj_disabled {
         (Vec3::new_zero(), 0., 0.)
     } else {
-        let (σ, ε) = lj_tables.lookup(lj_indices);
+        let (σ, ε, c4) = lj_tables.lookup(lj_indices);
 
         let (mut f, mut e, mut dh_dl) = if let Some(schedule) = schedule {
             let (f, e, dh_dl) =
                 alchemical_lj_soft_core_decouple(dir, dist_sq, σ, ε, schedule.lj_lambda);
             (f, e, dh_dl * schedule.lj_dlambda_dlambda)
         } else {
-            let (f, e) = force_e_lj(dir, inv_dist, σ, ε);
+            let (f, e) = force_e_lj_c4(dir, inv_dist, σ, ε, c4);
             (f, e, 0.)
         };
         if scale14 {
@@ -251,7 +251,7 @@ pub(super) fn f_water_water_cpu(
             let r = r2.sqrt();
             let inv = 1.0 / r;
             let dir = d_oo * inv;
-            let (sigma, eps) = lj_tables.lookup(&LjTableIndices::WaterWater);
+            let (sigma, eps, _c4) = lj_tables.lookup(&LjTableIndices::WaterWater);
             let (f, e) = force_e_lj(dir, inv, sigma, eps);
             let f64v: Vec3F64 = f.into();
             f_wa.f_o += f64v;
@@ -412,7 +412,9 @@ pub(super) fn f_water_std_cpu(
             // lookup in this hot path.
             let sigma = 0.5 * (atom_std.lj_sigma + O_SIGMA);
             let eps = (atom_std.lj_eps * O_EPS).sqrt();
-            let (f, e) = force_e_lj(dir, inv, sigma, eps);
+            // `lj_c4` is nonzero only for the Li-Merz 12-6-4 divalent ions;
+            // every other solute gets the bitwise-identical plain-LJ path.
+            let (f, e) = force_e_lj_c4(dir, inv, sigma, eps, atom_std.lj_c4);
             let f64v: Vec3F64 = f.into();
             // `f` is the force on the water O (tgt of d_o); solute gets the opposite.
             *f_std -= f64v;
@@ -520,9 +522,27 @@ pub(super) fn atom_to_mol_indices(n_atoms: usize, mol_start_indices: &[usize]) -
 /// Helper. Returns σ, ε between an atom pair. Atom order passed as params doesn't matter.
 /// Note that this uses the traditional algorithm; not the Amber-specific version: We pre-set
 /// atom-specific σ and ε to traditional versions on ingest, and when building solvent.
-pub(super) fn combine_lj_params(atom_0: &AtomDynamics, atom_1: &AtomDynamics) -> (f32, f32) {
+pub(crate) fn combine_lj_params(atom_0: &AtomDynamics, atom_1: &AtomDynamics) -> (f32, f32, f32) {
     let σ = 0.5 * (atom_0.lj_sigma + atom_1.lj_sigma);
     let ε = (atom_0.lj_eps * atom_1.lj_eps).sqrt();
+    // 12-6-4 pair rule for solute–solute (std–std) contacts. Amber's own
+    // 12-6-4 machinery combines per-type C4 coefficients with the same
+    // geometric mean as ε (Panteva–Giambasu–York site corrections rely on
+    // exactly this: a site carrying an effective C4 gets sqrt(c4_site ·
+    // c4_ion) against the metal). A single-sided C4 stays 0 here: ion–water
+    // induction is the water_std table's one-sided channel, and ordinary
+    // protein/salt atoms (c4 = 0) are untouched — bit-for-bit for everything
+    // except cation–cation pairs in multi-divalent systems, which now carry
+    // the Amber-consistent mutual term — sub-kcal at contact, and it is a
+    // correction Amber itself prescribes, so enabling it is the conservative
+    // choice, not a new interaction.
+    // Opposite-sign pairs (future anion C4) would be sqrt of
+    // negative: undefined → 0, never NaN.
+    let c4 = if atom_0.lj_c4 > 0.0 && atom_1.lj_c4 > 0.0 {
+        (atom_0.lj_c4 * atom_1.lj_c4).sqrt()
+    } else {
+        0.0
+    };
 
-    (σ, ε)
+    (σ, ε, c4)
 }

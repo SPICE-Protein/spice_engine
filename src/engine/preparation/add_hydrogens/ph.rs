@@ -23,11 +23,11 @@
 // Compute ND1/NE2 distances to nearby acceptors (O, carboxylate O, backbone carbonyl O, etc.) and
 // choose the proton on the ring nitrogen farther from a strong acceptor (so the closer one can
 // accept H-bond). If it picks ND1 → use HID; if NE2 → HIE. Then pass that choice into
-// make_h_digit_map (e.g. extra arg) or cache a per-run his_selected before you call it.
+// make_h_digit_map_custom (e.g. extra arg) or cache a per-run his_selected before you call it.
 // That’s still a localized change.
 
 use bio_files::{AtomGeneric, ResidueGeneric};
-use na_seq::{AminoAcidProtenationVariant, AtomTypeInRes, Element};
+use na_seq::{AminoAcid, AminoAcidProtenationVariant, AtomTypeInRes, Element};
 
 // Intrinsic pKas (typical, solvent-exposed). These are deliberately simple.
 // todo: Make them better?
@@ -71,6 +71,8 @@ pub(crate) fn resolve_his_tautomer_by_geometry(
             continue;
         }
 
+        // Be conservative for untyped atoms: an unknown nitrogen may be an
+        // amide or protonated center and must not decide the His tautomer.
         let is_acceptor = if let Some(tir) = &atom.type_in_res {
             matches!(
                 tir,
@@ -82,7 +84,7 @@ pub(crate) fn resolve_his_tautomer_by_geometry(
                     | AtomTypeInRes::OH
             )
         } else {
-            atom.element == Element::Oxygen || atom.element == Element::Nitrogen
+            atom.element == Element::Oxygen
         };
 
         if is_acceptor {
@@ -97,17 +99,22 @@ pub(crate) fn resolve_his_tautomer_by_geometry(
         }
     }
 
-    if min_d_nd1 < min_d_ne2 {
+    const ACCEPTOR_CUTOFF: f64 = 4.0;
+    if min_d_nd1 > ACCEPTOR_CUTOFF && min_d_ne2 > ACCEPTOR_CUTOFF {
+        return AminoAcidProtenationVariant::Hie;
+    }
+    // The closer ring nitrogen remains unprotonated so it can accept a H bond.
+    // Prefer HIE on ties for a deterministic, conservative default.
+    if min_d_nd1 + 0.1 < min_d_ne2 {
         AminoAcidProtenationVariant::Hie
-    } else {
+    } else if min_d_ne2 + 0.1 < min_d_nd1 {
         AminoAcidProtenationVariant::Hid
+    } else {
+        AminoAcidProtenationVariant::Hie
     }
 }
 
 pub(crate) fn his_choice(ph: f32) -> Option<AminoAcidProtenationVariant> {
-    // HIP (doubly protonated) below pKa; HIE (neutral, NE2-H tautomer) at or above.
-    // HID requires per-residue local-geometry analysis (see todo above) and is not
-    // selected here.
     if ph < PKA_HIS {
         Some(AminoAcidProtenationVariant::Hip)
     } else {
@@ -115,10 +122,43 @@ pub(crate) fn his_choice(ph: f32) -> Option<AminoAcidProtenationVariant> {
     }
 }
 
+/// Resolve the pH-dependent side-chain state. Explicit overrides are validated
+/// against the residue before they are returned; neutral His is the only state
+/// that uses local geometry to choose HID versus HIE.
+pub(crate) fn resolve_variant(
+    aa: AminoAcid,
+    ph: f32,
+    override_variant: Option<AminoAcidProtenationVariant>,
+    his_geometry: Option<AminoAcidProtenationVariant>,
+) -> Result<Option<AminoAcidProtenationVariant>, String> {
+    if let Some(v) = override_variant {
+        if v.get_standard() != Some(aa) {
+            return Err(format!(
+                "protonation variant {v} is incompatible with residue {aa}"
+            ));
+        }
+        return Ok(Some(v));
+    }
+
+    let selected = match aa {
+        AminoAcid::Asp if ph < PKA_ASP => Some(AminoAcidProtenationVariant::Ash),
+        AminoAcid::Glu if ph < PKA_GLU => Some(AminoAcidProtenationVariant::Glh),
+        AminoAcid::Cys if ph >= PKA_CYS => Some(AminoAcidProtenationVariant::Cym),
+        AminoAcid::Lys if ph > PKA_LYS => Some(AminoAcidProtenationVariant::Lyn),
+        AminoAcid::His if ph < PKA_HIS => Some(AminoAcidProtenationVariant::Hip),
+        AminoAcid::His => Some(match his_geometry {
+            Some(AminoAcidProtenationVariant::Hid) => AminoAcidProtenationVariant::Hid,
+            _ => AminoAcidProtenationVariant::Hie,
+        }),
+        _ => None,
+    };
+    Ok(selected)
+}
+
 pub(crate) fn variant_allowed_at_ph(aa_var: AminoAcidProtenationVariant, ph: f32) -> bool {
     match aa_var {
         // Histidine variants are selected by his_choice(); these entries keep
-        // variant_allowed_at_ph consistent but are not used inside make_h_digit_map.
+        // variant_allowed_at_ph consistent but are not used inside make_h_digit_map_custom.
         AminoAcidProtenationVariant::Hip => ph < PKA_HIS,
         AminoAcidProtenationVariant::Hid | AminoAcidProtenationVariant::Hie => ph >= PKA_HIS,
 

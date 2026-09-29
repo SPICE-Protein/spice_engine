@@ -12,7 +12,7 @@
 //! product of the parameter space; `is_stable` gives the decision rule (reusable
 //! as SAC reward / threshold).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,7 +25,14 @@ use crate::env::EnvParams;
 use crate::metrics::{Metrics, MetricsConfig, MetricsResult};
 use crate::structure::{StructureInput, build_from_input};
 
-static PROGRESS_BAR: Mutex<Option<indicatif::ProgressBar>> = Mutex::new(None);
+// Trend detection lives on the ENGINE now (`crate::engine`) so RL/FFI step
+// loops share one fail-fast path; the scan arms `engine.set_trend_monitor_skip`
+// per segment instead of carrying its own detector. `StabilityConfig::trend`
+// and the FFI keep the historical `crate::domain::TrendConfig` path through
+// this re-export.
+pub use crate::engine::TrendConfig;
+
+static PROGRESS_BAR: Mutex<Option<crate::progress::ProgressBar>> = Mutex::new(None);
 
 /// Environment-parameter grid (point sets per axis). `mesh()` takes the Cartesian product.
 #[derive(Debug, Clone)]
@@ -34,6 +41,10 @@ pub struct EnvGrid {
     pub phs: Vec<f32>,
     pub pressures: Vec<f32>,
     pub ionics: Vec<f32>,
+    /// MgCl2 formula-unit molarity axis (mol/L). Mg²⁺ titration is core RNA
+    /// stability work, so it gets full grid treatment; default `[0.0]`.
+    pub mg_molars: Vec<f32>,
+    pub ca_molars: Vec<f32>,
 }
 
 impl Default for EnvGrid {
@@ -44,6 +55,8 @@ impl Default for EnvGrid {
             phs: vec![6.5, 7.0, 7.5],
             pressures: vec![1.0],
             ionics: vec![0.0],
+            mg_molars: vec![0.0],
+            ca_molars: vec![0.0],
         }
     }
 }
@@ -66,11 +79,14 @@ impl EnvGrid {
     /// Build a grid from per-axis `(start, end, step)` ranges, so each dimension
     /// can use a different resolution. `None` pressure/ionic keeps the default
     /// single point (1.0 bar / 0.0 M).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_ranges(
         temps: (f32, f32, f32),
         phs: (f32, f32, f32),
         pressures: Option<(f32, f32, f32)>,
         ionics: Option<(f32, f32, f32)>,
+        mg: Option<(f32, f32, f32)>,
+        ca: Option<(f32, f32, f32)>,
     ) -> Self {
         Self {
             temps: Self::linspace(temps.0, temps.1, temps.2),
@@ -81,18 +97,36 @@ impl EnvGrid {
             ionics: ionics
                 .map(|i| Self::linspace(i.0, i.1, i.2))
                 .unwrap_or_else(|| vec![0.0]),
+            mg_molars: mg
+                .map(|m| Self::linspace(m.0, m.1, m.2))
+                .unwrap_or_else(|| vec![0.0]),
+            ca_molars: ca
+                .map(|c| Self::linspace(c.0, c.1, c.2))
+                .unwrap_or_else(|| vec![0.0]),
         }
     }
 
     pub fn mesh(&self) -> Vec<EnvParams> {
         let mut out = Vec::with_capacity(
-            self.temps.len() * self.phs.len() * self.pressures.len() * self.ionics.len(),
+            self.temps.len()
+                * self.phs.len()
+                * self.pressures.len()
+                * self.ionics.len()
+                * self.mg_molars.len()
+                * self.ca_molars.len(),
         );
         for &temp in &self.temps {
             for &ph in &self.phs {
                 for &pressure in &self.pressures {
                     for &ionic in &self.ionics {
-                        out.push(EnvParams::new(ph, temp, pressure, ionic));
+                        for &mg in &self.mg_molars {
+                            for &ca in &self.ca_molars {
+                                out.push(
+                                    EnvParams::new(ph, temp, pressure, ionic)
+                                        .with_divalent(mg, ca, 0.0, 0.0),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -105,6 +139,8 @@ impl EnvGrid {
             || self.phs.is_empty()
             || self.pressures.is_empty()
             || self.ionics.is_empty()
+            || self.mg_molars.is_empty()
+            || self.ca_molars.is_empty()
     }
 }
 
@@ -226,136 +262,6 @@ fn is_clear_stable(m: &MetricsResult, cfg: &StabilityConfig) -> bool {
         && m.m5 < cfg.max_charge_mismatch * cfg.clear_margin
 }
 
-/// Soft trend detector for LONG-MD environment validation (v2 protocol).
-///
-/// Short-MD asks "does the structure fold?"; long-MD asks "does the environment
-/// let the folded structure STAY folded?". Instead of predicting a crash, we
-/// detect whether the environment is driving the system in a bad direction —
-/// potential energy rising, Rg expanding, secondary structure dissolving — via
-/// the slope of a sliding window, z-scored against a thermal-noise floor. A
-/// segment terminates when ≥2 of the 3 signals are significant (scoring, not
-/// strict AND, so a single noisy metric cannot lock out a true termination).
-///
-/// Designed for ns-scale windows. With the current short scan windows it stays
-/// inert (the window never fills), which is intentional — it is the long-MD
-/// protocol that becomes live once windows are long enough (v2/v3).
-#[derive(Debug, Clone)]
-pub struct TrendConfig {
-    /// Master switch.
-    pub enabled: bool,
-    /// Observations needed before a slope is fit (sliding window).
-    pub window: usize,
-    /// Steps between observations.
-    pub check_every: usize,
-    /// A signal counts as "bad" when its per-ps slope exceeds `z_threshold ×
-    /// floor` (a z-score of `z_threshold` or more against the noise floor).
-    pub z_threshold: f64,
-    /// Thermal-noise floors: per-ps slope of each signal on a well-behaved
-    /// reference run — the per-system part of the z-score. Calibrate these on
-    /// the anchor reference. Units: kcal/mol/ps, Å/ps, fraction-of-ref/ps.
-    pub energy_floor_ps: f64,
-    pub rg_floor_ps: f64,
-    pub ss_floor_ps: f64,
-}
-
-impl Default for TrendConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            window: 100,
-            check_every: 10,
-            z_threshold: 3.0,
-            // Placeholders — calibrate on the reference run before trusting
-            // long-MD verdicts.
-            energy_floor_ps: 50.0,
-            rg_floor_ps: 0.1,
-            ss_floor_ps: 0.01,
-        }
-    }
-}
-
-struct TrendDetector {
-    cfg: TrendConfig,
-    t_ps: VecDeque<f64>,
-    energy: VecDeque<f64>,
-    rg: VecDeque<f64>,
-    ss: VecDeque<f64>,
-}
-
-impl TrendDetector {
-    fn new(cfg: TrendConfig) -> Self {
-        Self {
-            cfg,
-            t_ps: VecDeque::new(),
-            energy: VecDeque::new(),
-            rg: VecDeque::new(),
-            ss: VecDeque::new(),
-        }
-    }
-
-    /// Record one observation (time in ps, energy in kcal/mol, Rg in Å, and the
-    /// fraction of reference secondary structure still present). Returns the
-    /// triggering signal name once ≥2/3 trend slopes are significant in the bad
-    /// direction (energy rising / Rg expanding / SS dissolving).
-    fn observe(&mut self, t_ps: f64, energy: f64, rg: f64, ss_frac: f64) -> Option<&'static str> {
-        if !self.cfg.enabled {
-            return None;
-        }
-        let w = self.cfg.window.max(3);
-        self.t_ps.push_back(t_ps);
-        self.energy.push_back(energy);
-        self.rg.push_back(rg);
-        self.ss.push_back(ss_frac);
-        while self.energy.len() > w {
-            self.t_ps.pop_front();
-            self.energy.pop_front();
-            self.rg.pop_front();
-            self.ss.pop_front();
-        }
-        if self.energy.len() < w {
-            return None; // window not full yet — inert on short scans
-        }
-
-        let e_slope = slope_ps(&self.t_ps, &self.energy);
-        let r_slope = slope_ps(&self.t_ps, &self.rg);
-        let s_slope = slope_ps(&self.t_ps, &self.ss);
-
-        let mut bad = 0u32;
-        let mut reason = "trend";
-        if e_slope > self.cfg.z_threshold * self.cfg.energy_floor_ps {
-            bad += 1;
-            reason = "energy_rise";
-        }
-        if r_slope > self.cfg.z_threshold * self.cfg.rg_floor_ps {
-            bad += 1;
-            reason = "rg_expand";
-        }
-        // SS dissolving = negative slope of the kept-SS fraction.
-        if -s_slope > self.cfg.z_threshold * self.cfg.ss_floor_ps {
-            bad += 1;
-            reason = "ss_loss";
-        }
-        if bad >= 2 { Some(reason) } else { None }
-    }
-}
-
-/// Least-squares slope of `y` vs time `t` (ps) over the window, in y-units/ps.
-fn slope_ps(t: &VecDeque<f64>, y: &VecDeque<f64>) -> f64 {
-    let n = t.len();
-    if n < 2 {
-        return 0.0;
-    }
-    let t_mean: f64 = t.iter().sum::<f64>() / n as f64;
-    let y_mean: f64 = y.iter().sum::<f64>() / n as f64;
-    let (mut num, mut den) = (0.0f64, 0.0f64);
-    for i in 0..n {
-        let dt = t[i] - t_mean;
-        num += dt * (y[i] - y_mean);
-        den += dt * dt;
-    }
-    if den.abs() < 1e-12 { 0.0 } else { num / den }
-}
-
 /// Scan result for a single environment point.
 #[derive(Debug, Clone)]
 pub struct StabilityPoint {
@@ -407,14 +313,31 @@ struct PointTemplate {
     env: EnvParams,
 }
 
-/// Build-env key: two points can share one template iff pH (protonation),
-/// pressure on/off (barostat presence) and ionic strength (salt) match.
-fn build_key(e: EnvParams) -> (u32, bool, u32) {
-    (
-        e.ph.to_bits(),
-        e.pressure_bar > 0.0,
-        e.ionic_strength_m.to_bits(),
-    )
+/// Build-env key: two points can share one template iff every build-time
+/// input matches: pH (protonation), pressure on/off (barostat presence), and
+/// the packed float mix of ionic/divalent salts, redox fraction and the
+/// electric field (which all change the built system, not just runtime).
+fn build_key(e: EnvParams) -> (u32, bool, u64) {
+    // One 64-bit mix for the float-valued build inputs (salt, divalent salts,
+    // redox fraction, field components): differing values must never share a
+    // template, and equality of the packed mix implies equality of every
+    // component we build from (they're plain f32 fields).
+    let mut mix: u64 = 1469598103934665603;
+    for v in [
+        e.ionic_strength_m,
+        e.mg_cl2_m,
+        e.ca_cl2_m,
+        e.sr_cl2_m,
+        e.ba_cl2_m,
+        e.redox_reducing,
+        e.efield[0],
+        e.efield[1],
+        e.efield[2],
+        e.efield_omega,
+    ] {
+        mix = (mix ^ v.to_bits() as u64).wrapping_mul(1099511628211);
+    }
+    (e.ph.to_bits(), e.pressure_bar > 0.0, mix)
 }
 
 /// Build one environment point, run `n_steps`, and classify it (used by both
@@ -437,6 +360,15 @@ fn probe_point(
     // Rebuild only when build-time parameters changed. `relax_iters: None`
     // must inherit the build default (Some(2000)) — passing it through disables
     // minimization and every point crashes.
+    //
+    // build_key covers EnvParams only; `BuildOptions::cosolvents` (v1.3.1) and
+    // `BuildOptions::salts` (v1.3.2) ride outside the key BY CONSTRUCTION — a
+    // grid scan fixes one `build_opts` for its whole run, so the template and
+    // every point it serves share the same cosolutes/electrolytes. If a future
+    // API ever varies those between points of one template, the key must mix
+    // them in — same one-storage-path discipline as the mutate-path salt
+    // caveat (`builder::build_mutant_by_solvent_reuse`'s guard): there must be
+    // exactly one place that decides what a build depends on.
     let needs_rebuild = template
         .as_ref()
         .map_or(true, |t| build_key(t.env) != build_key(env));
@@ -508,46 +440,39 @@ fn probe_point(
             },
         );
 
-        // v2 long-MD environment-trend detector (soft early termination). It
-        // complements the hard `early_abort_u` spike and is inert while the
-        // window is shorter than `trend.window` (intended for short scans).
-        let mut trend = TrendDetector::new(cfg.trend.clone());
+        // v2 long-MD environment-trend detector (soft early termination), now
+        // engine-mounted (v1.3.4) so scans and RL share one fail-fast path. It
+        // complements the hard `early_abort_u` spike, skips the segment's
+        // equilibration prefix, and is inert while the window is shorter than
+        // `trend.window` (intended for short scans).
+        if cfg.trend.enabled {
+            engine.set_trend_monitor_skip(cfg.trend.clone(), cfg.equil_steps);
+        }
 
         let mut crashed = false;
         let mut reason: Option<&'static str> = None;
-        for step_i in 0..seg_steps {
+        for _step_i in 0..seg_steps {
             let r = engine.step(None);
+            // Trend alarm comes back on the step result (structured); treat it
+            // exactly like the old in-loop trigger.
+            if let Some(sig) = r.trend_alarm {
+                crashed = true;
+                reason = Some(sig);
+                break;
+            }
             // B: early abort — a positive energy spike means divergence is
             // underway; cut the doomed segment short instead of running to
             // CRASH_ENERGY (normal U for a solvated protein is strongly
-            // negative, so U > early_abort_u is unambiguous blow-up).
+            // negative, so U > early_abort_u is unambiguous blow-up). A hard
+            // crash (r.crashed with no trend_alarm) is the same failure.
             if r.crashed || (cfg.early_abort_u > 0.0 && r.u_t_kcal > cfg.early_abort_u) {
                 crashed = true;
                 reason = Some("energy_spike");
                 break;
             }
-            // Trend detection: sample cheap signals (energy is free; Rg and SS
-            // only on check steps) and terminate once the environment drives
-            // the fold in a bad direction (≥2/3 signals significant).
-            if cfg.trend.enabled
-                && step_i >= cfg.equil_steps
-                && (step_i + 1) % cfg.trend.check_every.max(1) == 0
-            {
-                let t_ps = engine.state.time;
-                let rg = crate::metrics::radius_of_gyration(&engine);
-                let ss_frac = if mref.ss_ref.is_empty() {
-                    1.0
-                } else {
-                    crate::metrics::ss_kept_count(&engine, &mref.ss_ref, mref.config.hbond_n_o)
-                        as f64
-                        / mref.ss_ref.len() as f64
-                };
-                if let Some(sig) = trend.observe(t_ps, r.u_t_kcal, rg, ss_frac) {
-                    crashed = true;
-                    reason = Some(sig);
-                    break;
-                }
-            }
+        }
+        if cfg.trend.enabled {
+            engine.clear_trend_monitor();
         }
         if crashed {
             n_crash += 1;
@@ -783,9 +708,9 @@ pub fn scan_stability(
     let done = AtomicUsize::new(0);
 
     if cfg.progress {
-        let pb = indicatif::ProgressBar::new(total as u64);
+        let pb = crate::progress::ProgressBar::new(total as u64);
         pb.set_style(
-            indicatif::ProgressStyle::default_bar()
+            crate::progress::ProgressStyle::default_bar()
                 .template("[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} {msg} ({eta})")
                 .unwrap()
                 .progress_chars("#>-"),
@@ -805,7 +730,7 @@ pub fn scan_stability(
     // Partition mesh points by build-env key; each group reuses one solvated +
     // minimized template (the LAMMPS velocity-create sweep pattern), so solvent
     // init + L-BFGS run once per distinct build env instead of per point.
-    let mut groups: HashMap<(u32, bool, u32), Vec<EnvParams>> = HashMap::new();
+    let mut groups: HashMap<(u32, bool, u64), Vec<EnvParams>> = HashMap::new();
     for env in &mesh {
         groups.entry(build_key(*env)).or_default().push(*env);
     }
@@ -822,7 +747,7 @@ pub fn scan_stability(
         );
     }
     let screened: Vec<(
-        (u32, bool, u32),
+        (u32, bool, u64),
         usize,
         StabilityPoint,
         Vec<EnvParams>,
@@ -871,7 +796,7 @@ pub fn scan_stability(
     }
 
     // ---- Stage 2 (parallel): walk T within each column, reusing its template.
-    let by_key: HashMap<(u32, bool, u32), Vec<StabilityPoint>> = screened
+    let by_key: HashMap<(u32, bool, u64), Vec<StabilityPoint>> = screened
         .into_par_iter()
         .map(|(k, ref_idx, ref_pt, envs, mut template)| {
             let n = envs.len();
@@ -985,6 +910,10 @@ pub enum Axis {
     Ph,
     Pressure,
     Ionic,
+    /// MgCl2 formula-unit molarity (mol/L).
+    Mg,
+    /// CaCl2 formula-unit molarity (mol/L).
+    Ca,
 }
 
 impl Axis {
@@ -994,7 +923,19 @@ impl Axis {
             Axis::Ph => "ph",
             Axis::Pressure => "pressure",
             Axis::Ionic => "ionic",
+            Axis::Mg => "mg",
+            Axis::Ca => "ca",
         }
+    }
+
+    /// Rebuild `e` through the clamping constructors while keeping every
+    /// field's current value (redox fraction and the electric field must not
+    /// be dropped when only one axis moves).
+    fn preserved(e: EnvParams) -> EnvParams {
+        EnvParams::new(e.ph, e.temp_k, e.pressure_bar, e.ionic_strength_m)
+            .with_divalent(e.mg_cl2_m, e.ca_cl2_m, e.sr_cl2_m, e.ba_cl2_m)
+            .with_redox(e.redox_reducing)
+            .with_efield(e.efield, e.efield_omega)
     }
 
     /// Step `env` along this axis by `step × sign(direction)`, clamped into the
@@ -1010,8 +951,10 @@ impl Axis {
             Axis::Ph => e.ph += s,
             Axis::Pressure => e.pressure_bar += s,
             Axis::Ionic => e.ionic_strength_m += s,
+            Axis::Mg => e.mg_cl2_m += s,
+            Axis::Ca => e.ca_cl2_m += s,
         }
-        EnvParams::new(e.ph, e.temp_k, e.pressure_bar, e.ionic_strength_m)
+        Self::preserved(e)
     }
 
     /// Value of `env` along this axis.
@@ -1021,6 +964,8 @@ impl Axis {
             Axis::Ph => env.ph,
             Axis::Pressure => env.pressure_bar,
             Axis::Ionic => env.ionic_strength_m,
+            Axis::Mg => env.mg_cl2_m,
+            Axis::Ca => env.ca_cl2_m,
         }
     }
 
@@ -1032,12 +977,16 @@ impl Axis {
     /// Midpoint of two envs along this axis (other axes taken from `a`).
     fn midpoint(&self, a: EnvParams, b: EnvParams) -> EnvParams {
         let mid = 0.5 * (self.value(a) + self.value(b));
+        let mut m = Self::preserved(a);
         match self {
-            Axis::Temp => EnvParams::new(a.ph, mid, a.pressure_bar, a.ionic_strength_m),
-            Axis::Ph => EnvParams::new(mid, a.temp_k, a.pressure_bar, a.ionic_strength_m),
-            Axis::Pressure => EnvParams::new(a.ph, a.temp_k, mid, a.ionic_strength_m),
-            Axis::Ionic => EnvParams::new(a.ph, a.temp_k, a.pressure_bar, mid),
+            Axis::Temp => m.temp_k = mid,
+            Axis::Ph => m.ph = mid,
+            Axis::Pressure => m.pressure_bar = mid,
+            Axis::Ionic => m.ionic_strength_m = mid,
+            Axis::Mg => m.mg_cl2_m = mid,
+            Axis::Ca => m.ca_cl2_m = mid,
         }
+        m.clamped()
     }
 
     /// Sane limit along this axis in `direction` (from `env::sane`).
@@ -1052,6 +1001,12 @@ impl Axis {
             (Axis::Pressure, Direction::Negative) => sane::PRESSURE_BAR_MIN,
             (Axis::Ionic, Direction::Positive) => sane::IONIC_M_MAX,
             (Axis::Ionic, Direction::Negative) => sane::IONIC_M_MIN,
+            (Axis::Mg, Direction::Positive) | (Axis::Ca, Direction::Positive) => {
+                sane::DIVALENT_M_MAX
+            }
+            (Axis::Mg, Direction::Negative) | (Axis::Ca, Direction::Negative) => {
+                sane::DIVALENT_M_MIN
+            }
         }
     }
 }
@@ -1228,9 +1183,9 @@ pub fn scan_radial(
     let done = AtomicUsize::new(0);
 
     if cfg.progress {
-        let pb = indicatif::ProgressBar::new(total as u64);
+        let pb = crate::progress::ProgressBar::new(total as u64);
         pb.set_style(
-            indicatif::ProgressStyle::default_bar()
+            crate::progress::ProgressStyle::default_bar()
                 .template("[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} {msg} ({eta})")
                 .unwrap()
                 .progress_chars("#>-"),
@@ -1374,7 +1329,14 @@ mod tests {
 
     #[test]
     fn from_ranges_builds_mesh() {
-        let g = EnvGrid::from_ranges((290.0, 310.0, 10.0), (6.0, 8.0, 1.0), None, None);
+        let g = EnvGrid::from_ranges(
+            (290.0, 310.0, 10.0),
+            (6.0, 8.0, 1.0),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(g.temps.len(), 3);
         assert_eq!(g.phs.len(), 3);
         assert_eq!(g.pressures, vec![1.0]);

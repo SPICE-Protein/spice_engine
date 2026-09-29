@@ -439,7 +439,6 @@ impl MdState {
         }
 
         self.water = placed_water;
-        self.water_pme_sites_forces = vec![[Vec3F64::new_zero(); 3]; self.water.len()];
         self.rebuild_spatial_caches(dev);
         true
     }

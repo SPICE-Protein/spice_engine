@@ -1,9 +1,15 @@
 #!/usr/bin/env python
-"""Validate the incomplete-residue policy:
+"""Validate the incomplete-residue policy (upgraded in v1.3.6, 糙1-residual (iii)):
+- The check is now PER-RESIDUE against the charge lib's sidechain heavy-atom
+  set, not merely "zero sidechain atoms". Structures with partially truncated
+  (disordered) sidechains — e.g. 4LPX Lys@41 CB-only, His@95-97 CB-only —
+  now FAIL strict (they used to build silently with −0.2 e-scale charge holes
+  and fractional net charge) and must list the missing atoms in the error.
 - 1R2I strict (default) must fail with a CLEAR aggregate error (was the
   misleading "Missing bond params for CX-HB2").
-- 1R2I strict_incomplete=False must build truncated.
-- 5H3G / 4LPX / 8CWC must still build OK in strict mode.
+- 1R2I / 4LPX strict_incomplete=False must build (degraded) with a warning.
+- 5H3G / 8CWC (clean sidechain sets after altloc dedup) must still build OK
+  in strict mode.
 """
 import spice_engine as se
 

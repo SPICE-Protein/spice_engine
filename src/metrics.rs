@@ -205,7 +205,7 @@ pub fn radius_of_gyration(engine: &SpiceEngine) -> f64 {
 
 /// DSSP-lite: find main-chain C=O(i)···N(j) hydrogen bonds. Returns `(donor O res,
 /// acceptor N res)` pairs with O–N distance under the cutoff.
-fn backbone_hbonds(engine: &SpiceEngine, cutoff: f64) -> Vec<(usize, usize)> {
+pub(crate) fn backbone_hbonds(engine: &SpiceEngine, cutoff: f64) -> Vec<(usize, usize)> {
     let n = engine.topology.sequence.len();
     let mut out = Vec::new();
 
@@ -284,10 +284,10 @@ impl Metrics {
         is_cterm: bool,
     ) -> Option<f64> {
         if is_nterm {
-            return Some(1.0);
+            return Some(if ph < pka.nterm { 1.0 } else { 0.0 });
         }
         if is_cterm {
-            return Some(-1.0);
+            return Some(if ph < pka.cterm { 0.0 } else { -1.0 });
         }
         match one {
             'D' => Some(if ph < pka.asp { 0.0 } else { -1.0 }),
@@ -382,10 +382,9 @@ impl Metrics {
 
     /// Surface charge mismatch (m5): mean |actual − ideal| over surface,
     /// charge-capable residues. 0 when none.
-    /// Re-calibrated to use neutral pH 7.0 as the physiological baseline so that
-    /// extreme pH built states create a clear, discriminating mismatch gradient.
+    /// Compare the surface charge against the requested build environment pH.
     fn surface_charge_mismatch(&self, engine: &SpiceEngine) -> (f64, usize) {
-        let ph = 7.0; // Physiological neutral pH baseline
+        let ph = engine.env.ph as f64;
         let n = engine.topology.sequence.len();
         let surface = self.surface_residues(engine);
         let mut acc = 0.0f64;
@@ -395,8 +394,8 @@ impl Metrics {
                 continue;
             }
             let one = engine.topology.residues[i].one_letter;
-            let is_nterm = i == 0;
-            let is_cterm = i + 1 == n;
+            let is_nterm = engine.topology.residues[i].is_nterm;
+            let is_cterm = engine.topology.residues[i].is_cterm;
             let Some(ideal) = Self::ideal_charge(one, ph, &self.config.pka, is_nterm, is_cterm)
             else {
                 continue;

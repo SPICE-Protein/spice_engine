@@ -15,7 +15,8 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::engine::md_core::{
-    AtomDynamics, KCAL_TO_NATIVE, MdState, NATIVE_TO_KCAL, SimBoxInit, solvent::WaterMolOpc,
+    AtomDynamics, NATIVE_TO_KCAL, SimBoxInit, solvent::WaterMolOpc,
+    thermostat::KB_A2_PS2_PER_K_PER_AMU,
 };
 
 pub(crate) const BAR_PER_KCAL_MOL_PER_ANSTROM_CUBED: f64 = 69476.95457055373;
@@ -186,7 +187,9 @@ impl SimBox {
     /// For use with the barostat. It will expand or shrink the box if it determines the pressure
     /// is too high or low based on the virial pair sum.
     pub fn scale_isotropic(&mut self, lambda: f32) {
-        // todo: QC f32 vs f64 in this fn.
+        // f32 throughout is deliberate: per-step |λ−1| is bounded at 10^-1 by
+        // the caller and positions are already f32; a f64 pass would only
+        // widen the cast boundary without changing reachable precision.
 
         // Treat non-finite or tiny λ as "no-op"
         let lam = if lambda.is_finite() && lambda.abs() > 1.0e-12 {
@@ -241,7 +244,6 @@ pub struct VirialKcalMol {
 
 impl VirialKcalMol {
     pub(crate) fn total(&self) -> f64 {
-        // todo temp!
         self.bonded + self.nonbonded_short_range + self.nonbonded_long_range + self.constraints
     }
 }
@@ -312,15 +314,17 @@ pub struct Barostat {
     /// C-rescale uses a Gaussian; `StdRng` (rather than the thread-local RNG) so that
     /// `MdState` is `Send` and engine pools can run workers in parallel.
     pub rng: StdRng,
+    /// Instantaneous pressure (bar) from the PREVIOUS force evaluation. The
+    /// barostat teleport now runs between the drift and this step's force
+    /// evaluation (GROMACS placement — see `step`), so its drive term is one
+    /// step behind by construction; at dlnV ≲ 10⁻³/step the lag is inert.
+    pub last_p_inst_bar: f64,
 }
 
 static SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn generate_unique_seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let nanos = crate::engine::md_core::clock::unix_ns();
     let count = SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SplitMix64 avalanche mixer: ensures that consecutive counts are mapped to completely
     // uncorrelated seeds, even when nanos is identical across parallel threads/nodes.
@@ -335,6 +339,7 @@ impl Default for Barostat {
         Self {
             virial: Default::default(),
             rng: StdRng::seed_from_u64(generate_unique_seed()),
+            last_p_inst_bar: 0.0,
         }
     }
 }
@@ -347,6 +352,7 @@ impl Clone for Barostat {
         Self {
             virial: self.virial.clone(),
             rng: StdRng::seed_from_u64(generate_unique_seed()),
+            last_p_inst_bar: self.last_p_inst_bar,
         }
     }
 }
@@ -383,7 +389,6 @@ impl Barostat {
         (dlnv / 3.0).exp()
     }
 
-    #[allow(unused)]
     pub(crate) fn apply_isotropic(
         &mut self,
         dt_ps: f64,
@@ -394,9 +399,6 @@ impl Barostat {
         atoms_dyn: &mut [AtomDynamics],
         waters: &mut [WaterMolOpc],
     ) -> bool {
-        // todo: Temporarily disabled barostat, until pressure measurements are fixed
-        return false;
-
         let vol_a3 = simbox.volume() as f64;
         let lam = self.scale_factor(p_inst_bar, dt_ps, temp_k, vol_a3, cfg); // λ for lengths (not volume)
 
@@ -426,27 +428,87 @@ impl Barostat {
             scale_pos(&mut w.h1.posit, c, lc);
         }
 
-        // Affine velocity scaling; the thermostat will correct kinetic energy.
+        // Stochastic cell-rescaling velocity transform (Bussi, Zykova-Timan &
+        // Parrinello JCP 131, 014101 (2009); Bernetti & Bussi 2020 eq. 4/6):
+        //   v → v/μ + sqrt(kB·T·(1−μ⁻²)/m)·ξ,  ξ ~ N(0,1),
+        // with the noise only when μ > 1 (contraction has no real variance).
+        // Peculiar velocities are DIVIDED by μ: for an ideal gas this division
+        // IS the PdV work accounting (K ∝ μ⁻² exactly balances V ∝ μ³… the
+        // gas cools as it expands); the noise term restores the Maxwell
+        // distribution at the reference temperature. (Historical note —
+        // 2026-09 forced-μ bisecting: the v × μ this replaced was wrong per
+        // the paper, but correcting it, AND moving the teleport from the step
+        // END to before force evaluation (see `MdState::step`), changed the
+        // hot-start heating slope by only their own small shares. Neither was
+        // the detonation cause: that is the teleport's real external work
+        // P·ΔV̇ on a build box that is tens of kbar overpressured, which the
+        // weak production thermostat (Langevin γ=0.5) cannot shed — so NPT
+        // from a cold box self-heats regardless of these velocity/ordering
+        // details. RL rollouts run NVT; these two are kept as ensemble/paper
+        // correctness.)
+        let inv_mu = 1.0 / lc;
+        let var_factor = (1.0 - inv_mu * inv_mu).max(0.0) as f64;
+        let kb_t = KB_A2_PS2_PER_K_PER_AMU as f64 * temp_k.max(0.0);
+        let noise = var_factor > 0.0;
+
         for a in atoms_dyn.iter_mut() {
-            if !a.static_ {
-                a.vel *= lc;
+            if a.static_ {
+                continue;
+            }
+            a.vel *= inv_mu;
+            if noise && a.mass > 0.0 {
+                let sigma = (kb_t * var_factor / a.mass as f64).sqrt() as f32;
+                a.vel += Vec3::new(
+                    sigma * self.sample_normal(),
+                    sigma * self.sample_normal(),
+                    sigma * self.sample_normal(),
+                );
             }
         }
         for w in waters.iter_mut() {
-            w.o.vel *= lc;
-            w.h0.vel *= lc;
-            w.h1.vel *= lc;
+            w.o.vel *= inv_mu;
+            w.h0.vel *= inv_mu;
+            w.h1.vel *= inv_mu;
+            if noise {
+                let so = (kb_t * var_factor / w.o.mass as f64).sqrt() as f32;
+                let sh = (kb_t * var_factor / w.h0.mass as f64).sqrt() as f32;
+                w.o.vel += Vec3::new(
+                    so * self.sample_normal(),
+                    so * self.sample_normal(),
+                    so * self.sample_normal(),
+                );
+                w.h0.vel += Vec3::new(
+                    sh * self.sample_normal(),
+                    sh * self.sample_normal(),
+                    sh * self.sample_normal(),
+                );
+                w.h1.vel += Vec3::new(
+                    sh * self.sample_normal(),
+                    sh * self.sample_normal(),
+                    sh * self.sample_normal(),
+                );
+            }
 
-            // We moved O and Hs above; update EP.
+            // Positions moved in step 2; rebuild EP (also re-interpolates M's velocity).
             w.update_virtual_site();
         }
         true
+    }
+
+    /// One N(0,1) draw from the barostat's stream. f64 then cast — f32
+    /// precision on a ~0.01 Å/ps noise term is irrelevant.
+    fn sample_normal(&mut self) -> f32 {
+        let x: f64 = StandardNormal.sample(&mut self.rng);
+        x as f32
     }
 }
 
 /// Measure instantaneous pressure, in bar. Inputs have been converted from native units
 /// to kcal and kcal/mol.
-/// P = (2K + W) / (3V), in kcal/mol/Å³
+/// P = (2K + W) / (3V), in kcal/mol/Å³. Every virial bucket must use the shared
+/// pair convention W = Σ (r_i − r_j)·f_on_i (positive under compression),
+/// which is what makes the sum valid; angle/dihedral use the equivalent
+/// Σ r_i·F_i with a reference atom (Newton-III makes it origin-independent).
 pub(crate) fn measure_pressure(
     kinetic_energy: f64, // kcal
     simbox: &SimBox,
@@ -461,63 +523,56 @@ pub(crate) fn measure_pressure(
     result * BAR_PER_KCAL_MOL_PER_ANSTROM_CUBED
 }
 
-impl MdState {
-    #[allow(unused)]
-    // todo: Consider removing this in favor or exposing these values in snapshots.
-    // todo: Then, applications could display in GUI etc.
-    /// Print ambient parameters, as a sanity check.
-    pub(crate) fn print_ambient_data(&self, pressure: f64) {
-        println!(
-            "\n\n------Ambient stats at step {}--------",
-            self.step_count
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lin_alg::f32::Vec3;
+
+    const R_KCAL: f64 = 0.001_987_204_1; // kcal mol⁻¹ K⁻¹
+
+    fn box_100() -> SimBox {
+        SimBox::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 100.0, 100.0))
+    }
+
+    #[test]
+    fn ideal_gas_pressure_matches_nkt_over_v() {
+        let n = 1000.0_f64;
+        let t = 300.0_f64;
+        // Translational KE of an ideal monatomic gas: 3/2 NRT.
+        let ke = 1.5 * n * R_KCAL * t;
+        let p = measure_pressure(ke, &box_100(), &VirialKcalMol::default());
+        let expected = n * R_KCAL * t / 1.0e6 * BAR_PER_KCAL_MOL_PER_ANSTROM_CUBED;
+        assert!(
+            (p - expected).abs() / expected < 1e-9,
+            "got {p}, expected {expected}"
         );
+    }
 
-        let cell_vol = self.cell.volume() as f64;
-        let atom_count = &self.atoms.iter().filter(|a| !a.static_).count();
-        println!(
-            "Cell vol: {cell_vol:.1} Å^3 num dynamic atoms: {atom_count} num solvent mols: {}",
-            self.water.len()
-        );
+    #[test]
+    fn positive_pair_virial_raises_pressure() {
+        // The shared convention W = Σ (r_i − r_j)·f_on_i is positive when
+        // compression dominates; pressure must respond with the same sign.
+        let base = measure_pressure(500.0, &box_100(), &VirialKcalMol::default());
+        let w = VirialKcalMol {
+            nonbonded_short_range: 1000.0,
+            ..Default::default()
+        };
+        let p = measure_pressure(500.0, &box_100(), &w);
+        assert!(p > base);
+    }
 
-        {
-            let p_kin_bar = (2.0 * self.measure_kinetic_energy_translational()) / (3.0 * cell_vol)
-                * BAR_PER_KCAL_MOL_PER_ANSTROM_CUBED;
-
-            let vir_total_kcal = self.barostat.virial.to_kcal_mol().total();
-            let p_vir_bar = vir_total_kcal / (3.0 * cell_vol) * BAR_PER_KCAL_MOL_PER_ANSTROM_CUBED;
-
-            println!("P_kin: {p_kin_bar:.3} bar  P_vir: {p_vir_bar:.3} bar");
-        }
-
-        let temp = self.measure_temperature();
-        println!("\nTemperature: {temp:.2} K");
-
-        let mut water_v = 0.;
-        for mol in &self.water {
-            water_v += mol.o.vel.magnitude();
-        }
-        let mut atom_v = 0.;
-        for atom in self.atoms.iter().filter(|a| !a.static_) {
-            atom_v += atom.vel.magnitude();
-        }
-
-        println!(
-            "Ke: {:.2} kcal/mol = {:.2} (Å/ps)²  DOF: {}",
-            self.kinetic_energy,
-            self.kinetic_energy * KCAL_TO_NATIVE as f64,
-            self.thermo_dof
-        );
-
-        println!(
-            "Water O avg vel: {:.3} Å/ps | Atom (non-static) avg vel: {:.3} Å/ps",
-            water_v / self.water.len() as f32,
-            atom_v / *atom_count as f32
-        );
-
-        println!("\nPressure: {pressure:.3} bar");
-
-        println!("Virial: {}", self.barostat.virial.to_kcal_mol());
-
-        println!("------------------------");
+    #[test]
+    fn scale_factor_direction_and_bounds() {
+        let mut barostat = Barostat::default();
+        let cfg = BarostatCfg::default();
+        // Over-pressurized: deterministic drift expands the box...
+        let lam_hot = barostat.scale_factor(60_000.0, 0.002, 310.0, 200_000.0, &cfg);
+        assert!(lam_hot > 1.0 && lam_hot < 1.04, "lam_hot={lam_hot}");
+        // ...while negative (tensile) pressure contracts it.
+        let lam_cold = barostat.scale_factor(-60_000.0, 0.002, 310.0, 200_000.0, &cfg);
+        assert!(lam_cold < 1.0 && lam_cold > 0.96, "lam_cold={lam_cold}");
+        // λ is exp(±0.1/3)-bounded by the dlnV clamp even at absurd pressure.
+        let lam_extreme = barostat.scale_factor(1.0e9, 100.0, 310.0, 100.0, &cfg);
+        assert!(lam_extreme.is_finite() && lam_extreme <= (0.1_f64 / 3.0).exp() + 1e-12);
     }
 }

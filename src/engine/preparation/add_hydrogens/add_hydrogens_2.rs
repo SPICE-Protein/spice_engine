@@ -21,7 +21,7 @@ use crate::engine::md_core::{
             LEN_C_H, LEN_CALPHA_H, LEN_N_H, LEN_O_H, LEN_S_H, PLANAR3_A, PLANAR3_B, PLANAR3_C,
             TETRA_A, TETRA_B, TETRA_C, TETRA_D,
         },
-        h_type_in_res_sidechain,
+        h_expect, h_type_in_res_sidechain,
         sidechain::Sidechain,
     },
 };
@@ -116,7 +116,7 @@ fn tetra_atoms_2(center: Vec3, atom_0: Vec3, atom_1: Vec3, len: f64) -> (Vec3, V
 }
 
 /// Find the position of the third planar (SP2) atom.
-fn planar_posit(posit_center: Vec3, bond_0: Vec3, bond_1: Vec3, len: f64) -> Vec3 {
+pub(crate) fn planar_posit(posit_center: Vec3, bond_0: Vec3, bond_1: Vec3, len: f64) -> Vec3 {
     let bond_0_unit = bond_0.to_normalized();
     let n_plane_normal = bond_0_unit.cross(bond_1).to_normalized();
     let rotator = Quaternion::from_axis_angle(n_plane_normal, SP2_PLANAR_ANGLE);
@@ -242,7 +242,95 @@ fn add_h_sc_het(
 
         match atom.element {
             Carbon => {
-                // todo: Handle O bonded (double bonds).
+                // Standard residues: the CHARGE LIB is the authority on how many H
+                // this carbon carries (see h_expect). The old single-bond-angle
+                // planar test is unreliable — real sp3 C-C-C angles run 111–117° and
+                // straddle PLANAR_ANGLE_THRESH, so distorted CH2 groups (Leu/Phe/Cys
+                // CB, Glu CG, …) were classified planar and silently lost their
+                // second H (HB3/HG3) → fractional, under-counted residue charges.
+                // The lib count decides; coordination only picks the geometry.
+                if let Some(aa_n) = aa {
+                    let names = h_expect(aa_n, parent_tir, digit_map)?;
+                    let want = names.len();
+                    if want == 0 {
+                        continue; // carbonyl/amide C, ring-fusion C, or deprotonated
+                    }
+                    let nb = atoms_bonded.len();
+                    if nb == 0 {
+                        eprintln!(
+                            "H placement: isolated sidechain C {parent_tir:?} in {aa_n:?} \
+                             (no heavy neighbours) — skipped."
+                        );
+                        continue;
+                    }
+                    // SAFETY: TETRA_* are (effectively-immutable) statics; the
+                    // existing code in this file reads them under `unsafe` too.
+                    let posits: Vec<Vec3> = if nb == 1 {
+                        // Methyl-type: 3 tetrahedral slots around the single bond.
+                        let (bond_prev, bond_back2) =
+                            match get_prev_bonds(atom, atoms, i, atoms_bonded[0]) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                        unsafe {
+                            let rotator_a = Quaternion::from_unit_vecs(TETRA_A, bond_prev);
+                            let tetra_rotated = rotator_a.rotate_vec(TETRA_B);
+                            let dihedral =
+                                calc_dihedral_angle(bond_prev, tetra_rotated, bond_back2);
+                            // Offset; don't align; avoids steric hindrance.
+                            let rotator_b =
+                                Quaternion::from_axis_angle(bond_prev, -dihedral + TAU / 6.);
+                            let rotator = rotator_b * rotator_a;
+                            [TETRA_B, TETRA_C, TETRA_D]
+                                .into_iter()
+                                .map(|tb| atom.posit + rotator.rotate_vec(tb) * LEN_C_H)
+                                .collect()
+                        }
+                    } else if nb == 2 && want == 1 {
+                        // sp2 ring/aromatic CH: in-plane single position.
+                        let bond_0 = atom.posit - atoms_bonded[0].1.posit;
+                        let bond_1 = atoms_bonded[1].1.posit - atom.posit;
+                        vec![planar_posit(atom.posit, bond_0, bond_1, LEN_C_H)]
+                    } else if nb == 2 {
+                        // CH2 (want ≥ 2): tetrahedral pair, no angle test.
+                        let (h_0, h_1) = tetra_atoms_2(
+                            atom.posit,
+                            atoms_bonded[0].1.posit,
+                            atoms_bonded[1].1.posit,
+                            LEN_C_H,
+                        );
+                        vec![h_0, h_1]
+                    } else {
+                        // nb >= 3: at most one H slot — sp3 CH on a 3-coordinate
+                        // centre (Ile CB), via the inverted-tetra formula.
+                        let p = atom.posit
+                            - tetra_atoms(
+                                atom.posit,
+                                atoms_bonded[0].1.posit,
+                                atoms_bonded[1].1.posit,
+                                atoms_bonded[2].1.posit,
+                            ) * LEN_CALPHA_H;
+                        vec![p]
+                    };
+                    if want > posits.len() {
+                        eprintln!(
+                            "H placement: {parent_tir:?} in {aa_n:?} expects {want} H but \
+                             coordination {nb} yields {} — placing {}.",
+                            posits.len(),
+                            posits.len()
+                        );
+                    }
+                    for (name, posit) in names.iter().zip(posits.into_iter()) {
+                        hydrogens.push(AtomGeneric {
+                            posit,
+                            type_in_res: Some(name.clone()),
+                            hetero: false,
+                            ..h_default_sc.clone()
+                        });
+                    }
+                    continue;
+                }
+                // Hetero/ligand carbons (no AA): legacy geometry-driven path.
                 match atoms_bonded.len() {
                     1 => unsafe {
                         // Methyl.
@@ -429,30 +517,15 @@ fn add_h_sc_het(
                                 }
                             };
 
-                        // Peek into the digit_map to count expected H on this nitrogen.
-                        // LYS NZ is NH3+ (3 H, tetrahedral) at low/neutral pH; it becomes
-                        // NH2 (2 H, planar) only above the LYS pKa (LYN variant).
-                        // All other terminal nitrogens (ARG NH1/NH2, ASN ND2, GLN NE2) are
-                        // always NH2 (2 H, planar).
-                        //
-                        // NOTE: `digit_map` keys by the FIRST designator char, so ARG's
-                        // NH1 (HH11/HH12) and NH2 (HH21/HH22) collide under 'H' (4 digits),
-                        // which would spuriously trigger the NH3+ branch (3 H) below.
-                        // Arg guanidinium has no pH variant — NH1/NH2 always carry 2 H.
-                        let depth = match parent_tir {
-                            AtomTypeInRes::NZ => 'Z',
-                            AtomTypeInRes::NH1 | AtomTypeInRes::NH2 => 'H',
-                            AtomTypeInRes::NE | AtomTypeInRes::NE1 | AtomTypeInRes::NE2 => 'E',
-                            AtomTypeInRes::ND1 | AtomTypeInRes::ND2 => 'D',
-                            _ => '\0',
-                        };
-                        let n_h = if matches!(parent_tir, AtomTypeInRes::NH1 | AtomTypeInRes::NH2) {
-                            2 // ARG guanidinium: always NH2 (2 H)
-                        } else {
-                            aa.and_then(|a| digit_map.get(&a))
-                                .and_then(|m| m.get(&depth))
-                                .map(|d| d.len())
-                                .unwrap_or(2)
+                        // Expected H count straight from the charge lib (h_expect):
+                        // LYS NZ → HZ/HZ2/HZ3 (3, tetrahedral NH3+) at low/neutral pH,
+                        // 1–2 above its pKa (LYN); ARG NH1/NH2 → HH1x/HH2x (2 each —
+                        // the leading-digit grouping in h_type_in_res_sidechain keeps
+                        // the two parents from colliding under depth 'H'). Hetero N
+                        // keeps the legacy default of 2.
+                        let n_h = match aa {
+                            Some(aa_n) => h_expect(aa_n, parent_tir, digit_map)?.len().min(3),
+                            None => 2,
                         };
 
                         if n_h >= 3 {

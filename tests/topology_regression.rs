@@ -8,7 +8,7 @@ use std::path::Path;
 
 use bio_files::MmCif;
 use na_seq::AtomTypeInRes;
-use spice_engine::engine::dynamics::params::{FfParamSet, prepare_peptide_mmcif};
+use spice_engine::engine::md_core::params::{FfParamSet, prepare_peptide_mmcif};
 use spice_engine::{BuildOptions, ProteinTopology, atoms_to_mmcif};
 
 #[test]
@@ -16,9 +16,15 @@ fn prepared_protein_ca_indices_are_one_per_residue_and_stable() {
     let mut cif = MmCif::load(Path::new("data/test/2LYZ.cif")).expect("load 2LYZ");
     let params = FfParamSet::new_amber().expect("load Amber parameters");
     let map = params.peptide_ff_q_map.as_ref().expect("peptide map");
-    let (bonds, _) =
-        prepare_peptide_mmcif(&mut cif, map, BuildOptions::default().env.ph, None, true)
-            .expect("prepare protein");
+    let (bonds, _) = prepare_peptide_mmcif(
+        &mut cif,
+        map,
+        BuildOptions::default().env.ph,
+        None,
+        true,
+        0.0,
+    )
+    .expect("prepare protein");
     assert!(!bonds.is_empty());
 
     let topology_a = ProteinTopology::from_prepared(&cif).expect("topology");

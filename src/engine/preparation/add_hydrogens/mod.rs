@@ -11,17 +11,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bio_files::{AtomGeneric, ChainGeneric, ResidueGeneric, ResidueType};
+use bio_files::{AtomGeneric, ChainGeneric, ResidueEnd, ResidueGeneric, ResidueType};
 use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeInRes, Element};
 
 use crate::engine::md_core::{
     ParamError,
     add_hydrogens::{
-        add_hydrogens_2::{Dihedral, aa_data_from_coords},
-        bond_vecs::init_local_bond_vecs,
+        add_hydrogens_2::{Dihedral, aa_data_from_coords, planar_posit},
+        bond_vecs::{LEN_CP_O, init_local_bond_vecs},
         ph::{
-            PKA_TYR, his_choice, resolve_his_tautomer_by_geometry, standard_allowed_at_ph,
-            variant_allowed_at_ph,
+            PKA_TYR, his_choice, resolve_his_tautomer_by_geometry, resolve_variant,
+            standard_allowed_at_ph, variant_allowed_at_ph,
         },
     },
     params::{ProtFfChargeMap, ProtFfChargeMapSet},
@@ -71,13 +71,31 @@ fn validate_h_atom_type(
     Ok(false)
 }
 
-// todo: Include N and C terminus maps A/R.
-/// Helper to get the digit part of the H from what's expected in Amber's naming conventions.
-/// E.g. this might map an incrementing `0` and `1` to `2` and `3` for HE2 and HE3.
-fn make_h_digit_map(ff_map: &ProtFfChargeMap, ph: f32) -> DigitMap {
-    make_h_digit_map_custom(ff_map, ph, None)
+/// The COMPLETE set of hydrogens the charge lib expects on `parent_tir` of amino
+/// acid `aa`, in naming order — i.e. `h_type_in_res_sidechain(0..)` until the
+/// first `None`. This is the authoritative H *count* for a residue position:
+/// crystal bond angles (sp3 C-C-C runs 111–117°) cannot tell a distorted CH2
+/// from a planar CH, and geometry-guessed counts silently dropped second H's
+/// (missing HB3/HG3 → fractional, under-counted net charge). Callers place
+/// exactly `len()` H's; a count of 0 means "no H here" (carbonyl C, ring-fusion
+/// C, deprotonated position at this pH — the protonation filtering in
+/// [`make_h_digit_map_custom`] is what makes the 0 meaningful).
+pub(crate) fn h_expect(
+    aa: AminoAcid,
+    parent_tir: &AtomTypeInRes,
+    digit_map: &DigitMap,
+) -> Result<Vec<AtomTypeInRes>, ParamError> {
+    let mut out = Vec::new();
+    for i in 0..4 {
+        match h_type_in_res_sidechain(i, parent_tir, Some(aa), digit_map)? {
+            Some(t) => out.push(t),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
+// todo: Include N and C terminus maps A/R.
 pub(crate) fn make_h_digit_map_custom(
     ff_map: &ProtFfChargeMap,
     ph: f32,
@@ -305,39 +323,64 @@ pub(crate) fn h_type_in_res_sidechain(
     // The naive approach of always applying 21 incremented to Cx2 doesn't always work,
     // so these individual overrides may be the easiest approach.
     // todo: See teh pattern here? Put in a mechanism to add the 2 prefix.
+    // NOTE: each override MUST return None once the parent's lib capacity is
+    // reached — h_expect counts expected H's by calling through i = 0.. and
+    // stopping at the first None; an unbounded override fabricates phantom
+    // atoms (HD3 on Phe ring CHs, HH23 inflating Arg NH2 to 3 H = +0.448 e).
     match aa {
         AminoAcid::Thr => {
             if *parent_tir == AtomTypeInRes::CG2 {
-                // HG21, 22, 23
+                // HG21, 22, 23 — methyl capacity 3.
+                if h_num_this_parent >= 3 {
+                    return Ok(None);
+                }
                 let digit = h_num_this_parent + 21;
                 return Ok(Some(AtomTypeInRes::H(format!("HG{digit}"))));
             }
         }
         AminoAcid::Arg => {
             if *parent_tir == AtomTypeInRes::NH2 {
+                // HH21, HH22 — guanidinium NH2 capacity 2 (NH1 falls through to
+                // the leading-digit grouping below, [11,12]).
+                if h_num_this_parent >= 2 {
+                    return Ok(None);
+                }
                 let digit = h_num_this_parent + 21;
                 return Ok(Some(AtomTypeInRes::H(format!("HH{digit}"))));
             }
         }
         AminoAcid::Phe => match parent_tir {
-            AtomTypeInRes::CD2 => {
-                let digit = h_num_this_parent + 2;
-                return Ok(Some(AtomTypeInRes::H(format!("HD{digit}"))));
-            }
-            AtomTypeInRes::CE2 => {
-                let digit = h_num_this_parent + 2;
-                return Ok(Some(AtomTypeInRes::H(format!("HE{digit}"))));
+            AtomTypeInRes::CD2 | AtomTypeInRes::CE2 => {
+                // Exactly one ring H on this CH carbon.
+                if h_num_this_parent >= 1 {
+                    return Ok(None);
+                }
+                let d = if matches!(parent_tir, AtomTypeInRes::CD2) {
+                    'D'
+                } else {
+                    'E'
+                };
+                let prefix = format!("H{d}");
+                return Ok(Some(AtomTypeInRes::H(format!("{prefix}2"))));
             }
             _ => (),
         },
         AminoAcid::Leu => {
             if *parent_tir == AtomTypeInRes::CD2 {
+                // HD21, 22, 23 — methyl capacity 3.
+                if h_num_this_parent >= 3 {
+                    return Ok(None);
+                }
                 let digit = h_num_this_parent + 21;
                 return Ok(Some(AtomTypeInRes::H(format!("HD{digit}"))));
             }
         }
         AminoAcid::Ile => {
             if *parent_tir == AtomTypeInRes::CG2 {
+                // HG21, 22, 23 — methyl capacity 3.
+                if h_num_this_parent >= 3 {
+                    return Ok(None);
+                }
                 let digit = h_num_this_parent + 21;
                 return Ok(Some(AtomTypeInRes::H(format!("HG{digit}"))));
             }
@@ -380,24 +423,44 @@ pub(crate) fn h_type_in_res_sidechain(
 
         if let Some(sd) = suffix_digit {
             if let Some(pos) = digits.iter().position(|&d| d == sd as u8) {
-                &digits[pos] // exact match: CE3 → 3, CZ3 → 3, CZ2 → 2, etc.
+                // Exact match (CE3 → 3, CZ2 → 2, Ile CG1 → "HG1" …): the digit
+                // identifies the PARENT, so such a parent carries exactly one H.
+                // (A count-driven caller looping h_num would otherwise re-receive
+                // the same name forever.)
+                if h_num_this_parent == 0 {
+                    digits[pos]
+                } else {
+                    return Ok(None);
+                }
             } else if digits.iter().all(|&d| d < 10) {
                 // All H names at this depth are single-digit (e.g. HD1, HD2). The parent's
                 // suffix is absent, meaning this H doesn't exist in the current protonation
                 // state — e.g. ND1 (suffix=1) has no HD1 in HIE whose 'D'→[2].
                 return Ok(None);
             } else {
-                // Multi-digit H names (e.g. HG21/22/23): the parent suffix doesn't map
-                // directly to the H digit, so fall back to attachment order.
-                digits
-                    .get(h_num_this_parent)
-                    .unwrap_or_else(|| &digits[digits.len() - 1])
+                // Multi-digit H families (HG11/12/13 vs HG21/22/23 on CG1/CG2): the
+                // parent's suffix selects the LEADING decimal digit, then attachment
+                // order walks within that group. (Walking the unfiltered vec — the old
+                // behavior — named both Val methyls HG11/12/13.)
+                let group: Vec<u8> = digits
+                    .iter()
+                    .copied()
+                    .filter(|&d| d >= 10 && (d / 10) as usize == sd)
+                    .collect();
+                match group.get(h_num_this_parent) {
+                    Some(&d) => d,
+                    None => return Ok(None),
+                }
             }
         } else {
-            // No numeric suffix on parent (e.g., OG, ND, etc.) → use attachment order
-            digits
-                .get(h_num_this_parent)
-                .unwrap_or_else(|| &digits[digits.len() - 1])
+            // No numeric suffix on parent (e.g., OG, ND, etc.) → use attachment
+            // order; running off the end of the lib's digit list honestly means
+            // "this parent carries no more H" (returning the last entry again —
+            // the old wrap — fabricates duplicate names under a count-driven loop).
+            match digits.get(h_num_this_parent) {
+                Some(&d) => d,
+                None => return Ok(None),
+            }
         }
     };
 
@@ -406,7 +469,7 @@ pub(crate) fn h_type_in_res_sidechain(
     // todo: Consider adding a completeness validator for the AA, ensuring all expected
     // todo: Hs are present.
 
-    let val = if *digit == 0 {
+    let val = if digit == 0 {
         format!("H{depth}") // e.g. HG. We use 0 as a flag when building the map.
     } else {
         format!("H{depth}{digit}")
@@ -414,7 +477,7 @@ pub(crate) fn h_type_in_res_sidechain(
 
     let result = AtomTypeInRes::H(val);
 
-    if !validate_h_atom_type(depth, *digit, aa, h_digit_map)? {
+    if !validate_h_atom_type(depth, digit, aa, h_digit_map)? {
         return Err(ParamError::new(&format!(
             "Invalid H type: {result} on {aa}. Parent: {parent_tir}"
         )));
@@ -434,12 +497,28 @@ pub(crate) fn h_type_in_res_sidechain(
 /// The H-placement uses ideal per-residue geometry without checking the rest of
 /// the (folded) protein, so in tightly packed regions an added H can sit ~1 Å from
 /// a non-bonded atom of another residue and blow the system up within a few MD
-/// steps; energy minimization cannot always push them apart (bonded forces pin
-/// the H's). We remove any added H that is within `CLASH_DIST` of an atom outside
-/// its own residue. Same-residue atoms are excluded from the check: they are
-/// 1-2/1-3 bonded (or template-adjacent) and legitimately close.
+/// steps. Same-residue atoms are excluded from the check: they are 1-2/1-3 bonded
+/// (or template-adjacent) and legitimately close.
 ///
-/// Returns the number of H's removed.
+/// Deleting the clashing H was the original remedy — but that silently removes
+/// CHARGE-BEARING hydrogens (a buried Arg's guanidinium HH11/HH22 at +0.448 e
+/// each, a Cys CB-H, …), leaving the solute net charge fractional and
+/// systematically under-counted (2LYZ: 7 deletions → +4.8 e vs ~+7 e true),
+/// which corrupts counterion balancing and every downstream electrostatic.
+/// The remedy is therefore now three-phase:
+///
+/// 1. Keep if the H is ≥ [`CLASH_DIST`] from every foreign atom (the bulk case).
+/// 2. **Reposition**: rigid-bond cone search — keep the parent–H distance,
+///    scan the placement direction on the cone around the original bond vector
+///    (polar angle ascending, so the least-distorted clearing wins).
+/// 3. **Local relax**: if the cone misses, hill-climb the H on the parent sphere
+///    (tangent pseudo-repulsion from nearby foreign atoms) from the cone's best
+///    point.
+///
+/// Only if phases 2–3 cannot reach `CLASH_DIST` is the H removed — and that now
+/// prints a named warning (residue, atom type, best distance reached).
+///
+/// Returns the number of H's removed (0 on healthy systems).
 fn resolve_h_clashes(
     atoms: &mut Vec<AtomGeneric>,
     residues: &mut [ResidueGeneric],
@@ -447,7 +526,9 @@ fn resolve_h_clashes(
     new_sn_start: u32,
 ) -> usize {
     const CLASH_DIST: f64 = 1.2; // Å — clearly-overlapping non-bonded contact
+    const TARGET_DIST: f64 = 1.3; // Å — search early-exit margin above the threshold
     const PARENT_DIST: f64 = 1.55; // Å — longest heavy-H bond (S-H ~1.35 Å)
+    const NEAR_WINDOW: f64 = 4.5; // Å — foreign atoms relevant to a ~1 Å H excursion
 
     // serial -> residue index, and residue index -> set of atom serials
     let mut res_of: HashMap<u32, usize> = HashMap::new();
@@ -468,11 +549,16 @@ fn resolve_h_clashes(
 
     let h_serials: Vec<u32> = atoms
         .iter()
-        .filter(|a| a.serial_number >= new_sn_start)
+        // Only HYDROGENS are removal candidates: added heavy atoms (the C-term
+        // OXT completion below) are chemistry-critical — they can never be
+        // deleted for a clash, only relaxed around by the build minimizer.
+        .filter(|a| a.serial_number >= new_sn_start && a.element == Element::Hydrogen)
         .map(|a| a.serial_number)
         .collect();
 
     let mut to_remove: HashSet<u32> = HashSet::new();
+    let mut removed_detail: Vec<String> = Vec::new();
+    let mut repositioned = 0usize;
 
     for &sn in &h_serials {
         let Some(&hi) = idx_of.get(&sn) else {
@@ -481,7 +567,7 @@ fn resolve_h_clashes(
         let h_pos = atoms[hi].posit;
 
         // parent = nearest heavy atom within PARENT_DIST
-        let mut parent_sn: Option<u32> = None;
+        let mut parent_j: Option<usize> = None;
         let mut best = PARENT_DIST;
         for (j, a) in atoms.iter().enumerate() {
             if j == hi || a.element == Element::Hydrogen {
@@ -490,10 +576,11 @@ fn resolve_h_clashes(
             let d = (a.posit - h_pos).magnitude();
             if d < best {
                 best = d;
-                parent_sn = Some(a.serial_number);
+                parent_j = Some(j);
             }
         }
-        let Some(psn) = parent_sn else { continue };
+        let Some(pj) = parent_j else { continue };
+        let psn = atoms[pj].serial_number;
         let Some(&pri) = res_of.get(&psn) else {
             continue;
         };
@@ -510,9 +597,132 @@ fn resolve_h_clashes(
                 min_d = d;
             }
         }
+        if min_d >= CLASH_DIST {
+            continue; // phase 1: no clash
+        }
 
-        if min_d < CLASH_DIST {
+        // Phases 2–3: move the H on the sphere of radius r0 around its parent
+        // (bond length preserved exactly, so bonded terms and any bond
+        // inference downstream see an undistorted bond; only angles bend).
+        let p_pos = atoms[pj].posit;
+        let r0 = (h_pos - p_pos).magnitude();
+        let name_of = |a: &AtomGeneric| -> String {
+            match a.type_in_res_general.as_deref() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => match &a.type_in_res {
+                    Some(t) => format!("{t:?}"),
+                    None => format!("serial {sn}"),
+                },
+            }
+        };
+        if r0 < 1e-3 {
             to_remove.insert(sn);
+            removed_detail.push(format!(
+                "{} in {:?}@{} (degenerate bond placement)",
+                name_of(&atoms[hi]),
+                residues[pri].res_type,
+                residues[pri].serial_number
+            ));
+            continue;
+        }
+        let d0 = (h_pos - p_pos).to_normalized();
+        // Orthonormal tangent basis (u, v) ⊥ d0, deterministic.
+        let arb = if d0.x.abs() < 0.9 {
+            lin_alg::f64::Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            lin_alg::f64::Vec3::new(0.0, 1.0, 0.0)
+        };
+        let u = arb.cross(d0).to_normalized();
+        let v = d0.cross(u);
+        // Foreign atoms near the original spot — the excursion is at most ~1 Å,
+        // so a 4.5 Å window cannot miss a sub-CLASH_DIST contact.
+        let near: Vec<usize> = atoms
+            .iter()
+            .enumerate()
+            .filter(|(j, a)| {
+                *j != hi
+                    && !excluded.contains(&a.serial_number)
+                    && (a.posit - h_pos).magnitude() < NEAR_WINDOW
+            })
+            .map(|(j, _)| j)
+            .collect();
+        let score = |dir: lin_alg::f64::Vec3| -> f64 {
+            let pos = p_pos + dir * r0;
+            let mut m = f64::INFINITY;
+            for &j in &near {
+                let d = (atoms[j].posit - pos).magnitude();
+                if d < m {
+                    m = d;
+                }
+            }
+            m
+        };
+
+        // Phase 2: cone search, smallest distortion first.
+        let mut best_dir = d0;
+        let mut best_d = min_d;
+        'cone: for &theta in &[15.0f64, 30.0, 45.0, 60.0] {
+            let (ct, st) = (theta.to_radians().cos(), theta.to_radians().sin());
+            for k in 0..12 {
+                let phi = k as f64 * std::f64::consts::FRAC_PI_6;
+                let dir = d0 * ct + (u * phi.cos() + v * phi.sin()) * st;
+                let d = score(dir);
+                if d > best_d {
+                    best_d = d;
+                    best_dir = dir;
+                }
+                if best_d >= TARGET_DIST {
+                    break 'cone;
+                }
+            }
+        }
+        // Phase 3: hill-climb the min-distance on the sphere (only downhill
+        // attempts shrink the step; strictly accepting improvements keeps this
+        // deterministic).
+        if best_d < TARGET_DIST {
+            let mut dir = best_dir;
+            let mut step = 0.4f64;
+            for _ in 0..64 {
+                let pos = p_pos + dir * r0;
+                let mut f = lin_alg::f64::Vec3::new(0.0, 0.0, 0.0);
+                for &j in &near {
+                    let dv = pos - atoms[j].posit;
+                    let d = dv.magnitude();
+                    if d < 2.2 && d > 1e-6 {
+                        f += dv.to_normalized() * (1.0 - d / 2.2);
+                    }
+                }
+                let t = (f - dir * f.dot(dir)).to_normalized();
+                if t.magnitude_squared() < 1e-12 {
+                    break;
+                }
+                dir = (dir + t * step).to_normalized();
+                let d = score(dir);
+                if d > best_d {
+                    best_d = d;
+                    best_dir = dir;
+                    if best_d >= TARGET_DIST {
+                        break;
+                    }
+                } else {
+                    step *= 0.8;
+                }
+            }
+        }
+
+        if best_d >= CLASH_DIST {
+            atoms[hi].posit = p_pos + best_dir * r0;
+            repositioned += 1;
+        } else {
+            // Last resort — and it is now LOUD: a removed H is a removed charge.
+            to_remove.insert(sn);
+            removed_detail.push(format!(
+                "{} in {:?}@{} (best {:.2} A after reposition+relax)",
+                name_of(&atoms[hi]),
+                residues[pri].res_type,
+                residues[pri].serial_number,
+                best_d
+            ));
         }
     }
 
@@ -535,30 +745,91 @@ fn resolve_h_clashes(
     }
 
     let n = to_remove.len();
-    if n > 0 {
-        eprintln!("Removed {n} H(s) to resolve clashes.");
+    if repositioned > 0 || n > 0 {
+        eprintln!(
+            "H clash resolution: {repositioned} repositioned on parent bond sphere, \
+             {n} removed (could not clear {CLASH_DIST} A)."
+        );
+    }
+    for d in &removed_detail {
+        eprintln!("  WARNING: removed charge-bearing H: {d}");
     }
     n
 }
 
 /// Find Cys SG atoms that form a disulfide bridge (SG–SG distance < 2.4 Å).
 /// Used to prevent protonating bridged cysteines during H placement.
-pub fn find_disulfide_sgs(atoms: &[AtomGeneric]) -> HashSet<u32> {
+/// Serial numbers of SG atoms that remain in the *oxidized* (CYX) state
+/// under a redox environment of `reducing_fraction`.
+///
+/// Bridges are detected as before (SG–SG < 2.4 Å). `reducing_fraction` ∈
+/// [0,1]: a seeded deterministic shuffle picks ceil(f·n_bridges) bridges to
+/// REDUCE; their SGs are dropped from the set, so those cysteines take the
+/// standard CYS unit — thiol "SH" ff type, an HG hydrogen, and (via
+/// `add_disulfide_bonds`/`filter_protein_bonds` in the params trees) no S–S
+/// bond record. f=0 is the historical all-oxidized behavior bit for bit.
+/// Reduction keeps the two SG positions as found (≈2 Å apart); the following
+/// solvation-relax/minimize pass is what separates them — a reduced bridge
+/// is a *starting* condition for reduction physics, not an equilibrated one.
+pub fn find_disulfide_sgs(atoms: &[AtomGeneric], reducing_fraction: f32) -> HashSet<u32> {
     let sg: Vec<usize> = atoms
         .iter()
         .enumerate()
         .filter(|(_, a)| matches!(&a.type_in_res, Some(AtomTypeInRes::SG)))
         .map(|(i, _)| i)
         .collect();
-    let mut out = HashSet::new();
+    let mut bridges: Vec<(u32, u32)> = Vec::new();
     for a in 0..sg.len() {
         for b in (a + 1)..sg.len() {
             let d = (atoms[sg[a]].posit - atoms[sg[b]].posit).magnitude();
             if d < 2.4 {
-                out.insert(atoms[sg[a]].serial_number);
-                out.insert(atoms[sg[b]].serial_number);
+                bridges.push((
+                    atoms[sg[a]].serial_number.min(atoms[sg[b]].serial_number),
+                    atoms[sg[a]].serial_number.max(atoms[sg[b]].serial_number),
+                ));
             }
         }
+    }
+    let mut out = HashSet::new();
+    let reducing_fraction = reducing_fraction.clamp(0.0, 1.0);
+    if reducing_fraction <= 0.0 {
+        for &(a, b) in &bridges {
+            out.insert(a);
+            out.insert(b);
+        }
+        return out;
+    }
+    let mut order: Vec<usize> = (0..bridges.len()).collect();
+    {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        // Fixed seed: same protein + same fraction ⇒ same reduced bridges,
+        // matching the engine's reproducible-build policy for placement-time
+        // decisions (unlike the per-build-entropy thermo RNG).
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_1018);
+        order.shuffle(&mut rng);
+    }
+    let n_reduce = (reducing_fraction * bridges.len() as f32).ceil() as usize;
+    let reduce: HashSet<(u32, u32)> = order
+        .iter()
+        .copied()
+        .take(n_reduce)
+        .map(|i| bridges[i])
+        .collect();
+    for (idx, &(a, b)) in bridges.iter().enumerate() {
+        if reduce.contains(&(a, b)) {
+            continue;
+        }
+        out.insert(a);
+        out.insert(b);
+        let _ = idx;
+    }
+    if !bridges.is_empty() {
+        eprintln!(
+            "[redox] reducing {}/{} disulfide bridge(s) (fraction {reducing_fraction}).",
+            reduce.len(),
+            bridges.len()
+        );
     }
     out
 }
@@ -570,8 +841,28 @@ pub fn populate_hydrogens_dihedrals(
     ff_map: &ProtFfChargeMapSet,
     ph: f32,
     custom_protonation: Option<&HashMap<usize, AminoAcidProtenationVariant>>,
+    reducing_fraction: f32,
 ) -> Result<Vec<Dihedral>, ParamError> {
     // todo: Move this fn to this module? Split this and its diehdral component, or not?
+
+    // Rebuild protein hydrogens from the selected pH state. Deposited hydrogen
+    // names frequently encode a different titration state; retaining them would
+    // create duplicates or leave stale HIP/HID/CYM/LYN atoms. Heavy atoms and
+    // coordinates are preserved, making repeated preparation idempotent.
+    let removed_h: HashSet<u32> = atoms
+        .iter()
+        .filter(|a| a.element == Element::Hydrogen && !a.hetero)
+        .map(|a| a.serial_number)
+        .collect();
+    if !removed_h.is_empty() {
+        atoms.retain(|a| !removed_h.contains(&a.serial_number));
+        for res in residues.iter_mut() {
+            res.atom_sns.retain(|sn| !removed_h.contains(sn));
+        }
+        for chain in chains.iter_mut() {
+            chain.atom_sns.retain(|sn| !removed_h.contains(sn));
+        }
+    }
 
     // Sets up write-once static muts.
     init_local_bond_vecs(); // This is a bit hacky, and only needs to be run once.
@@ -584,7 +875,7 @@ pub fn populate_hydrogens_dihedrals(
     // Detect Cys-Cys disulfide bridges (SG–SG < 2.4 Å) so the hydrogen
     // placement below does not protonate bonded SG atoms — otherwise every
     // disulfide S gets a thiol H clashing inside the bridge (huge forces).
-    let disulfide_sg_sns = find_disulfide_sgs(atoms);
+    let disulfide_sg_sns = find_disulfide_sgs(atoms, reducing_fraction);
 
     let mut dihedrals = Vec::with_capacity(residues.len());
 
@@ -596,7 +887,6 @@ pub fn populate_hydrogens_dihedrals(
     let res_clone = residues.to_owned();
 
     // todo: Handle the N and C term A/R.
-    let digit_map = make_h_digit_map(&ff_map.internal, ph);
 
     // Increment H serial number, starting with the final atom present prior to adding H + 1)
     let mut highest_sn = 0;
@@ -637,30 +927,31 @@ pub fn populate_hydrogens_dihedrals(
             .filter_map(|i| index_map.get(i).map(|&idx| &atoms[idx]))
             .collect();
 
-        // Determine custom variant and geometry-based Histidine choice
-        let mut custom_variant = None;
-        let mut custom_variant_used = false;
-        if let Some(map) = custom_protonation {
-            if let Some(&var) = map.get(&res_i) {
-                custom_variant = Some(var);
-                custom_variant_used = true;
-            }
-        }
-
-        if !custom_variant_used && matches!(res.res_type, ResidueType::AminoAcid(AminoAcid::His)) {
-            let var = resolve_his_tautomer_by_geometry(atoms, res);
-            custom_variant = Some(var);
-            custom_variant_used = true;
-        }
-
-        let this_digit_map = if custom_variant_used {
-            make_h_digit_map_custom(&ff_map.internal, ph, custom_variant)
+        let custom_variant = custom_protonation.and_then(|map| map.get(&res_i).copied());
+        let geometry_variant = if matches!(res.res_type, ResidueType::AminoAcid(AminoAcid::His)) {
+            Some(resolve_his_tautomer_by_geometry(atoms, res))
         } else {
-            digit_map.clone()
+            None
         };
+        let selected_variant = match res.res_type {
+            // Gate matches `populate_peptide_ff_and_q`: terminal residues keep
+            // standard side-chain protonation at any pH (their charge units have
+            // no pH variants — LYN/CYM/ASH/GLH ship internal-only); custom
+            // overrides and His tautomer geometry still apply everywhere.
+            ResidueType::AminoAcid(aa) => {
+                if custom_variant.is_none() && !matches!(res.end, ResidueEnd::Internal) {
+                    geometry_variant
+                } else {
+                    resolve_variant(aa, ph, custom_variant, geometry_variant)
+                        .map_err(|e| ParamError::new(&format!("Residue {res_i}: {e}")))?
+                }
+            }
+            _ => None,
+        };
+        let this_digit_map = make_h_digit_map_custom(&ff_map.internal, ph, selected_variant);
 
         // todo: Handle the N term and C term cases; pass those params in.
-        let (dihedral, h_added_this_res, this_cp_ca) = aa_data_from_coords(
+        let (dihedral, mut h_added_this_res, this_cp_ca) = aa_data_from_coords(
             &atoms_this_res,
             &res_clone,
             &res.res_type,
@@ -669,6 +960,43 @@ pub fn populate_hydrogens_dihedrals(
             &this_digit_map,
             &disulfide_sg_sns,
         )?;
+
+        // C-terminal carboxylate completion (糙1-residual (ii)): `aminoct12.lib`
+        // types the C-terminus with O *and* OXT (each ≈ −0.82 → residue sum
+        // exactly −1.000), but many X-ray CIFs deposit only one carboxyl O (or
+        // altloc-dedup drops the second). Without the atom the OXT charge has
+        // nowhere to live: the residue sums to ≈ −0.18 and the solute net
+        // charge goes fractional (observed: 1XJ3 CTERM Leu@116). Synthesize the
+        // missing OXT in the carboxyl sp2 plane from C's two existing
+        // substituents (CA and O) at C–O carbonyl length; downstream bond
+        // inference sees the 1.23 Å C–OXT and records the bond. N-terminus H1/
+        // H2/H3 are already rebuilt inside aa_data_from_coords.
+        if matches!(res.end, ResidueEnd::CTerminus) {
+            let has_oxt = atoms_this_res
+                .iter()
+                .any(|a| matches!(a.type_in_res, Some(AtomTypeInRes::OXT)));
+            if !has_oxt {
+                let ca = atoms_this_res
+                    .iter()
+                    .find(|a| matches!(a.type_in_res, Some(AtomTypeInRes::CA)));
+                let c = atoms_this_res
+                    .iter()
+                    .find(|a| matches!(a.type_in_res, Some(AtomTypeInRes::C)));
+                let o = atoms_this_res
+                    .iter()
+                    .find(|a| matches!(a.type_in_res, Some(AtomTypeInRes::O)));
+                if let (Some(ca), Some(c), Some(o)) = (ca, c, o) {
+                    let posit =
+                        planar_posit(c.posit, c.posit - ca.posit, o.posit - c.posit, LEN_CP_O);
+                    h_added_this_res.push(AtomGeneric {
+                        posit,
+                        element: Element::Oxygen,
+                        type_in_res: Some(AtomTypeInRes::OXT),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
 
         // Get the first atom's chain; probably OK for assigning a chain to H.
         let mut chain_i = 0;
@@ -699,7 +1027,8 @@ pub fn populate_hydrogens_dihedrals(
 
     // Resolve clashes introduced by idealized H placement: an H can sit < 1.2 Å
     // from an atom of another residue in a folded protein and blow the system up
-    // within a few MD steps.
+    // within a few MD steps. Clashing H's are first moved (or relaxed) on their
+    // parent bond sphere; deletion is a flagged last resort (see resolve_h_clashes).
     resolve_h_clashes(atoms, residues, chains, highest_sn + 1);
 
     Ok(dihedrals)

@@ -18,6 +18,14 @@
 //!     low-energy positions instead of spiking;
 //!   • finish with `hold_steps` of unrestrained NVT at the target temperature.
 //!
+//! The barostat is FROZEN for the WHOLE equilibration (NVT). A cold build is
+//! tens of kbar overpressured, and relieving that through the barostat's
+//! position-teleport is a heat pump (see the ordering comment in
+//! `MdState::step`): it overshoots T by hundreds of K and can't settle within
+//! an RL rollout's worth of steps. Pressurization is a separate, longer
+//! concern than temperature equilibration; RL rollouts run NVT (or reuse an
+//! already-settled box via `build_mutant_by_solvent_reuse`).
+//!
 //! Measured on 2LYZ: max |force| drops from ~10⁴ (step 0) to ~107 by step 100,
 //! and post-equilibration production runs have ZERO accel clamps (vs 13-19 per
 //! step before).
@@ -50,7 +58,11 @@ pub struct EquilConfig {
     /// robust choice (restraints freeze the skeleton and prevent the H's that
     /// actually carry the strain from relaxing).
     pub k_restraint: f32,
-    /// Unrestrained NVT steps at the target temperature after the ramp.
+    /// Unrestrained NVT steps at the target temperature after the ramp. The
+    /// barostat stays FROZEN for the whole ramp+hold (NVT): letting it run
+    /// during the strain-fighting ramp inflates the cell ~17% linearly while
+    /// the solvent is still heating, which then feeds the pressure-relief
+    /// pump described on `MdState::step`'s barostat placement.
     pub hold_steps: usize,
     /// Restrain hydrogens too (only relevant if `k_restraint > 0`).
     pub restrain_hydrogens: bool,
@@ -86,9 +98,9 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
     }
     let last = cfg.ramp_steps.saturating_sub(1).max(1) as f32;
 
-    let pb = indicatif::ProgressBar::new(total as u64);
+    let pb = crate::progress::ProgressBar::new(total as u64);
     pb.set_style(
-        indicatif::ProgressStyle::default_bar()
+        crate::progress::ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg} ({eta})")
             .unwrap()
             .progress_chars("#>-"),
@@ -111,6 +123,12 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
     engine.state.cfg.integrator = Integrator::LangevinMiddle {
         gamma: cfg.friction_gamma,
     };
+    // The docs promise an NVT settle, so freeze the barostat too: rescaling
+    // the box while the ramp is fighting strain lets the two positive-feedback
+    // (expansion ↔ heating) inflate the cell ~17% linearly over a 400-step
+    // ramp (observed 2LYZ: 59 → 69 Å). The production NPT coupling is restored
+    // with the integrator in step 5.
+    let prev_barostat = engine.state.cfg.barostat_cfg.take();
     engine.reset_velocities();
 
     // 2) Reference positions: heavy atoms only by default (see module docs).
@@ -181,9 +199,14 @@ pub fn equilibrate(engine: &mut SpiceEngine, cfg: &EquilConfig) -> Result<(), St
         steps += 1;
     }
 
-    // 5) Restore the production integrator and reset history so downstream
-    //    metrics / pseudo-labels start from a clean equilibrated state.
+    // 5) Restore the production integrator (barostat back live for production)
+    //    and reset history so downstream metrics / pseudo-labels start from a
+    //    clean equilibrated state. Equilibration itself ran entirely NVT — a
+    //    cold build is tens of kbar overpressured and relieving THAT through
+    //    the barostat's position teleport is a heat pump that an RL-length
+    //    rollout can't afford; pressurization is a separate, longer phase.
     engine.state.cfg.integrator = prev_integrator;
+    engine.state.cfg.barostat_cfg = prev_barostat;
     engine.reset_history();
     pb.finish_with_message(format!(
         "Equilibration complete: T={t_end:.0}K, U={:.3e}",

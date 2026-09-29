@@ -3,7 +3,7 @@
 //!
 //! Architecture boundary: the Rust side does **not** read files / Parquet.
 //! Reading Parquet, PDB, mmCIF and cleaning the data is the Python side's job
-//! (the `spice_protein/` pipeline); Python passes atom arrays into
+//! (the caller's data prep); Python passes atom arrays into
 //! `StructureInput` zero-copy through the PyO3 FFI (P4). This module converts
 //! them to `MmCif` and runs the standard build pipeline (H placement → ff
 //! types/charges → bond formation → solvation → minimization).
@@ -145,11 +145,13 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
         return Err("StructureInput has no atoms".to_string());
     }
 
-    // Group atoms by residue (sorted by res_seq). Keep each residue's atoms in
-    // input order.
-    let mut by_res: BTreeMap<i32, Vec<&AtomInput>> = BTreeMap::new();
+    // Group atoms by chain and residue so termini are assigned per chain.
+    let mut by_res: BTreeMap<(String, i32), Vec<&AtomInput>> = BTreeMap::new();
     for a in &input.atoms {
-        by_res.entry(a.res_seq).or_default().push(a);
+        by_res
+            .entry((a.chain_id.clone(), a.res_seq))
+            .or_default()
+            .push(a);
     }
 
     let mut mm_atoms: Vec<AtomGeneric> = Vec::with_capacity(input.atoms.len());
@@ -164,22 +166,21 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
     // StructureInput（from_atoms / Tauri GUI）路径也安全。
     let is_water =
         |a: &AtomInput| matches!(a.res_name.as_str(), "HOH" | "WAT" | "SOL" | "H2O" | "DOD");
-    let kept_res: Vec<&Vec<&AtomInput>> = by_res
-        .values()
-        .filter(|ra| !ra.is_empty() && !is_water(ra[0]))
+    let kept_res: Vec<(&(String, i32), &Vec<&AtomInput>)> = by_res
+        .iter()
+        .filter(|(_, ra)| !ra.is_empty() && !is_water(ra[0]))
         .collect();
     if kept_res.is_empty() {
         return Err("StructureInput has no protein residues (all atoms are waters)".to_string());
     }
     let n_res = kept_res.len();
-    for (res_idx, res_atoms) in kept_res.iter().enumerate() {
-        // Residue end tagging determines which charge map (internal/n/c-term) is used.
-        let end = if res_idx == 0 {
-            ResidueEnd::NTerminus
-        } else if res_idx + 1 == n_res {
-            ResidueEnd::CTerminus
-        } else {
-            ResidueEnd::Internal
+    for (res_idx, ((chain_id, _), res_atoms)) in kept_res.iter().enumerate() {
+        let first_in_chain = res_idx == 0 || kept_res[res_idx - 1].0.0 != *chain_id;
+        let last_in_chain = res_idx + 1 == n_res || kept_res[res_idx + 1].0.0 != *chain_id;
+        let end = match (first_in_chain, last_in_chain) {
+            (true, _) => ResidueEnd::NTerminus,
+            (_, true) => ResidueEnd::CTerminus,
+            _ => ResidueEnd::Internal,
         };
 
         let res_type = ResidueType::from_str(res_atoms[0].res_name.as_str());
@@ -218,15 +219,30 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
         });
     }
 
-    let chains = vec![ChainGeneric {
-        id: input
-            .atoms
-            .first()
-            .map(|a| a.chain_id.clone())
-            .unwrap_or_else(|| "A".to_string()),
-        residue_sns: chain_res_sns,
-        atom_sns: chain_atom_sns,
-    }];
+    let chains = {
+        let mut chains = Vec::new();
+        for (chain_id, _) in kept_res.iter().map(|(key, atoms)| (&key.0, atoms)) {
+            if chains.iter().any(|c: &ChainGeneric| c.id == *chain_id) {
+                continue;
+            }
+            let residue_sns: Vec<u32> = kept_res
+                .iter()
+                .filter(|(key, _)| key.0 == *chain_id)
+                .map(|(key, _)| key.1 as u32 + 1)
+                .collect();
+            let atom_sns: Vec<u32> = residues
+                .iter()
+                .filter(|r| residue_sns.contains(&r.serial_number))
+                .flat_map(|r| r.atom_sns.iter().copied())
+                .collect();
+            chains.push(ChainGeneric {
+                id: chain_id.clone(),
+                residue_sns,
+                atom_sns,
+            });
+        }
+        chains
+    };
 
     Ok(MmCif {
         ident: "structure-input".to_string(),

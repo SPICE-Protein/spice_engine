@@ -8,8 +8,8 @@
 //! `diag_equil_off` shows the raw post-min state + production steps (the crash
 //! mechanism). `diag_equil_on` additionally logs the equilibration ramp.
 use bio_files::MmCif;
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::FfParamSet;
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::FfParamSet;
 use spice_engine::{BuildOptions, EnvParams, EquilConfig, build_system};
 use std::path::Path;
 
@@ -72,7 +72,7 @@ fn print_sulfur_diag(engine: &spice_engine::SpiceEngine) {
         let nbr_s = nbrs
             .iter()
             .find(|(_, m, _)| (*m - 32.0).abs() < 1.0)
-            .map(|&(j, m, d)| format!("S-{}", j))
+            .map(|&(j, _, _)| format!("S-{}", j))
             .unwrap_or_else(|| "no-S-nbr".to_string());
         println!(
             "[sulfur] atom {si} ({p:.1}) force={:.1} nbrs={:?} -> {nbr_s}",

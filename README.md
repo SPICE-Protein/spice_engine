@@ -1,16 +1,10 @@
-# SPICE — Sequence-Protein Interaction under Conditional Environments
+# spice_engine — an all-atom molecular-dynamics engine (Rust · Python · WebAssembly)
 
-> Protein adaptive-evolution simulation platform: uses **reinforcement learning
-> (SAC) + all-atom MD** to explore a protein's **stability domain** and adaptive
-> evolution paths across a multidimensional environment (temperature / pH /
-> ionic strength / pressure).
+> A **general-purpose all-atom MD engine**: ff19SB protein · Li/Merz **OPC** water (rigid) · monovalent **and divalent** ions (12-6 / 12-6-4) · GAFF2 small molecules · OL24 nucleic acids · SPME/PME electrostatics · Langevin + velocity-rescale thermostats + optional Monte-Carlo barostat (NVT/NPT) · a **conditional-environment** knob set (pH / ionic strength / divalent / redox / external electric field / cosolvents) · an RL-action (bias-force) interface · an observability suite · mutation with solvent-reuse · parallel pool · **PyO3 Python bindings** · and a **1.8 MB WebAssembly build that runs MD in the browser tab**.
+>
+> Protein adaptive evolution was the application that drove development; the engine itself is general-purpose and stands on its own — integrator, force-field plumbing, environment physics, browser port. **It is not a structure predictor**: no ML runs inside this crate.
 
-The Rust engine (this repo) builds on the `dynamics` crate
-(Amber ff19SB force field + OPC water + PME) and provides environment-parameterised
-MD, five physical metrics, RL action (bias-force) interfaces, external structure
-ingestion, a parallel engine pool, and PyO3 Python bindings. The data pipeline
-(PDB download/clean → Parquet → HF) lives in the sibling `spice_protein/`
-directory.
+The engine core (v1.3.9) lives in `src/engine/` (the migrated `md_core` dynamics engine — this is the hot path), with a newer SE-owned force-field tree in `src/forcefield/`. It takes atoms in, builds a fully solvated, charge- and protonation-consistent system, integrates it, and streams structure / energy / health signals out.
 
 ## Core concepts
 
@@ -25,50 +19,57 @@ directory.
               stability-domain search / adaptive evolution (SAC)
 ```
 
-- **Conditional environment**: `EnvParams { ph, temp_k, pressure_bar, ionic_strength_m }`
-  sets protonation states / thermostat / salt concentration at build time; ΔT
-  supports hot-switching temperature mid-run.
-- **Five physical metrics M** (`metrics.rs`, the RL state/reward vector):
-  | metric | meaning |
-  |---|---|
-  | m1 | Var(U)/(k_B·T) — potential-energy fluctuation (normalised by thermal noise) |
-  | m2 | \|Rg − Rg_ref\|/Rg_ref — radius-of-gyration drift |
-  | m3 | 1 − SS_kept/SS_ref — secondary-structure loss (DSSP-lite) |
-  | m4 | fraction of heavy-atom pairs with distance/(vdW sum) < 0.6 — clash score |
-  | m5 | surface ionizable residue actual charge vs pH-ideal charge — surface charge mismatch |
-- **RL actions** (`actions.rs`): `a ∈ R¹⁶` × low-rank basis `W[L,3]×16` → per-residue
-  Cα bias forces (tanh-clamped to ±0.5 kcal/(mol·Å)); `ActionMask` re-randomises a
-  residue subset every 20 steps; `EnvDelta{ΔT, ΔpH}`.
-- **Stability-domain search** (`domain.rs`): scans a (T, pH) grid, using M to judge
-  whether the protein keeps its native fold at each environmental point, and
-  outputs the stability domain.
+- **Conditional environment** (v1.3 knob set): `EnvParams` drives build-time protonation (pH), thermostat/barostat setpoints, background NaCl ionic strength, **divalent salts** (Mg²⁺/Ca²⁺/Sr²⁺/Ba²⁺, 12-6-4), **redox** (disulfide reduction, CYX→CYS seeding), **external electric field** (static or oscillating), and **cosolvents** (urea / TMAO / GdmCl, CHARMM 2020 parameters). ΔT / Δγ / ΔT(dual-bath) / pressure hot-switch mid-run.
+- **Observability** (read-only, `analysis.rs`): probe **electrostatic potential** and its analytic **field**, per-atom **SASA**, PDB-name atom selection, contact counts and channel **bottleneck clearance**, per-term energies + virial buckets, species (solute vs water) temperatures, Rg, net charge, effective ionic strength, a `debug_rigid_scale_probe` for same-config audits, and an optional sliding-window **trend detector** for RL fail-fast.
+- **Three frontiers, one core**: the same engine compiles to a **PyO3 extension** (`python` feature), an **rlib** for Rust consumers (`EnginePool`), and a **WebAssembly** module (`web` feature) driven by a hand-rolled `extern "C"` ABI — full PME MD in the browser, no server. See `docs/web_demo.md` and the in-repo demo under `web/` (`loader.mjs` JS wrapper + `index.html` reference page + prebuilt `dist/*.wasm.gz`; `make web-serve` to try it in a tab).
+- **RL actions** (`actions.rs`): `a ∈ R¹⁶` × low-rank basis `W[L,3]×16` → per-residue Cα bias forces (tanh-clamped to ±0.5 kcal/(mol·Å)); `ActionMask` re-randomises a residue subset every 20 steps; `EnvDelta{ΔT, ΔpH}`.
+- **Stability-domain search** (`domain.rs`): scans a (T, pH) grid, using M to judge whether the protein keeps its native fold at each environmental point, and outputs the stability domain.
+
+**Five physical metrics M** (`metrics.rs` — the RL state/reward vector):
+
+| metric | meaning |
+|---|---|
+| m1 | Var(U)/(k_B·T) — potential-energy fluctuation (normalised by thermal noise) |
+| m2 | \|Rg − Rg_ref\|/Rg_ref — radius-of-gyration drift |
+| m3 | 1 − SS_kept/SS_ref — secondary-structure loss (DSSP-lite) |
+| m4 | fraction of heavy-atom pairs with distance/(vdW sum) < 0.6 — clash score |
+| m5 | surface ionizable residue actual charge vs pH-ideal charge — surface charge mismatch |
 
 ## Repository layout
 
 ```
-spice_engine/
+spice_engine/  (crate: spice_engine)
 ├── src/
-│   ├── env.rs        EnvParams environment parameters
+│   ├── env.rs        EnvParams: pH / T / P / ionic / divalent / redox / efield / cosolvent
 │   ├── topology.rs   protein topology (sequence, Cα/backbone/heavy indices, residue→atom map)
-│   ├── builder.rs    system build (pH protonation → H placement → solvation → salt → minimize)
-│   ├── engine.rs     SpiceEngine (step / U / pseudo-labels / temperature hot-switch)
-│   ├── metrics.rs    five physical metrics M
+│   ├── builder.rs    system build (pH protonation → H placement → solvation → salt → L-BFGS relax; + mutant solvent-reuse)
+│   ├── engine/       ★ the MD hot path (migrated `md_core`: integrator / nonbonded+SPME /
+│   │                   constraints / solvent / analysis / utility shims; #[path] chain
+│   │                   under engine/core/mod.rs) + SpiceEngine facade (engine.rs)
+│   ├── forcefield/   SE-owned force-field tree (SIMD backend, Amber/CHARMM/Martini types)
+│   ├── metrics.rs    five physical metrics M (+ Rg / backbone-H-bond proxies)
 │   ├── actions.rs    RL actions (force basis + ActionMask + EnvDelta)
 │   ├── structure.rs  external structure ingestion (Python in-memory atoms → build)
 │   ├── mutate.rs     sequence validation / point mutations
 │   ├── pool.rs       EnginePool (parallel workers, MdState is Send)
-│   ├── domain.rs     stability-domain grid scan
+│   ├── domain.rs     stability-domain grid scan (+ radial scans)
+│   ├── progress.rs   indicatif shim: real bars native / no-op on wasm (v1.3.9)
+│   ├── web.rs        WebAssembly extern-"C" API (feature `web`, wasm32 only; v1.3.9)
 │   └── ffi.rs        PyO3 Python bindings (feature `python`)
-├── tests/            Rust integration tests (md_smoke / p2 / p3) + Python smoke
+├── docs/             capabilities.md (API reference) · web_demo.md (browser port)
+├── web/              browser demo — loader.mjs · index.html · smoke.mjs/selftest.mjs ·
+│                     dist/*.wasm.gz (prebuilt scalar+simd) · mini.cif (fast fixture)
+├── tests/            Rust integration tests (md_smoke / npt_virial / dual_bath /
+│                     topology_regression / ion_layout_golden / repack_ions / …)
 ├── pyproject.toml    maturin packaging config
-└── Cargo.toml        cdylib + rlib; [patch] ewald (arm64)
+├── Makefile          native + web-* wasm targets (RUSTFLAGS stays per-recipe)
+└── Cargo.toml        cdylib + rlib; features python / inference / network / heavy-forcefields / web
 ```
 
-Upstream (`../`):
-- `dynamics/` — MD engine fork (patched: salt, H-clash, neighbour list, full-field
-  minimization, Barostat RNG → Send)
-- `ewald/` — SPME fork (arm64 SIMD gating)
-- `spice_protein/` — Python data pipeline (PDB → Parquet → HF)
+Build-dependency forks (`../`):
+- `ewald/` (SPICE-Protein fork) — SPME: arm64 gating, molecular exclusions, k-space virial (v0.1.16 `statrs` slimmed for wasm)
+- `bio_files` (SPICE-Protein fork) — parser, `network` feature optional so the web build drops ureq/rustls/ring
+- `dynamics` crate — upstream lineage, now migrated into `src/engine/`
 
 ## Quick start
 
@@ -81,6 +82,11 @@ cargo test --release
 cd spice_engine
 CONDA_PREFIX=/path/to/envs/spice VIRTUAL_ENV=/path/to/envs/spice \
   python -m maturin develop --release
+
+# Browser (WebAssembly) — same engine core, no server
+make wasm        # → …/wasm32-unknown-unknown/release/spice_engine.wasm (~5 MB / 1.8 MB gz)
+make web-smoke   # node correctness gate: instantiate → build → step → read back
+make web-serve   # serve web/ → http://localhost:8080 (loader.mjs + reference page)
 ```
 
 ### Python usage
@@ -89,7 +95,7 @@ CONDA_PREFIX=/path/to/envs/spice VIRTUAL_ENV=/path/to/envs/spice \
 import spice_engine as se
 import numpy as np
 
-# 1) Structure (production: numpy arrays from the Python pipeline; mmCIF convenience here)
+# 1) Structure (production: pass numpy arrays via from_atoms; from_mmcif is the debug path)
 struct = se.Structure.from_mmcif("data/test/2LYZ.cif")
 
 # 2) Build the engine (pH → protonation, T → thermostat, ionic strength → salt)
@@ -123,11 +129,9 @@ let pts = scan_stability(&dev, &param_set, &structure, &grid, &opts, &stab)?;
 // pts: Vec<StabilityPoint { env, stable, metrics }> — parallel stability scan
 ```
 
-On the Python side you can also drive each point with `Engine.build` + `step` +
-`metrics` (for SAC); the Rust `domain.rs` grid scan serves as ground truth /
-batch data generation.
+On the Python side you can also drive each point with `Engine.build` + `step` + `metrics` (for SAC); the Rust `domain.rs` grid scan serves as ground truth / batch data generation.
 
-## Current status
+## Current status (v1.3.9)
 
 | phase | content | status |
 |---|---|---|
@@ -136,10 +140,9 @@ batch data generation.
 | P2 | metrics (5 dims) + actions bias forces | ✅ |
 | P3 | external structure + mutate + EnginePool + pseudo-labels | ✅ |
 | P4 | PyO3 FFI + maturin packaging | ✅ |
-| — | stability-domain search (domain.rs) | in progress |
+| — | stability-domain search (domain.rs, parallel grid + radial scans) | ✅ |
+| v1.3.x | environment knob set (divalent 12-6-4 / redox / efield / cosolvents) · L-BFGS relaxation · ion-strength audit + genion-style placement · solvent-reuse with index-copy | ✅ |
+| v1.3.8 | **pressure closure** (PME molecular exclusions, k-space virial sign, SETTLE constraint virial billed, water-water energy fully booked) · dual-bath thermostat with exact OU per step · trend fail-fast for RL | ✅ |
+| v1.3.9 | **WebAssembly browser port** (`web` feature, hand-rolled extern-"C" ABI, dependency-graph surgery — native output bit-identical) | ✅ |
 
-**Known limitations**: steepest-descent minimization still leaves ~70–90
-kcal/mol/Å residual forces on crystal-strain hotspots, so very long MD runs can
-randomly blow up (tens-of-steps scale); the formal fix (positional restraints +
-NVT ramp equilibration) is future work. Tests therefore assert short, reliable
-stability windows.
+**Known limitations**: builder starts are density-calibrated, not perfect — the 2LYZ reference build sits at a roughly constant +12 kbar offset (a flat build-time signature, not a drift; the calibration pass is open work), and very long runs from crystal geometries still want an equilibration ramp before production. Results produced before v1.3.8 predate the fixed force/virial bookkeeping and need revalidation. The wasm tab build is single-threaded and budgeted for small systems (~10–17 ns/day at 1.5 k sites); SharedArrayBuffer threading and WebGPU are explicit non-goals.

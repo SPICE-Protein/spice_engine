@@ -7,16 +7,18 @@
 //! This involves creating, saving and loading templates, and generating water molecules given a template,
 //! sim box, and solute.
 
-use std::{fs, io, path::Path, time::Instant};
+use std::{fs, io, path::Path};
+
+use crate::engine::md_core::clock::Mono;
 
 use bincode::{Decode, Encode};
 use bio_files::{gromacs, gromacs::gro::Gro};
-use lin_alg::f32::{Quaternion, Vec3};
+use lin_alg::f32::Vec3;
 
 use crate::engine::md_core::{
     AtomDynamics, ComputationDevice, MdState, Solvent,
     barostat::SimBox,
-    partial_charge_inference::{files::load_from_bytes_bincode, save},
+    pci_files::{load_from_bytes_bincode, save},
     sa_surface,
     solvent::WaterMolOpc,
 };
@@ -334,7 +336,10 @@ impl WaterInitTemplate {
         )
     }
 
-    // todo: Identical structs; we could consolidate.
+    // Note: `gromacs::solvate::WaterInitTemplate` is a bio_files type; a
+    // real consolidation means deleting one side upstream (an
+    // upstream-coordination decision, not local work — we deliberately do
+    // not alias across the crate boundary here).
     /// Note: `gmx solvate`` handles tiling, centering, and solute deconfliction; we can
     /// send it the raw template.
     pub fn to_gromacs(&self) -> gromacs::solvate::WaterInitTemplate {
@@ -539,7 +544,7 @@ pub(crate) fn water_mols_from_template_in_region_avoiding(
     }
 
     println!("Initializing solvent molecules...");
-    let start = Instant::now();
+    let start = Mono::now();
 
     let template = template_type.get_template()?;
     validate_positive_cell("Water template cell", &template.cell)?;
@@ -658,20 +663,17 @@ pub(crate) fn water_mols_from_template_in_region_avoiding(
             }
         }
 
-        let mut mol = WaterMolOpc::new(
-            Vec3::new_zero(),
-            Vec3::new_zero(),
-            Quaternion::new_identity(),
-        );
+        // Derive the orientation from the template's raw site positions, then
+        // re-place ALL sites at the canonical OPC internal geometry. The 60 Å
+        // template's H sites sit at TIP3P bond length; copying those positions
+        // (as an earlier version did) leaves OPC charges on an over-extended
+        // donor arm — over-cohesive water, ~+100k kcal/mol box virial, and a
+        // barostat that can never reach ambient pressure.
+        let v_h0 = candidate.h0_posit - candidate.o_posit;
+        let v_h1 = candidate.h1_posit - candidate.o_posit;
+        let mut mol =
+            WaterMolOpc::from_axes(candidate.o_posit, candidate.o_velocity, v_h0 + v_h1, v_h0);
 
-        // todo: I'm not sure how we're handling the M/EP point. I guess it's placed
-        // todo: automatically during integration.
-
-        mol.o.posit = candidate.o_posit;
-        mol.h0.posit = candidate.h0_posit;
-        mol.h1.posit = candidate.h1_posit;
-
-        mol.o.vel = candidate.o_velocity;
         mol.h0.vel = candidate.h0_velocity;
         mol.h1.vel = candidate.h1_velocity;
         mol.update_virtual_site();
@@ -774,7 +776,7 @@ impl MdState {
     /// the main sim starts.
     pub fn md_on_solute_only(&mut self, dev: &ComputationDevice) {
         println!("Initializing solvent structure prior to production MD...");
-        let start = Instant::now();
+        let start = Mono::now();
 
         // This disables things like snapshot saving, and certain prints.
         self.solvent_only_sim_at_init = true;

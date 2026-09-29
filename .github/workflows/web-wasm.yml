@@ -1,0 +1,78 @@
+# Browser (wasm32) build gate for spice_engine — the v1.3.9 web port.
+#
+# This is SEPARATE from build-wheels.yml (which builds CPython wheels via
+# maturin). Here we only care that the `web` feature compiles clean for
+# wasm32-unknown-unknown and that the raw extern-"C" artifact actually RUNS.
+# CI has network, so the SPICE-Protein git forks (ewald/dynamics/bio_files)
+# resolve without the offline-box gymnastics the local `--offline` build needs.
+#
+# The `getrandom_backend="unsupported"` cfg is mandatory: rand's sys_rng path
+# compile-errors on wasm32-unknown-unknown, and we deliberately do NOT use the
+# wasm_js backend (it pulls wasm-bindgen/js-sys, which a raw ABI cannot load
+# offline). entropy is seeded from the JS clock instead — see src/engine/utility.
+name: web-wasm
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUSTFLAGS: --cfg getrandom_backend="unsupported"
+
+jobs:
+  wasm:
+    name: wasm32 + node smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Type-check the browser build (scalar)
+        run: cargo check --no-default-features --features web --target wasm32-unknown-unknown
+
+      - name: Structural gate — no wasm-bindgen/ring/rustls/js-sys in the graph
+        run: |
+          cargo tree --no-default-features --features web --target wasm32-unknown-unknown -e normal \
+            > /tmp/webtree.txt
+          if grep -Eiq 'wasm-bindgen|js-sys|web-sys|ring|rustls|web-time|ureq|indicatif' /tmp/webtree.txt; then
+            echo "::error::forbidden crate in the web build graph:"
+            grep -Ei 'wasm-bindgen|js-sys|web-sys|ring|rustls|web-time|ureq|indicatif' /tmp/webtree.txt
+            exit 1
+          fi
+          echo "graph clean"
+
+      - name: Build scalar release wasm
+        run: cargo build --release --no-default-features --features web --target wasm32-unknown-unknown
+
+      - name: Build simd128 release wasm
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="unsupported" -C target-feature=+simd128
+        run: |
+          cargo build --release --no-default-features --features web --target wasm32-unknown-unknown
+          cp target/wasm32-unknown-unknown/release/spice_engine.wasm \
+             target/wasm32-unknown-unknown/release/spice_engine_simd.wasm
+
+      - name: Node end-to-end smoke (build mini + step + read back)
+        run: node --max-old-space-size=4096 web/smoke.mjs target/wasm32-unknown-unknown/release/spice_engine.wasm
+
+      - name: Node end-to-end smoke (simd128)
+        run: node --max-old-space-size=4096 web/smoke.mjs target/wasm32-unknown-unknown/release/spice_engine_simd.wasm
+
+      - name: Upload wasm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spice_engine-wasm
+          path: |
+            target/wasm32-unknown-unknown/release/spice_engine.wasm
+            target/wasm32-unknown-unknown/release/spice_engine_simd.wasm
+          if-no-files-found: error

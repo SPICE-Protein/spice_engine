@@ -29,11 +29,10 @@ use bio_files::{
     gromacs::mdp::{ConstraintAlgorithm, Constraints},
     md_params::ForceFieldParams,
 };
-use na_seq::Element;
 
 use crate::engine::md_core::{
-    AtomDynamics, CHARGE_UNIT_SCALER, ComputationDevice, ForceFieldParamsIndexed, LjTables,
-    MdState, NeighborsNb, insert_ion, remove_waters,
+    AtomDynamics, CHARGE_UNIT_SCALER, ComputationDevice, DistanceRestraint,
+    ForceFieldParamsIndexed, LjTables, MdState, NeighborsNb, SimBox, add_ions,
 };
 
 /// Add items from one parameter set to the other. If there are duplicates, the second set's overrides
@@ -164,23 +163,36 @@ impl MdState {
 
         combined_atoms.append(&mut parent_ions);
 
-        // 2. Clone water molecules, but prune any water molecule that clashes with the new mutant solute!
-        let mut water = Vec::new();
-        let cutoff_clash_sq = 2.2 * 2.2; // 2.2 Å cutoff for steric clashes
-        let mut pruned_count = 0;
+        // 2. Clone water molecules, pruning any that clash with the new mutant
+        //    solute. Naively this scans EVERY water against EVERY solute atom —
+        //    O(N_water · N_solute); on a large full-length box (HSFA2 68k waters
+        //    × 2.3k solute atoms ≈ 1.6e8 min-image checks) that dominated the
+        //    per-episode reuse cost. A clash needs two atoms within `cutoff`, so
+        //    we bin the solute atoms into a uniform periodic grid with cell edge
+        //    ≥ cutoff (cell = extent/floor(extent/cutoff) ≥ cutoff) and, per
+        //    water, test only the 27 neighbouring cells. This is EXACTLY
+        //    equivalent to the full scan (any solute atom within `cutoff` of a
+        //    water is provably in the same or an adjacent cell), just ~O(N_water)
+        //    instead of O(N_water · N_solute).
+        //
+        //    We must test the whole new solute, NOT just the mutated residue:
+        //    `prepare_peptide_mmcif` re-adds hydrogens at canonical positions, so
+        //    even *unchanged* residues can have H atoms that moved a sub-Å from
+        //    the parent and newly clash a nearby water (a WT→WT reuse still
+        //    prunes ~68 waters). The neighbour set is therefore per-water spatial.
+        let cutoff_clash = 2.2f32; // Å steric-clash cutoff
+        let cutoff_clash_sq = cutoff_clash * cutoff_clash;
+        let mut water = Vec::with_capacity(self.water.len());
+        let mut pruned_count = 0usize;
 
+        // Positions of the new solute (heavy + re-added H) — the clash candidates.
+        let solute_pos: Vec<lin_alg::f32::Vec3> = combined_atoms[..n_new_solute]
+            .iter()
+            .map(|a| a.posit)
+            .collect();
+        let grid = ClashGrid::build(&self.cell, &solute_pos, cutoff_clash);
         for w in &self.water {
-            let mut clash = false;
-            let o_pos = w.o.posit;
-            for a in &combined_atoms[..n_new_solute] {
-                // only check against the new solute atoms
-                let diff = self.cell.min_image(o_pos - a.posit);
-                if diff.magnitude_squared() < cutoff_clash_sq {
-                    clash = true;
-                    break;
-                }
-            }
-            if clash {
+            if grid.clashes(&self.cell, &solute_pos, w.o.posit, cutoff_clash_sq) {
                 pruned_count += 1;
             } else {
                 water.push(w.clone());
@@ -225,6 +237,63 @@ impl MdState {
         }
         new_state.mol_start_indices = new_mol_start_indices;
 
+        // 5. (v1.3.2 R2 fix) Carry the parent's TAIL-region bonded state.
+        // The old code copied tail atoms but dropped `distance_restraints`,
+        // their `bonds_topology` exclusions, and the tail adjacency rows —
+        // so a multi-site cosolute (urea, Gdm⁺, a future polyatomic ion)
+        // was physically *disconnected* in the mutant: its harmonic bonds
+        // and 1-2 exclusions silently evaporated and the molecule flew
+        // apart. Only tail↔tail restraints carry (both ends ≥ solute count
+        // in the parent): solute-touching restraints (e.g. leftover
+        // equilibration position restraints) reference *old solute* indices
+        // and are meaningless for a different mutant solute — they are
+        // dropped deliberately. Monatomic ions have no bonds at all and
+        // were never affected by this bug.
+        let mut carried = 0usize;
+        let mut dropped_solute_touching = 0usize;
+        for r in &self.distance_restraints {
+            if r.atom_0_idx >= parent_solute_count && r.atom_1_idx >= parent_solute_count {
+                let ia = (r.atom_0_idx as isize + diff) as usize;
+                let ib = (r.atom_1_idx as isize + diff) as usize;
+                new_state.distance_restraints.push(DistanceRestraint {
+                    atom_0_idx: ia,
+                    atom_1_idx: ib,
+                    r0: r.r0,
+                    k: r.k,
+                });
+                // 1-2 exclusion source …
+                new_state
+                    .force_field_params
+                    .bonds_topology
+                    .insert((ia.min(ib), ia.max(ib)));
+                // … and symmetric adjacency (pad the tail rows the old
+                // code never created: adjacency currently only covers the
+                // solute, while snapshot readers `.get()` it defensively).
+                if new_state.adjacency_list.len() < new_state.atoms.len() {
+                    new_state
+                        .adjacency_list
+                        .resize(new_state.atoms.len(), Vec::new());
+                }
+                new_state.adjacency_list[ia].push(ib);
+                new_state.adjacency_list[ib].push(ia);
+                carried += 1;
+            } else if r.atom_0_idx < parent_solute_count || r.atom_1_idx < parent_solute_count {
+                dropped_solute_touching += 1;
+            }
+        }
+        if carried > 0 {
+            eprintln!(
+                "[solvent_reuse] Carried {carried} cosolute bond restraint(s) across the mutation \
+                 (indices shifted by {diff})."
+            );
+        }
+        if dropped_solute_touching > 0 {
+            eprintln!(
+                "[solvent_reuse] Dropped {dropped_solute_touching} parent restraint(s) that \
+                 touched solute atoms (old solute indices are invalid for the mutant)."
+            );
+        }
+
         // --- Wish 7: Re-neutralize based on mutant net charge ---
         let q_scaled_sum: f32 = new_state.atoms.iter().map(|a| a.partial_charge).sum();
         let net_q_e = q_scaled_sum / CHARGE_UNIT_SCALER;
@@ -233,57 +302,10 @@ impl MdState {
         if diff_q != 0 {
             let n_ions = diff_q.abs() as usize;
             if n_ions > 0 && !new_state.water.is_empty() {
-                let (ff_type, elem, mass, q_scaled, sigma, eps): (
-                    &str,
-                    Element,
-                    f32,
-                    f32,
-                    f32,
-                    f32,
-                ) = if diff_q > 0 {
-                    (
-                        "Cl-",
-                        Element::Chlorine,
-                        35.45,
-                        -CHARGE_UNIT_SCALER,
-                        4.478,
-                        0.0073,
-                    )
-                } else {
-                    (
-                        "Na+",
-                        Element::Sodium,
-                        22.99,
-                        CHARGE_UNIT_SCALER,
-                        2.439,
-                        0.1065,
-                    )
-                };
-
-                let stride = (new_state.water.len() / n_ions).max(1);
-                let w_indices: Vec<usize> = (0..n_ions)
-                    .map(|i| (i * stride).min(new_state.water.len() - 1))
-                    .collect();
-
-                for &w_idx in &w_indices {
-                    insert_ion(
-                        &mut new_state,
-                        w_idx,
-                        ff_type,
-                        elem,
-                        mass,
-                        q_scaled,
-                        sigma,
-                        eps,
-                    );
-                }
-
-                remove_waters(&mut new_state, w_indices);
-
-                eprintln!(
-                    "[solvent_reuse] Re-neutralized mutant net charge ({:+.3}e) by adding {} {} ion(s).",
-                    net_q_e, n_ions, ff_type
-                );
+                // Same genion-style seeded/exclusion placement as the build;
+                // the old local copy of the ion tuple + fixed-stride walk is
+                // gone (single source: `add_ions`/`ION_*`).
+                add_ions(&mut new_state, net_q_e, n_ions);
             }
         }
 
@@ -296,8 +318,6 @@ impl MdState {
             new_state.potential_energy_between_mols.clear();
         }
         new_state.thermo_dof = new_state.dof_for_thermo();
-        new_state.water_pme_sites_forces =
-            vec![[lin_alg::f64::Vec3::new_zero(); 3]; new_state.water.len()];
         new_state.lj_tables = LjTables::new(&new_state.atoms);
         new_state.neighbors_nb =
             NeighborsNb::new(new_state.cfg.neighbor_skin, new_state.cfg.coulomb_cutoff);
@@ -307,5 +327,300 @@ impl MdState {
         new_state.regen_pme(dev);
 
         new_state
+    }
+}
+
+/// Periodic steric-clash oracle for the solvent-reuse water prune.
+///
+/// Solutes are binned into a uniform grid whose cell edge is ≥ `cutoff`
+/// (`extent / floor(extent/cutoff) ≥ cutoff`). Two atoms within `cutoff` are
+/// then always in the same or an adjacent cell, so testing the 27 neighbouring
+/// cells (periodic wrap, box minimum image) is EXACTLY equivalent to scanning
+/// every solute atom — but O(local density) per probe instead of O(n_solute).
+/// Degenerate (sub-cutoff) boxes fall back to the brute scan, which is the
+/// correctness oracle the tests compare against.
+struct ClashGrid {
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    lo: lin_alg::f32::Vec3,
+    ext: lin_alg::f32::Vec3,
+    bins: std::collections::HashMap<u64, Vec<usize>>,
+    enabled: bool,
+}
+
+fn grid_key(nx: usize, ny: usize, ix: usize, iy: usize, iz: usize) -> u64 {
+    (ix as u64) + (iy as u64) * (nx as u64) + (iz as u64) * (nx as u64) * (ny as u64)
+}
+
+fn grid_cell_of(
+    lo: lin_alg::f32::Vec3,
+    ext: lin_alg::f32::Vec3,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    p: lin_alg::f32::Vec3,
+) -> (usize, usize, usize) {
+    (
+        (((p.x - lo.x).rem_euclid(ext.x)) * nx as f32 / ext.x) as usize % nx,
+        (((p.y - lo.y).rem_euclid(ext.y)) * ny as f32 / ext.y) as usize % ny,
+        (((p.z - lo.z).rem_euclid(ext.z)) * nz as f32 / ext.z) as usize % nz,
+    )
+}
+
+impl ClashGrid {
+    fn build(cell: &SimBox, solute: &[lin_alg::f32::Vec3], cutoff: f32) -> Self {
+        let ext = cell.extent;
+        let lo = cell.bounds_low;
+        let enabled = !solute.is_empty() && ext.x > cutoff && ext.y > cutoff && ext.z > cutoff;
+        if !enabled {
+            return Self {
+                nx: 1,
+                ny: 1,
+                nz: 1,
+                lo,
+                ext,
+                bins: std::collections::HashMap::new(),
+                enabled: false,
+            };
+        }
+        let nx = ((ext.x / cutoff).floor() as usize).max(1);
+        let ny = ((ext.y / cutoff).floor() as usize).max(1);
+        let nz = ((ext.z / cutoff).floor() as usize).max(1);
+        let mut bins: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::with_capacity(solute.len() * 2 + 1);
+        for (i, &p) in solute.iter().enumerate() {
+            let (ix, iy, iz) = grid_cell_of(lo, ext, nx, ny, nz, p);
+            bins.entry(grid_key(nx, ny, ix, iy, iz))
+                .or_default()
+                .push(i);
+        }
+        Self {
+            nx,
+            ny,
+            nz,
+            lo,
+            ext,
+            bins,
+            enabled: true,
+        }
+    }
+
+    /// Does `probe` lie within `cutoff_sq` of any `solute` atom (grid fast path,
+    /// brute when disabled)? `solute` is indexed by the same order used in `build`.
+    fn clashes(
+        &self,
+        cell: &SimBox,
+        solute: &[lin_alg::f32::Vec3],
+        probe: lin_alg::f32::Vec3,
+        cutoff_sq: f32,
+    ) -> bool {
+        if !self.enabled {
+            return ClashGrid::brute(cell, solute, probe, cutoff_sq);
+        }
+        let (cx, cy, cz) = grid_cell_of(self.lo, self.ext, self.nx, self.ny, self.nz, probe);
+        for dx in -1i64..=1 {
+            let ix = (cx as i64 + dx).rem_euclid(self.nx as i64) as usize;
+            for dy in -1i64..=1 {
+                let iy = (cy as i64 + dy).rem_euclid(self.ny as i64) as usize;
+                for dz in -1i64..=1 {
+                    let iz = (cz as i64 + dz).rem_euclid(self.nz as i64) as usize;
+                    if let Some(bucket) = self.bins.get(&grid_key(self.nx, self.ny, ix, iy, iz)) {
+                        for &ai in bucket {
+                            let diff = cell.min_image(probe - solute[ai]);
+                            if diff.magnitude_squared() < cutoff_sq {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Reference implementation: scan every solute atom. Also the fallback for
+    /// degenerate boxes. Used as the equivalence oracle in tests.
+    fn brute(
+        cell: &SimBox,
+        solute: &[lin_alg::f32::Vec3],
+        probe: lin_alg::f32::Vec3,
+        cutoff_sq: f32,
+    ) -> bool {
+        for &sp in solute {
+            let diff = cell.min_image(probe - sp);
+            if diff.magnitude_squared() < cutoff_sq {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod clash_grid_tests {
+    use super::*;
+    use lin_alg::f32::Vec3;
+
+    /// Tiny deterministic LCG so tests don't depend on `rand` (and `now()`).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32) / ((1u64 << 24) as f32) // [0,1)
+        }
+    }
+
+    fn random_points(rng: &mut Lcg, n: usize, ext: Vec3, lo: Vec3) -> Vec<Vec3> {
+        (0..n)
+            .map(|_| {
+                Vec3::new(
+                    lo.x + rng.next_f32() * ext.x,
+                    lo.y + rng.next_f32() * ext.y,
+                    lo.z + rng.next_f32() * ext.z,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_matches_brute_across_periodic_wrap() {
+        // Deliberately shift bounds_low off origin so rem_euclid + min_image
+        // wrapping is exercised, and pick an extent that is not an integer
+        // multiple of the cutoff (cell edge ends up > cutoff).
+        let lo = Vec3::new(-7.3, 4.1, 0.0);
+        let ext = Vec3::new(31.0, 26.0, 23.0);
+        let hi = Vec3::new(lo.x + ext.x, lo.y + ext.y, lo.z + ext.z);
+        let cell = SimBox::new(lo, hi);
+        let cutoff = 2.2f32;
+        let cutoff_sq = cutoff * cutoff;
+
+        let mut rng = Lcg(0xC0FFEE);
+        let solute = random_points(&mut rng, 600, ext, lo);
+        let probes = random_points(&mut rng, 5000, ext, lo);
+
+        let grid = ClashGrid::build(&cell, &solute, cutoff);
+        assert!(grid.enabled, "box is wide enough → grid should be enabled");
+        let mut hit = 0;
+        for &p in &probes {
+            let fast = grid.clashes(&cell, &solute, p, cutoff_sq);
+            let slow = ClashGrid::brute(&cell, &solute, p, cutoff_sq);
+            assert_eq!(fast, slow, "grid/brute disagreement at probe {p:?}");
+            hit += fast as usize;
+        }
+        // Sanity: the density should produce both hits and non-hits so the test
+        // is actually meaningful (not all-false).
+        assert!(hit > 0 && hit < probes.len(), "test degenerate: hits={hit}");
+    }
+
+    #[test]
+    fn grid_matches_brute_with_dense_clusters() {
+        // Many solutes packed into a few cells (high occupancy) + probes right
+        // on cell boundaries — stresses the ±1 neighbour coverage.
+        let cell = SimBox::new(Vec3::new_zero(), Vec3::new(20.0, 20.0, 20.0));
+        let cutoff = 2.2f32;
+        let cutoff_sq = cutoff * cutoff;
+        let mut rng = Lcg(1234);
+        // Cluster ~200 solutes within 2 Å of the origin region (cell (0,0,0)±).
+        let mut solute = Vec::new();
+        for _ in 0..200 {
+            solute.push(Vec3::new(
+                rng.next_f32() * 4.0,
+                rng.next_f32() * 4.0,
+                rng.next_f32() * 4.0,
+            ));
+        }
+        // Probes scattered + exactly on a cell boundary.
+        let grid = ClashGrid::build(&cell, &solute, cutoff);
+        let mut probes = random_points(&mut rng, 3000, cell.extent, cell.bounds_low);
+        probes.push(Vec3::new(cutoff, cutoff, cutoff)); // on/near a cell edge
+        for &p in &probes {
+            assert_eq!(
+                grid.clashes(&cell, &solute, p, cutoff_sq),
+                ClashGrid::brute(&cell, &solute, p, cutoff_sq),
+                "cluster mismatch at {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_box_uses_brute_and_is_correct() {
+        // Box smaller than the cutoff on one axis → grid disabled → brute path,
+        // which must still agree with the reference scan exactly.
+        let cell = SimBox::new(Vec3::new_zero(), Vec3::new(3.0, 3.0, 1.0));
+        let cutoff = 2.2f32;
+        let cutoff_sq = cutoff * cutoff;
+        let solute = vec![Vec3::new(0.5, 0.5, 0.5), Vec3::new(2.5, 2.5, 0.9)];
+        let grid = ClashGrid::build(&cell, &solute, cutoff);
+        assert!(!grid.enabled, "thin box must disable the grid");
+        // A probe on a solute atom clashes; grid (brute fallback) says so too.
+        assert!(grid.clashes(&cell, &solute, Vec3::new(0.5, 0.5, 0.5), cutoff_sq));
+        // And for a spread of probes the brute fallback equals the oracle.
+        let mut rng = Lcg(7);
+        for _ in 0..500 {
+            let p = Vec3::new(
+                rng.next_f32() * 3.0,
+                rng.next_f32() * 3.0,
+                rng.next_f32() * 1.0,
+            );
+            assert_eq!(
+                grid.clashes(&cell, &solute, p, cutoff_sq),
+                ClashGrid::brute(&cell, &solute, p, cutoff_sq),
+                "brute-fallback mismatch at {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_solute_never_clashes() {
+        let cell = SimBox::new(Vec3::new_zero(), Vec3::new(20.0, 20.0, 20.0));
+        let grid = ClashGrid::build(&cell, &[], 2.2);
+        assert!(!grid.enabled);
+        assert!(!grid.clashes(&cell, &[], Vec3::new(1.0, 1.0, 1.0), 4.84));
+    }
+
+    /// Scale guard (not in the default run): reproduces the HSFA2 full-length
+    /// reuse geometry (≈5k solute atoms × 68k waters in a 134×109×148 Å box) and
+    /// times the grid-accelerated prune against the old O(N_water·N_solute)
+    /// brute scan, asserting they agree. Shows the prune term the reuse path
+    /// used to pay at full length. Run:
+    /// `cargo test --release --lib clash_grid_tests::prune_grid_vs_brute_hsfa2_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore = "scale benchmark; prints grid-vs-brute prune timing"]
+    fn prune_grid_vs_brute_hsfa2_scale() {
+        use crate::engine::md_core::clock::Mono;
+        let cell = SimBox::new(Vec3::new_zero(), Vec3::new(134.0, 109.0, 148.0));
+        let cutoff = 2.2f32;
+        let cutoff_sq = cutoff * cutoff;
+        let mut rng = Lcg(0x0FA5_2EED); // deterministic ("HSFA2-ish" seed)
+        let solute = random_points(&mut rng, 5_000, cell.extent, cell.bounds_low);
+        let waters = random_points(&mut rng, 68_000, cell.extent, cell.bounds_low);
+
+        // Grid path.
+        let t0 = Mono::now();
+        let grid = ClashGrid::build(&cell, &solute, cutoff);
+        let mut pruned_grid = 0usize;
+        for &w in &waters {
+            pruned_grid += grid.clashes(&cell, &solute, w, cutoff_sq) as usize;
+        }
+        let grid_s = t0.elapsed().as_secs_f64();
+
+        // Brute path (the previous implementation).
+        let t1 = Mono::now();
+        let mut pruned_brute = 0usize;
+        for &w in &waters {
+            pruned_brute += ClashGrid::brute(&cell, &solute, w, cutoff_sq) as usize;
+        }
+        let brute_s = t1.elapsed().as_secs_f64();
+
+        println!(
+            "[prune@HSFA2-scale] grid {grid_s:.3} s vs brute {brute_s:.3} s (×{:.0}) | pruned grid={pruned_grid} brute={pruned_brute}",
+            if grid_s > 0.0 { brute_s / grid_s } else { 0.0 }
+        );
+        assert_eq!(pruned_grid, pruned_brute, "grid/brute must agree exactly");
+        assert!(brute_s > grid_s, "grid should be at least as fast as brute");
     }
 }

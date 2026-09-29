@@ -12,7 +12,7 @@ use bio_files::{
 };
 
 use crate::engine::md_core::{
-    MdOverrides, SimBoxInit, barostat,
+    CosolventSpec, DivalentSalt, MdOverrides, SaltSpec, SimBoxInit, barostat,
     integrate::Integrator,
     prep::HydrogenConstraint,
     snapshot::SnapshotHandlers,
@@ -52,6 +52,16 @@ pub struct MdConfig {
     pub com_removal_interval: usize,
     /// Kelvin. Defaults to 310 K.
     pub temp_target: f32,
+    /// Optional SEPARATE bath for the solute (std atoms incl. ions), Kelvin.
+    /// None = single-bath legacy behavior (bit-identical: this field is
+    /// `skip`ped by bincode, so snapshots never see it). v1.3.8 dual-bath:
+    /// water owns ~96% of system heat capacity, so a single target relaxes
+    /// the solute slower than an anneal stage (v8b: 150 ns could not pull
+    /// solT from 434 down to 360). Heating water (activity, low viscosity)
+    /// while cooling the solute directly into the folding window needs the
+    /// solute's own setpoint. Consumed by the LangevinMiddle solute noise.
+    #[cfg_attr(feature = "encode", bincode(skip))]
+    pub temp_target_solute: Option<f32>,
     /// None to disable it.
     pub barostat_cfg: Option<barostat::BarostatCfg>,
     /// Allows constraining Hydrogens to be rigid with their bonded atom, using SHAKE and RATTLE
@@ -106,6 +116,32 @@ pub struct MdConfig {
     /// Target salt (NaCl) concentration in mol/L added at init, to control ionic
     /// strength. `None` (default) adds no salt beyond charge neutralization.
     pub salt_concentration_m: Option<f32>,
+    /// Extra divalent salts as (species, formula-unit molarity); each unit
+    /// is MgCl2-style (one dication + two Cl⁻) and displaces three waters.
+    pub divalent_salts: Vec<(DivalentSalt, f32)>,
+    /// General electrolyte channel (v1.3.2): any charge-balanced
+    /// cation/anion pair — including future multi-site species — with the
+    /// formula-unit stoichiometry derived from the species charges
+    /// (`species::balance_stoichiometry`). Counted per formula unit at
+    /// c·V·N_A exactly like the named salt knobs. Kept separate from
+    /// `divalent_salts`, which is the historical named vocabulary.
+    pub salts: Vec<SaltSpec>,
+    /// Uniform external electric field, kcal·mol⁻¹·e⁻¹·Å⁻¹ per component
+    /// (1 V/nm ≈ 0.231 in these units). Applied to *every* charge — solute
+    /// atoms, ions, and all rigid-water sites (O is chargeless; M/H carry
+    /// the OPC dipoles) — after force evaluation, before integration, like
+    /// LAMMPS `fix efield` / GROMACS `electric-field`. `efield_omega` makes
+    /// it oscillate as E₀·cos(ωt) (ω in rad/ps; 0 = static).
+    pub efield: [f32; 3],
+    pub efield_omega: f32,
+    /// User-parameterized cosolvents (denaturants, osmolytes, cryoprotects)
+    /// inserted by water displacement at build time, molarity → count via
+    /// c·V·N_A exactly like salt. The ENGINE ships the mechanism (slots,
+    /// charges, LJ, exclusions, restraints); the PARAMETER DATA is the
+    /// force-field owner's call — urea/GdmCl/TMAO charge sets and geometries
+    /// are deliberately not embedded here (no un-QC'd chemistry). See
+    /// `MdState::add_cosolvent`.
+    pub cosolvents: Vec<CosolventSpec>,
     pub overrides: MdOverrides,
 }
 
@@ -117,6 +153,7 @@ impl Default for MdConfig {
             com_motion_removal: ComMotionRemoval::Linear,
             com_removal_interval: 100,
             temp_target: TEMP_DEFAULT, // GROMACS uses this.
+            temp_target_solute: None,
             barostat_cfg: Some(Default::default()),
             hydrogen_constraint: Default::default(),
             snapshot_handlers: Default::default(),
@@ -138,6 +175,11 @@ impl Default for MdConfig {
             lj_cutoff: 10.,
             recenter_sim_box: true,
             salt_concentration_m: None,
+            divalent_salts: Vec::new(),
+            salts: Vec::new(),
+            efield: [0.0; 3],
+            efield_omega: 0.0,
+            cosolvents: Vec::new(),
             overrides: Default::default(),
         }
     }
@@ -336,6 +378,7 @@ impl From<MdpParams> for MdConfig {
             com_motion_removal: def.com_motion_removal,
             com_removal_interval: def.com_removal_interval,
             temp_target: p.ref_t.first().copied().unwrap_or(300.0),
+            temp_target_solute: None,
             barostat_cfg,
             hydrogen_constraint,
             snapshot_handlers,
@@ -354,6 +397,11 @@ impl From<MdpParams> for MdConfig {
             lj_cutoff: p.rvdw * NM_TO_ANGSTROM,
             recenter_sim_box: def.recenter_sim_box,
             salt_concentration_m: None,
+            divalent_salts: Vec::new(),
+            salts: Vec::new(),
+            efield: [0.0; 3],
+            efield_omega: 0.0,
+            cosolvents: Vec::new(),
         }
     }
 }

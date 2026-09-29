@@ -21,8 +21,9 @@ pub mod traits;
 pub mod types;
 
 pub use self::neighbors::{
-    AtomBlock, BlockForceAccumulator, CsrNeighborList, DirectedPair, PairBlock, atom_block_index,
-    make_atom_blocks, partition_directed_pairs,
+    AtomBlock, BlockForceAccumulator, ClusterPair, ClusterPairStream, ClusterRange,
+    CsrNeighborList, DirectedPair, PairBlock, atom_block_index, make_atom_blocks,
+    partition_directed_pairs,
 };
 pub use parameters::{
     Amber19, Amber19Prepared, AmberAngle, AmberBond, AmberDihedral, AmberMass, AmberNonbonded,

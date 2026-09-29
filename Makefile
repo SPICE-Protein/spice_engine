@@ -6,7 +6,20 @@ PY ?= /opt/homebrew/Caskroom/miniconda/base/envs/spice/bin/python
 # Resolve the conda env root (…/envs/spice) from the interpreter path.
 VENV := $(abspath $(dir $(PY))/..)
 
-.PHONY: build check test install wheel clean
+# --- macOS 26+ (Tahoe) build workaround -------------------------------------------
+# The release profile strips symbols (`strip = "symbols"`), but macOS 26+ dyld then
+# rejects the large LTO'd extension at import with:
+#   "mis-aligned LINKEDIT string pool"  (the strip step leaves __LINKEDIT's string
+#   table misaligned for the new dyld). Keeping symbols makes the module importable.
+# Scoped to Darwin only, so Linux/Windows CI wheels still ship stripped.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  DEV_RUSTFLAGS := -C strip=none
+else
+  DEV_RUSTFLAGS :=
+endif
+
+.PHONY: build check test install wheel clean web-check wasm wasm-simd web-smoke web-verify web-serve
 
 ## Compile the native lib only (fast feedback, no Python bindings).
 build:
@@ -22,13 +35,52 @@ test:
 
 ## Build + install the Python extension into the active env (dev loop).
 install:
-	CONDA_PREFIX=$(VENV) VIRTUAL_ENV=$(VENV) $(PY) -m maturin develop --release
+	CONDA_PREFIX=$(VENV) VIRTUAL_ENV=$(VENV) RUSTFLAGS="$(DEV_RUSTFLAGS) $(RUSTFLAGS)" $(PY) -m maturin develop --release
 
 ## Build a distributable wheel into target/wheels.
 wheel:
-	$(PY) -m maturin build --release
+	RUSTFLAGS="$(DEV_RUSTFLAGS) $(RUSTFLAGS)" $(PY) -m maturin build --release
 
 ## Clean all build artifacts.
 clean:
 	cargo clean
 	rm -rf target/wheels
+
+# --- Browser (wasm32) targets (v1.3.9 web port) ---------------------------------
+# RUSTFLAGS is scoped PER RECIPE so the `getrandom_backend` cfg can never leak
+# into a native build and the wheel / .cargo/config stay untouched.
+WASM_TARGET := wasm32-unknown-unknown
+WEB_FEATURES := --no-default-features --features web
+# `unsupported` makes getrandom compile (runtime Err, never called — entropy.rs
+# seeds via clock+counter); wasm_js is FORBIDDEN (pulls wasm-bindgen/js-sys, and
+# there is no wasm-bindgen CLI offline to post-process its glue).
+WEB_RUSTFLAGS := --cfg getrandom_backend=\"unsupported\"
+WEB_SIMD_RUSTFLAGS := $(WEB_RUSTFLAGS) -C target-feature=+simd128
+
+## Type-check the browser build (web feature, wasm target, scalar).
+web-check:
+	RUSTFLAGS="$(WEB_RUSTFLAGS)" cargo check --offline $(WEB_FEATURES) --target $(WASM_TARGET)
+
+## Release-build the baseline wasm (scalar fallback — runs everywhere).
+wasm:
+	RUSTFLAGS="$(WEB_RUSTFLAGS)" cargo build --offline --release $(WEB_FEATURES) --target $(WASM_TARGET)
+	@ls -lh target/$(WASM_TARGET)/release/spice_engine.wasm
+
+## Release-build the simd128 wasm (Chrome 101+/Firefox 100+/Safari 16+).
+wasm-simd:
+	RUSTFLAGS="$(WEB_SIMD_RUSTFLAGS)" cargo build --offline --release $(WEB_FEATURES) --target $(WASM_TARGET)
+	@cp target/$(WASM_TARGET)/release/spice_engine.wasm target/$(WASM_TARGET)/release/spice_engine_simd.wasm
+	@ls -lh target/$(WASM_TARGET)/release/spice_engine_simd.wasm
+
+## Node end-to-end smoke of the baseline wasm (build 2LYZ + step + read back).
+web-smoke: wasm
+	node --max-old-space-size=4096 web/smoke.mjs target/$(WASM_TARGET)/release/spice_engine.wasm
+
+## Build both variants and smoke each (correctness gate; simd is non-bit-exact).
+web-verify: wasm wasm-simd
+	node --max-old-space-size=4096 web/smoke.mjs target/$(WASM_TARGET)/release/spice_engine.wasm
+	node --max-old-space-size=4096 web/smoke.mjs target/$(WASM_TARGET)/release/spice_engine_simd.wasm
+
+## Serve the demo dir locally (for manual browser testing of the loader).
+web-serve:
+	python3 -m http.server 8080 --directory web

@@ -354,7 +354,14 @@ impl MdState {
         self.alchemical.dh_dl = 0.0;
         self.spme_force_prev = None;
 
-        // todo: Why is this here?
+        // Changing the alchemical molecule flips `alch_interaction` on
+        // existing pairs (geometry is unchanged), and the pair streams are
+        // derived inside build_all_neighbors → setup_pairs. A narrower
+        // "re-classify only" refresh is possible but deliberately NOT built:
+        // measured on the reuse path, this rebuild is not the bottleneck
+        // (head+neighbors+PME ≈0.4–0.8 s on 2LYZ — tests/rl_5ps_budget.rs
+        // ledger), so the extra cache-invalidation complexity would buy noise,
+        // not speed. Revisit only if alchemical windows become hot.
         self.build_all_neighbors(dev);
 
         Ok(())

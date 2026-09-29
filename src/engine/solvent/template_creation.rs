@@ -15,7 +15,7 @@ use lin_alg::{
 use rand::{
     RngExt,
     distr::{Distribution, Uniform},
-    prelude::{SliceRandom, ThreadRng},
+    prelude::SliceRandom,
 };
 use rand_distr::Normal;
 
@@ -55,7 +55,7 @@ pub fn make_water_mols_grid(
 ) -> Vec<WaterMolOpc> {
     println!("Initializing a solvent grid, as part of template preparation...");
     // Initialize an RNG for orientations.
-    let mut rng = rand::rng();
+    let mut rng = crate::engine::md_core::entropy::session_rng();
     let distro = Uniform::<f32>::new(0.0, 1.0).unwrap();
 
     let n_mols = n_water_mols(cell, &[]);
@@ -135,7 +135,7 @@ fn init_velocities(
     mols: &mut [WaterMolOpc],
     t_target: f32,
     zero_com_drift: bool,
-    rng: &mut ThreadRng,
+    rng: &mut crate::engine::md_core::entropy::SessionRng,
 ) {
     let kT = KB_A2_PS2_PER_K_PER_AMU * t_target;
 
@@ -426,7 +426,7 @@ impl MdState {
             water_count,
             &self.cell,
             water_temperature_tgt,
-            &mut rand::rng(),
+            &mut crate::engine::md_core::entropy::session_rng(),
         );
 
         if placed_water.len() != water_count {
@@ -439,7 +439,6 @@ impl MdState {
         }
 
         self.water = placed_water;
-        self.water_pme_sites_forces = vec![[Vec3F64::new_zero(); 3]; self.water.len()];
         self.rebuild_spatial_caches(dev);
         true
     }
@@ -540,7 +539,7 @@ fn place_interleaved_opc_waters(
     water_count: usize,
     cell: &SimBox,
     temperature_tgt: f32,
-    rng: &mut ThreadRng,
+    rng: &mut crate::engine::md_core::entropy::SessionRng,
 ) -> Vec<WaterMolOpc> {
     const MAX_WATER_ROT_ATTEMPTS: usize = 12;
     const MIN_CENTER_OFFSET_FRAC: f64 = 0.12;
@@ -563,33 +562,35 @@ fn place_interleaved_opc_waters(
     let mut placed = Vec::with_capacity(water_count);
     let distro = Uniform::<f32>::new(0.0, 1.0).unwrap();
 
-    let try_place_candidate =
-        |o_posit: Vec3, placed: &mut Vec<WaterMolOpc>, rng: &mut ThreadRng| -> bool {
-            if !cell.contains(o_posit) {
-                return false;
+    let try_place_candidate = |o_posit: Vec3,
+                               placed: &mut Vec<WaterMolOpc>,
+                               rng: &mut crate::engine::md_core::entropy::SessionRng|
+     -> bool {
+        if !cell.contains(o_posit) {
+            return false;
+        }
+
+        for _ in 0..MAX_WATER_ROT_ATTEMPTS {
+            let candidate = WaterMolOpc::new(
+                o_posit,
+                Vec3::new_zero(),
+                Quaternion::random(rng, Some(distro)),
+            );
+
+            if water_conflicts_with_solvent(&candidate, solvent_atom_posits, cell) {
+                continue;
             }
 
-            for _ in 0..MAX_WATER_ROT_ATTEMPTS {
-                let candidate = WaterMolOpc::new(
-                    o_posit,
-                    Vec3::new_zero(),
-                    Quaternion::random(rng, Some(distro)),
-                );
-
-                if water_conflicts_with_solvent(&candidate, solvent_atom_posits, cell) {
-                    continue;
-                }
-
-                if water_conflicts_with_water(&candidate, placed, cell) {
-                    continue;
-                }
-
-                placed.push(candidate);
-                return true;
+            if water_conflicts_with_water(&candidate, placed, cell) {
+                continue;
             }
 
-            false
-        };
+            placed.push(candidate);
+            return true;
+        }
+
+        false
+    };
 
     'round_robin: for candidate_idx in 0..offsets_unit.len() {
         for (cell_idx, center) in solvent_centers.iter().enumerate() {

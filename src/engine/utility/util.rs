@@ -109,32 +109,40 @@ impl Display for ComputationTime {
     }
 }
 
-/// We use this to monitor performance, by component. We track
-/// Times are in μs. todo: Add integration time, H Shaking, Water settle, SPME rebuild etc A/R.
+/// We use this to monitor performance, by component. Times are in μs.
+/// The buckets are disjoint by construction: `apply_all_forces` records the
+/// bonded/nonbonded/ewald sums itself and the stepper restarts its region
+/// clocks around it, so no work is billed twice; `total` is the whole-step
+/// wall time and `other` is the untagged residual.
 #[derive(Debug, Default, Clone)]
 pub struct ComputationTimeSums {
     pub bonded_sum: u64,
     pub non_bonded_short_range_sum: u64,
     pub ewald_long_range_sum: u64,
     /// The ratio doesn't apply to neighbors; log each time we do this.
-    /// `neighbor_all` includes code that determines when we need to rebuild.
-    /// note: The neighbor rebuild makes up the large majority of the time taken of neighbor_all.
-    /// todo: Consider removing one or the other.
+    /// `neighbor_all` includes the per-step check that decides whether to
+    /// rebuild; `neighbor_rebuild` counts only actual rebuilds. Both are kept:
+    /// the check runs every step, the rebuild spikes, and the pair separates
+    /// steady-state cost from tail events.
     pub neighbor_all_sum: u64,
     /// Just the actual rebuild time; not each time.
     pub neighbor_rebuild_sum: u64,
     pub neighbor_rebuild_count: u16,
     pub integration_sum: u64,
-    /// Thermostat, barostat, sim box rebuilds.
-    /// todo: Split this up into these components if it's significantly large.
+    /// Pressure measurement + constraint-virial carry glue. (Thermostat and
+    /// barostat work now land in their own named buckets.)
     pub ambient_sum: u64,
+    /// Currently unfilled: the KE traversals run inside the integration and
+    /// thermostat regions, so their cost is already counted there.
     pub kinetic_sum: u64,
+    /// Currently unfilled: SETTLE runs inside `kick_and_drift`'s integration
+    /// region for the same reason.
     pub water_settle_sum: u64,
     pub thermostat_sum: u64,
     pub barostat_sum: u64,
     pub snapshot_sum: u64,
-    /// If the other values don't add up to nearly this, parts we haven't counted
-    /// make up a significant amount of the computation time; we may need to include them.
+    /// Whole-step wall time averaged over every step. If the other values do
+    /// not add up to nearly this, untagged work is significant; inspect `other`.
     pub total: u64,
 }
 
@@ -163,7 +171,9 @@ impl ComputationTimeSums {
         let thermostat = apply(self.thermostat_sum);
         let barostat = apply(self.barostat_sum);
         let snapshots = apply(self.snapshot_sum);
-        let total = apply(self.total);
+        // `total` is accumulated every step (unlike the ratio-sampled
+        // buckets), so it averages by plain division.
+        let total = (self.total / num_steps as u64) as u32;
 
         let other = total as i32
             - (bonded

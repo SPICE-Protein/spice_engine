@@ -38,22 +38,35 @@ impl ForceField for Martini3 {
     }
 
     fn prepare(&self) -> Result<Self::Prepared, ForceFieldError> {
-        Ok(Martini3Prepared {
-            particles: include_str!("data/martini/martini3/martini_v3.0.0.itp"),
-            ions: include_str!("data/martini/martini3/martini_v3.0.0_ions_v1.itp"),
-            proteins: include_str!(
-                "data/martini/martini3/martini_v3.0.0_proteins/force_fields/martini3001/aminoacids.ff"
-            ),
-            nucleobases: include_str!("data/martini/martini3/martini_v3.0.0_nucleobases_v1.itp"),
-            phospholipids: include_str!(
-                "data/martini/martini3/martini_v3.0.0_phospholipids_v1.itp"
-            ),
-            small_molecules: include_str!(
-                "data/martini/martini3/martini_v3.0.0_small_molecules_v1.itp"
-            ),
-            solvents: include_str!("data/martini/martini3/martini_v3.0.0_solvents_v1.itp"),
-            sugars: include_str!("data/martini/martini3/martini_v3.0.0_sugars_v1.itp"),
-        })
+        // v1.3.9 web: the ~16 MB Martini `.itp`/`.ff` blobs (incl. the 15 MB
+        // martini_v3.0.0.itp) are embedded only under `heavy-forcefields`
+        // (default ON). The browser build turns it off; requesting Martini there
+        // is a clean, honest error.
+        #[cfg(feature = "heavy-forcefields")]
+        {
+            Ok(Martini3Prepared {
+                particles: include_str!("data/martini/martini3/martini_v3.0.0.itp"),
+                ions: include_str!("data/martini/martini3/martini_v3.0.0_ions_v1.itp"),
+                proteins: include_str!(
+                    "data/martini/martini3/martini_v3.0.0_proteins/force_fields/martini3001/aminoacids.ff"
+                ),
+                nucleobases: include_str!(
+                    "data/martini/martini3/martini_v3.0.0_nucleobases_v1.itp"
+                ),
+                phospholipids: include_str!(
+                    "data/martini/martini3/martini_v3.0.0_phospholipids_v1.itp"
+                ),
+                small_molecules: include_str!(
+                    "data/martini/martini3/martini_v3.0.0_small_molecules_v1.itp"
+                ),
+                solvents: include_str!("data/martini/martini3/martini_v3.0.0_solvents_v1.itp"),
+                sugars: include_str!("data/martini/martini3/martini_v3.0.0_sugars_v1.itp"),
+            })
+        }
+        #[cfg(not(feature = "heavy-forcefields"))]
+        Err(ForceFieldError(
+            "martini3 parameters are not compiled into this build (enable the `heavy-forcefields` feature)".to_string(),
+        ))
     }
 }
 

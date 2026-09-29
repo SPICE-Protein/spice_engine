@@ -15,12 +15,19 @@ pub mod metrics;
 pub mod mutate;
 pub mod pocket;
 pub mod pool;
+pub mod progress;
 pub mod rna;
 pub mod structure;
 pub mod topology;
 
 #[cfg(feature = "python")]
 pub mod ffi;
+
+/// Browser extern-C API surface (v1.3.9 web port). Only ever compiled for the
+/// `wasm32-unknown-unknown` target with the `web` feature; native and the pyo3
+/// wheel never see it. See `src/web.rs` for the calling contract.
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+pub mod web;
 
 pub use actions::{ActionMask, EnvDelta, ForceAction};
 pub use builder::{BuildOptions, build_mutant_by_solvent_reuse, build_system};
@@ -54,6 +61,19 @@ pub use topology::{ProteinTopology, ResidueInfo};
 use pyo3::prelude::*;
 
 pub fn log_print(msg: String) {
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    {
+        // The browser host has no stdout; route to the console via the same
+        // `env.log` import `src/web.rs` uses (declared here too because
+        // `log_print` is a crate-wide helper that compiles independently).
+        #[link(wasm_import_module = "env")]
+        unsafe extern "C" {
+            fn log(ptr: *const u8, len: usize);
+        }
+        // Safety: `log` is a pure JS binding over a borrowed slice we keep alive.
+        unsafe { log(msg.as_ptr(), msg.len()) };
+        return;
+    }
     #[cfg(feature = "python")]
     {
         pyo3::Python::attach(|py| {
@@ -66,10 +86,21 @@ pub fn log_print(msg: String) {
             }
         });
     }
+    #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
     println!("{}", msg);
 }
 
 pub fn log_eprint(msg: String) {
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    {
+        #[link(wasm_import_module = "env")]
+        unsafe extern "C" {
+            fn log(ptr: *const u8, len: usize);
+        }
+        // Safety: `log` is a pure JS binding over a borrowed slice we keep alive.
+        unsafe { log(msg.as_ptr(), msg.len()) };
+        return;
+    }
     #[cfg(feature = "python")]
     {
         pyo3::Python::attach(|py| {
@@ -82,5 +113,6 @@ pub fn log_eprint(msg: String) {
             }
         });
     }
+    #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
     eprintln!("{}", msg);
 }

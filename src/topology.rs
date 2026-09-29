@@ -47,6 +47,18 @@ pub struct ResidueInfo {
     pub one_letter: char,
     /// Indices into `MdState.atoms` for every atom of this residue.
     pub atom_indices: Vec<usize>,
+    /// PDB-style atom names, parallel to `atom_indices`: `type_in_res`
+    /// display ("CA", "OE1", "OXT"), falling back to `type_in_res_general`
+    /// (this is how the hydrogen-placement step labels added H: "HH11"),
+    /// then to the element debug string. What `SpiceEngine::select_atoms`
+    /// with `names=` matches, and what `SpiceEngine::atom_names` reports
+    /// for protein atoms.
+    pub atom_names: Vec<String>,
+    /// Chain identifier used to determine chain-local termini.
+    pub chain_id: String,
+    /// Whether this residue is the N/C terminus of its chain.
+    pub is_nterm: bool,
+    pub is_cterm: bool,
 }
 
 /// A lightweight view of the prepared protein that SPICE needs: the sequence,
@@ -106,6 +118,11 @@ impl ProteinTopology {
             return Err("no Cα atoms found — was the peptide prepared?".to_string());
         }
 
+        let residue_chain: HashMap<u32, &str> = protein
+            .chains
+            .iter()
+            .flat_map(|c| c.residue_sns.iter().map(move |sn| (*sn, c.id.as_str())))
+            .collect();
         let residues: Vec<ResidueInfo> = protein
             .residues
             .iter()
@@ -117,15 +134,37 @@ impl ProteinTopology {
                         name.chars().next().unwrap_or('X').to_ascii_uppercase()
                     }
                 };
-                let atom_indices = r
-                    .atom_sns
-                    .iter()
-                    .filter_map(|sn| serial_to_idx.get(sn).copied())
-                    .collect();
+                // Same name convention as params.rs `name_of` (type_in_res
+                // preferred, general name next, element debug last).
+                let mut atom_indices: Vec<usize> = Vec::new();
+                let mut atom_names: Vec<String> = Vec::new();
+                for sn in &r.atom_sns {
+                    if let Some(&i) = serial_to_idx.get(sn) {
+                        atom_indices.push(i);
+                        let a = &protein.atoms[i];
+                        atom_names.push(
+                            a.type_in_res
+                                .as_ref()
+                                .map(|t| t.to_string())
+                                .or_else(|| a.type_in_res_general.clone())
+                                .unwrap_or_else(|| format!("{:?}", a.element)),
+                        );
+                    }
+                }
+                let chain_id = residue_chain.get(&r.serial_number).copied().unwrap_or("");
+                let (is_nterm, is_cterm) = match r.end {
+                    bio_files::ResidueEnd::NTerminus => (true, false),
+                    bio_files::ResidueEnd::CTerminus => (false, true),
+                    _ => (false, false),
+                };
                 ResidueInfo {
                     seq_id: r.serial_number as i32,
                     one_letter: one,
                     atom_indices,
+                    atom_names,
+                    chain_id: chain_id.to_string(),
+                    is_nterm,
+                    is_cterm,
                 }
             })
             .collect();

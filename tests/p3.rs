@@ -2,8 +2,8 @@
 //! and time-averaged Cα pseudo-labels.
 
 use bio_files::MmCif;
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::FfParamSet;
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::FfParamSet;
 use spice_engine::{
     AtomInput, BuildOptions, EnginePool, Mutation, StructureInput, apply_mutations,
     build_from_input,
@@ -78,7 +78,20 @@ fn p3_structure_mutate_pool() {
 
     // --- pseudo-labels: time-averaged Cα ---
     engine.reset_pseudo_labels();
-    assert!(engine.time_averaged_ca().is_empty(), "no frames yet");
+    // With a zeroed averaging window the accessor documents a fallback to
+    // instantaneous Cα positions (never an empty vector when the topology
+    // has Cα atoms), so "empty" is the wrong assertion: it must equal the
+    // current coordinates exactly.
+    let fb = engine.time_averaged_ca();
+    assert_eq!(fb.len(), 129);
+    for (&idx, got) in engine.topology.ca_indices.iter().zip(&fb) {
+        let p = engine.state.atoms[idx].posit;
+        assert_eq!(
+            *got,
+            [p.x, p.y, p.z],
+            "fallback must mirror instantaneous Cα"
+        );
+    }
     for _ in 0..3 {
         let r = engine.step(None);
         assert!(!r.crashed, "crashed at step {}", r.step_count);

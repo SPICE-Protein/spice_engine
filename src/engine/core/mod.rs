@@ -39,7 +39,9 @@
 //! - Optimizations for LJ: Dist cutoff for now.
 //! - Amber 1-2, 1-3 exclusions, and 1-4 scaling of covalently-bonded atoms.
 //! - Rayon parallelization of non-bonded forces
-//! - WIP SIMD and CUDA parallelization of non-bonded forces, depending on hardware availability. todo
+//! - CPU SIMD (x86_64 AVX2/AVX-512, arm64 NEON) for std-std and water
+//!   non-bonded streams is in the production hot path; CUDA parallelization
+//!   of non-bonded forces remains WIP.
 //! - A thermostat and barostat
 //! - An energy-measuring system.
 //! - An integrated tool for inferring atom types, bonded-parameter overrides, and partial charges for arbitrary
@@ -79,14 +81,22 @@
 
 #[path = "../preparation/add_hydrogens/mod.rs"]
 mod add_hydrogens;
+#[path = "../analysis.rs"]
+pub mod analysis;
 #[path = "../geometry/barostat.rs"]
 mod barostat;
 #[path = "../forcefield/bonded.rs"]
 mod bonded;
 #[path = "../forcefield/bonded_forces.rs"]
 mod bonded_forces;
+#[path = "../utility/clock.rs"]
+pub mod clock;
 #[path = "../geometry/config.rs"]
 mod config;
+#[path = "../cosolvent_presets.rs"]
+pub mod cosolvent_presets;
+#[path = "../utility/entropy.rs"]
+pub mod entropy;
 #[path = "../forcefield/forces.rs"]
 mod forces;
 #[path = "../integrator/integrate.rs"]
@@ -95,6 +105,8 @@ pub mod integrate;
 mod neighbors;
 #[path = "../forcefield/non_bonded/mod.rs"]
 mod non_bonded;
+#[path = "../panteva.rs"]
+pub mod panteva;
 #[path = "../forcefield/params.rs"]
 pub mod params;
 #[path = "../preparation/prep.rs"]
@@ -106,6 +118,8 @@ mod simd;
 pub mod snapshot;
 #[path = "../solvent/mod.rs"]
 mod solvent;
+#[path = "../species.rs"]
+pub mod species;
 #[path = "../integrator/thermostat.rs"]
 mod thermostat;
 #[path = "../utility/util.rs"]
@@ -123,8 +137,16 @@ pub mod minimize_energy;
 pub mod alchemical;
 #[path = "../preparation/param_inference/mod.rs"]
 pub mod param_inference;
+// v1.3.9 web split. `pci_files` is the candle-free bincode half (water
+// template load + preference-file save) and compiles in every build.
+// `partial_charge_inference` is the candle GNN half; slim builds (wasm)
+// opt out via `--no-default-features` so candle/getrandom never enter the
+// graph. Callers reach the always-on helpers through `md_core::pci_files`.
+#[cfg(feature = "inference")]
 #[path = "../preparation/partial_charge_inference/mod.rs"]
 pub mod partial_charge_inference;
+#[path = "../preparation/partial_charge_inference/files.rs"]
+pub mod pci_files;
 #[path = "../utility/sa_surface.rs"]
 mod sa_surface;
 
@@ -136,7 +158,6 @@ use std::{
     fmt,
     fmt::{Display, Formatter},
     io,
-    time::Instant,
 };
 
 pub use add_hydrogens::{
@@ -165,13 +186,13 @@ pub use integrate::Integrator;
 #[allow(unused)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use lin_alg::f32::{Vec3x8, Vec3x16, f32x8, f32x16};
-use lin_alg::{
-    f32::{Quaternion, Vec3},
-    f64::Vec3 as Vec3F64,
-};
+use lin_alg::{f32::Vec3, f64::Vec3 as Vec3F64};
 use na_seq::Element;
 use neighbors::NeighborsNb;
 pub use prep::{HydrogenConstraint, merge_params};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 pub use solvent::{
     ForcesOnWaterMol, Solvent, WaterMolOpc,
     init::{
@@ -187,12 +208,13 @@ pub use solvent::{
 
 #[cfg(feature = "cuda")]
 use crate::engine::md_core::gpu_interface::{ForcesPositsGpu, GpuKernels, PerNeighborGpu};
+use crate::engine::md_core::non_bonded::{WaterSoluteBatch8, WaterWaterBatch8};
 #[cfg(target_arch = "x86_64")]
 use crate::engine::md_core::solvent::{WaterMolx8, WaterMolx16};
 use crate::engine::md_core::{
     alchemical::StateAlchemical,
     barostat::Barostat,
-    non_bonded::{CHARGE_UNIT_SCALER, LjTables, NonBondedPair, NumericSimdPair},
+    non_bonded::{CHARGE_UNIT_SCALER, CompactNonBondedPair, LjTables, NumericSimdPair},
     param_inference::update_small_mol_params,
     params::FfParamSet,
     snapshot::Snapshot,
@@ -316,7 +338,6 @@ pub struct MolDynamics {
     pub static_: bool,
     /// If present, any values here override molecule-type general parameters.
     pub mol_specific_params: Option<ForceFieldParams>,
-    /// todo experimentin
     /// If true, this atom exerts and experiences non-bonded forces only.
     /// This may be useful for protein atoms that aren't near a docking site.
     pub bonded_only: bool,
@@ -388,6 +409,7 @@ impl MolDynamics {
     ///
     /// You may wish to modify the `atom_posits` field after to position this relative to
     /// other molecules.
+    #[cfg(feature = "network")]
     pub fn from_amber_geostd(ident: &str) -> io::Result<Self> {
         let data = bio_apis::amber_geostd::load_mol_files(ident)
             .map_err(|e| io::Error::other(format!("Error loading data: {e:?}")))?;
@@ -439,6 +461,10 @@ pub struct AtomDynamics {
     pub lj_sigma: f32,
     /// kcal/mol
     pub lj_eps: f32,
+    /// 12-6-4 induction pair constant (Li-Merz OPC column, kcal/mol·Å⁴).
+    /// Nonzero only for the divalent salt ions; the water kernels fold
+    /// `U4 = −c4/r⁴` into the ion–water-oxygen pair before the force cap.
+    pub lj_c4: f32,
 }
 
 impl Display for AtomDynamics {
@@ -678,8 +704,8 @@ pub struct MdState {
     pub snapshots: Vec<Snapshot>,
     pub cell: SimBox,
     pub neighbors_nb: NeighborsNb,
-    /// Rebuilt whenever nonbonded neighbors is.
-    pub(crate) nb_pairs: Vec<NonBondedPair>,
+    /// Compact CPU nonbonded pair stream rebuilt with the neighbour list.
+    pub(crate) cpu_pairs: Vec<CompactNonBondedPair>,
     /// Number of numeric pair records eligible for the SIMD path after the last rebuild.
     pub(crate) simd_pair_count: usize,
     /// Number of pair records kept on the scalar path after the last rebuild.
@@ -695,8 +721,6 @@ pub struct MdState {
     /// These are indices of atoms separated by three consecutive bonds
     pairs_14_scaled: HashSet<(usize, usize)>,
     lj_tables: LjTables,
-    // todo: Hmm... Is this DRY with forces_on_water? Investigate.
-    pub water_pme_sites_forces: Vec<[Vec3F64; 3]>, // todo: A/R
     pme_recip: Option<PmeRecip>,
     /// kcal/mol
     pub kinetic_energy: f64,
@@ -718,6 +742,13 @@ pub struct MdState {
     /// the target temperature — a too-weak Langevin coupling keeps T_kin ≈ 298 K
     /// even when `temp_target` is 380 K.
     pub last_temperature_k: f32,
+    /// Instantaneous pressure (bar) measured on the last step's forces —
+    /// exactly the value that fed `Barostat::scale_factor` for the NEXT
+    /// step's drive term. The barostat is linear response in it: sustained
+    /// tens-of-kbar readings (clash virials, torn solvation shells) are what
+    /// inflate a box during relaxation; apps can watch it to tell a real
+    /// overpressure from a numerical phantom.
+    pub last_pressure_bar: f64,
     /// Every so many snapshots, write these to file, then clear from memory.
     /// Used to track which molecule each atom is associated with in our flattened structures.
     /// This is the potential energy between every pair of molecules.
@@ -745,7 +776,15 @@ pub struct MdState {
     /// indices and pair parameters already expanded out of enum/table lookups.
     pub(crate) simd_pairs: Vec<NumericSimdPair>,
     /// Pairs that must remain on the scalar path.
-    pub(crate) scalar_pairs: Vec<NonBondedPair>,
+    pub(crate) scalar_pairs: Vec<CompactNonBondedPair>,
+    /// Compact water-solute SIMD batches; consumed by the CPU dispatch when
+    /// `WATER_SIMD_ACTIVE` holds and the env kill-switch is unset.
+    pub(crate) water_simd_pairs: Vec<WaterSoluteBatch8>,
+    /// Compact water-water SIMD batches; same gating as `water_simd_pairs`.
+    pub(crate) water_water_simd_pairs: Vec<WaterWaterBatch8>,
+    pub(crate) water_water_candidate_count: usize,
+    pub(crate) water_water_scalar_tail_count: usize,
+
     /// A cache. We don't run SPME every step; store the previous step's per-atom
     /// force values (Flattened; non-solvent, then solvent M, H0, H1), and apply them
     /// on the steps where we don't re-calculate. (Force, potential energy, virial energy)
@@ -1127,7 +1166,10 @@ impl MdState {
 
                 water_mols_from_gro(gro)?
             }
-            Solvent::Custom(_) => Vec::new(), // todo: ?
+            // Custom solvents carry their own molecule specs (see
+            // `Solvent::Custom`); this function yields only OPC water
+            // templates, so custom solvent contributes none here.
+            Solvent::Custom(_) => Vec::new(),
         };
 
         let mut n_ions_total = n_ions;
@@ -1144,8 +1186,58 @@ impl MdState {
                 result.add_salt_ions(n_pairs);
             }
         }
+        // Divalent salts (MgCl2-style formula units) on top of the monovalent
+        // background; same c·V·N_A counting, three waters per unit.
+        for (salt, conc_m) in &cfg.divalent_salts {
+            if *conc_m > 0.0 {
+                let vol_l = f64::from(result.cell.volume()) * 1.0e-27;
+                let n_units = ((f64::from(*conc_m)) * vol_l * AVOGADRO).round() as usize;
+                n_ions_total += 3 * n_units;
+                result.add_divalent_salt(*salt, n_units);
+            }
+        }
+        // General electrolyte channel (v1.3.2): any charge-balanced
+        // cation/anion pair; stoichiometry from the species charges, count
+        // per formula unit at c·V·N_A exactly like the named knobs.
+        for salt in &cfg.salts {
+            if salt.molarity > 0.0 {
+                let vol_l = f64::from(result.cell.volume()) * 1.0e-27;
+                let n_units = ((f64::from(salt.molarity)) * vol_l * AVOGADRO).round() as usize;
+                n_ions_total += salt.stoichiometry().map_or(0, |(c, a)| (c + a) as usize) * n_units;
+                result.add_salt(salt, n_units);
+            }
+        }
+        // User-provided cosolvents (urea-style denaturants etc. — mechanism
+        // here, parameter data from the caller). Note the exclusion flags are
+        // (re)built inside add_cosolvent from bonds_topology.
+        for cospec in &cfg.cosolvents {
+            if cospec.molarity > 0.0 {
+                let vol_l = f64::from(result.cell.volume()) * 1.0e-27;
+                let n_mols = ((f64::from(cospec.molarity)) * vol_l * AVOGADRO).round() as usize;
+                result.add_cosolvent(cospec, n_mols);
+            }
+        }
         validate_mol_start_indices(result.atoms.len(), &result.mol_start_indices)
             .map_err(|e| ParamError::new(&e))?;
+
+        // Neutralizing path may have run (add_ions calls this itself only for
+        // salt changes); check once for the counterion-only build too.
+        if !cfg.overrides.skip_counterion_insertion && cfg.salt_concentration_m.is_none() {
+            warn_if_not_neutral(&result);
+        }
+
+        // Report the EFFECTIVE total ionic strength (½Σcᵢzᵢ²) of the built box —
+        // it can exceed the NaCl `salt_concentration_m` knob once divalent salts
+        // or `salts_json` electrolytes are present, so surface the real number.
+        if n_ions_total > 0 {
+            let ionic = result.effective_ionic_strength_m();
+            if ionic > 0.0 {
+                eprintln!(
+                    "System ionic strength: {ionic:.4} M (effective I; NaCl knob alone would \
+                     understate it with divalent/extra salts)."
+                );
+            }
+        }
 
         // Rebuild the LJ table to include any ions that were appended after the initial build.
         if n_ions_total > 0 {
@@ -1154,8 +1246,6 @@ impl MdState {
 
         // Calc DOF only after all atoms and solvent are initialized.
         result.thermo_dof = result.dof_for_thermo();
-
-        result.water_pme_sites_forces = vec![[Vec3F64::new_zero(); 3]; result.water.len()];
 
         result.setup_nonbonded_exclusion_scale_flags();
 
@@ -1314,11 +1404,29 @@ impl MdState {
     }
 
     pub fn nb_pair_count(&self) -> usize {
-        self.nb_pairs.len()
+        self.cpu_pairs.len()
     }
 
     pub fn simd_pair_count(&self) -> usize {
         self.simd_pair_count
+    }
+
+    /// Number of std-water pair records evaluated by the water SIMD path.
+    pub fn water_simd_pair_count(&self) -> usize {
+        self.water_simd_pairs.len() * 8
+    }
+
+    /// Number of water-water pair records evaluated by the water SIMD path.
+    pub fn water_water_simd_pair_count(&self) -> usize {
+        self.water_water_simd_pairs.len() * 8
+    }
+
+    pub fn water_water_candidate_count(&self) -> usize {
+        self.water_water_candidate_count
+    }
+
+    pub fn water_water_scalar_tail_count(&self) -> usize {
+        self.water_water_scalar_tail_count
     }
 
     pub fn scalar_pair_count(&self) -> usize {
@@ -1349,6 +1457,23 @@ impl MdState {
             v.nonbonded_short_range,
             v.nonbonded_long_range,
             v.constraints,
+        )
+    }
+
+    /// Topology-exclusion bookkeeping, for diagnostics: sizes of the 1-2/1-3
+    /// excluded set, the 1-4 scaled set, the FF bond/angle/dihedral tables the
+    /// exclusions were built from, and total std-std neighbor pairs. If
+    /// `excluded`/`scaled14` look tiny next to `bonds`/`angles`, bonded pairs
+    /// are leaking into the nonbonded sums (huge positive short-range virial).
+    pub fn exclusion_diagnostics(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let ff = &self.force_field_params;
+        (
+            self.pairs_excluded_12_13.len(),
+            self.pairs_14_scaled.len(),
+            ff.bonds_topology.len(),
+            ff.angle.len(),
+            ff.dihedral.len(),
+            self.cpu_pairs.len(),
         )
     }
 
@@ -1434,7 +1559,7 @@ impl MdState {
         dev: &ComputationDevice,
         external_force: Option<&[Vec3]>,
     ) {
-        let mut start = Instant::now();
+        let mut start = clock::Mono::now();
         let log_time = self.step_count.is_multiple_of(COMPUTATION_TIME_RATIO);
 
         if !self.cfg.overrides.bonded_disabled {
@@ -1444,7 +1569,7 @@ impl MdState {
         if log_time {
             let elapsed = start.elapsed().as_micros() as u64;
             self.computation_time.bonded_sum += elapsed;
-            start = Instant::now();
+            start = clock::Mono::now();
         }
 
         self.apply_nonbonded_forces(dev);
@@ -1470,7 +1595,7 @@ impl MdState {
                 // Note: This relies on SPME_RATIO being divisible by COMPUTATION_TIME_RATIO.
                 // It will produce inaccurate results otherwise.
                 if log_time {
-                    start = Instant::now();
+                    start = clock::Mono::now();
                 }
 
                 self.last_step_pme = true;
@@ -1528,7 +1653,70 @@ impl MdState {
                 self.atoms[i].force += *f;
             }
         }
+
+        self.apply_efield();
     }
+
+    /// Uniform (optionally cosine-oscillating) external electric field.
+    /// F_i += q_i·E(t) on every charged site including rigid-water M/H, and
+    /// the field potential U = −E·Σq_i r_i is folded into `potential_energy`
+    /// (same accounting as LAMMPS `fix efield`). No virial contribution: a
+    /// homogeneous external field is not a pair interaction.
+    ///
+    /// `cfg.efield` is stored in kcal·mol⁻¹·e⁻¹·Å⁻¹; forces here use the
+    /// engine's charge scaling (CHARGE_UNIT_SCALER per elementary charge),
+    /// hence the division. Energy bookkeeping stays in kcal/mol.
+    fn apply_efield(&mut self) {
+        let e0 = self.cfg.efield;
+        if e0 == [0.0; 3] {
+            return;
+        }
+        let scale = if self.cfg.efield_omega != 0.0 {
+            (self.cfg.efield_omega * self.time as f32).cos()
+        } else {
+            1.0
+        };
+        // Pre-scaled so `efield_term` can multiply the engine-scaled charge
+        // directly: q_scaled·(E/SCALER) = q_e·E.
+        let e = [
+            e0[0] * scale / CHARGE_UNIT_SCALER,
+            e0[1] * scale / CHARGE_UNIT_SCALER,
+            e0[2] * scale / CHARGE_UNIT_SCALER,
+        ];
+
+        let mut field_potential = 0.0_f64;
+        for a in &mut self.atoms {
+            let (f, u) = efield_term(a.partial_charge, a.posit, e);
+            a.force += f;
+            field_potential += u;
+        }
+        for w in &mut self.water {
+            for site in [&mut w.o, &mut w.m, &mut w.h0, &mut w.h1] {
+                let (f, u) = efield_term(site.partial_charge, site.posit, e);
+                site.force += f;
+                field_potential += u;
+            }
+        }
+        self.potential_energy += field_potential;
+    }
+}
+
+/// Pure per-charge efield contribution: force (engine units) on a site with
+/// engine-scaled charge `q_scaled` at `posit` under field `e_scaled`
+/// (= E/(kcal·mol⁻¹·e⁻¹·Å⁻¹) / CHARGE_UNIT_SCALER), and the potential
+/// energy contribution −q_e·E·r in kcal/mol (derived as
+/// −q_scaled·e_scaled·r, equal to −q_e·(E_raw)·r by construction).
+fn efield_term(q_scaled: f32, posit: Vec3, e_scaled: [f32; 3]) -> (Vec3, f64) {
+    let f = Vec3::new(
+        q_scaled * e_scaled[0],
+        q_scaled * e_scaled[1],
+        q_scaled * e_scaled[2],
+    );
+    let u = -f64::from(q_scaled)
+        * (f64::from(e_scaled[0]) * f64::from(posit.x)
+            + f64::from(e_scaled[1]) * f64::from(posit.y)
+            + f64::from(e_scaled[2]) * f64::from(posit.z));
+    (f, u)
 }
 
 impl Display for MdState {
@@ -1686,12 +1874,15 @@ fn water_mols_from_gro(gro: &Gro) -> Result<Vec<WaterMolOpc>, ParamError> {
             )));
         };
 
-        let mut mol = WaterMolOpc::new(o_posit, o_vel, Quaternion::new_identity());
-        mol.o.posit = o_posit;
-        mol.o.vel = o_vel;
-        mol.h0.posit = h0_posit;
+        // Orientation comes from the template's raw site positions, but the
+        // internal geometry (O–H bond, HOH angle, O–EP offset) is re-placed at
+        // the canonical OPC constants — never copied from the GRO template,
+        // whose TIP3P-distance H sites would over-deepen every H-bond under
+        // OPC charges (see solvent/init.rs water-placement note).
+        let v_h0 = h0_posit - o_posit;
+        let v_h1 = h1_posit - o_posit;
+        let mut mol = WaterMolOpc::from_axes(o_posit, o_vel, v_h0 + v_h1, v_h0);
         mol.h0.vel = h0_vel;
-        mol.h1.posit = h1_posit;
         mol.h1.vel = h1_vel;
         mol.update_virtual_site();
 
@@ -1760,6 +1951,7 @@ pub(crate) fn insert_ion(
     q: f32,
     sigma: f32,
     eps: f32,
+    c4: f32,
 ) {
     let atom_idx = state.atoms.len();
     let posit = state.water[w_idx].o.posit;
@@ -1773,6 +1965,7 @@ pub(crate) fn insert_ion(
         partial_charge: q,
         lj_sigma: sigma,
         lj_eps: eps,
+        lj_c4: c4,
         ..Default::default()
     });
     state.force_field_params.mass.insert(
@@ -1806,54 +1999,538 @@ pub(crate) fn remove_waters(state: &mut MdState, mut w_indices: Vec<usize>) {
     }
 }
 
-fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
+/// Write ONE instance of a [`SpeciesSpec`] into displaced water slot
+/// `slot_w` — the single insertion algorithm behind every path (counterions,
+/// salts, cosolutes; v1.3.2). The caller owns slot selection
+/// (`pick_ion_slots`), water removal, and table/DOF refresh, so the
+/// historical tail order (append ions, then delete waters) is unchanged.
+///
+/// Atomic species (single site, zero offset, no bonds) defer entirely to
+/// `insert_ion`, which is what makes them *bit-identical* to the v1.3.1
+/// output: the position is taken verbatim from the slot's water O (no
+/// `center + offset` float arithmetic, which could flip signed zeros), the
+/// `MassParams` comment stays `None` (the ion path never wrote one), and
+/// `mass_accel_factor` keeps its un-clamped division.
+///
+/// Multi-site instances reproduce the old `add_cosolvent` loop line for
+/// line, with one deliberate change: each site's `c4` is now threaded into
+/// `lj_c4`. In v1.3.1 it silently fell to the `Default` (0.0), so a
+/// cosolute-shaped species carrying 12-6-4 coefficients lost them; shipped
+/// CGenFF presets are pure 12-6 (c4 = 0), so *their* output is unaffected.
+pub(crate) fn insert_instance(state: &mut MdState, sp: &SpeciesSpec, slot_w: usize) {
+    if sp.is_atomic() {
+        let s = &sp.sites[0];
+        insert_ion(
+            state,
+            slot_w,
+            &s.ff_type,
+            s.element,
+            s.mass,
+            s.charge_scaled,
+            s.sigma,
+            s.eps,
+            s.c4,
+        );
+        return;
+    }
+    for &(a, b, _, _) in &sp.bonds {
+        assert!(
+            a < sp.sites.len() && b < sp.sites.len() && a != b,
+            "species {}: bond ({a},{b}) out of site range",
+            sp.name
+        );
+    }
+    let center = state.water[slot_w].o.posit;
+    let first = state.atoms.len();
+    for site in &sp.sites {
+        let atom_idx = state.atoms.len();
+        state.atoms.push(AtomDynamics {
+            serial_number: atom_idx as u32,
+            force_field_type: site.ff_type.clone(),
+            element: site.element,
+            posit: center + site.offset,
+            mass: site.mass,
+            partial_charge: site.charge_scaled,
+            lj_sigma: site.sigma,
+            lj_eps: site.eps,
+            lj_c4: site.c4,
+            ..Default::default()
+        });
+        state.force_field_params.mass.insert(
+            atom_idx,
+            MassParams {
+                atom_type: site.ff_type.clone(),
+                mass: site.mass,
+                comment: Some(sp.name.clone()),
+            },
+        );
+        state.force_field_params.lennard_jones.insert(
+            atom_idx,
+            LjParams {
+                atom_type: site.ff_type.clone(),
+                sigma: site.sigma,
+                eps: site.eps,
+            },
+        );
+        state.adjacency_list.push(Vec::new());
+        state
+            .mass_accel_factor
+            .push(KCAL_TO_NATIVE / site.mass.max(1e-6));
+    }
+    // One instance = one mol group (first site index).
+    state.mol_start_indices.push(first);
+    for &(a, b, k, r0) in &sp.bonds {
+        let (ia, ib) = (first + a, first + b);
+        // Harmonic connectivity (bonded force comes from restraints).
+        state.distance_restraints.push(DistanceRestraint {
+            atom_0_idx: ia,
+            atom_1_idx: ib,
+            r0,
+            k,
+        });
+        // 1-2 exclusion source + adjacency symmetry.
+        state
+            .force_field_params
+            .bonds_topology
+            .insert((ia.min(ib), ia.max(ib)));
+        state.adjacency_list[ia].push(ib);
+        state.adjacency_list[ib].push(ia);
+    }
+}
+
+/// Amber/CHARMM parameter files tabulate **R_min/2** ("R*"); the engine's
+/// `lj_sigma` field is a true σ (used in the 4ε[(σ/r)¹²−(σ/r)⁶] form, paired
+/// by arithmetic mean). The conversion is σ = 2·R*/2^(1/6), i.e. this factor.
+/// bio_files' `LjParams::from_line` applies the same factor to every protein
+/// and water heavy atom — ions must use it too, or their LJ minima land
+/// ~44% too close (the bug the v1.3.1 provenance audit caught).
+/// Consequence of matching factors: an (ion, water-O) pair's LJ minimum in
+/// the engine equals exactly R*_ion + R*_O, i.e. Amber's Rmin,ij rule.
+pub const R_STAR_TO_SIGMA: f32 = 2.0 / 1.122_462_048_309_373;
+
+/// One nonbonded ion model: ff type, element, mass, charge (engine-scaled),
+/// LJ (**true σ**, kept as `r_star * R_STAR_TO_SIGMA` so the published
+/// R_min/2 value is visible in the source), and the 12-6-4 induction
+/// constant `c4` (0 = plain 12-6). Single source for counterions *and*
+/// explicit salt of every valence.
+///
+/// All values below are the **OPC columns** of the Li/Merz ion series,
+/// chosen so every nonbonded ion parameter shares one water model, one
+/// combining convention, and one lab:
+/// - Monovalent: Sengupta, Li, Song, Li & Merz, J. Chem. Inf. Model. 2021,
+///   61, 869 (doi:10.1021/acs.jcim.0c01390), Table 2 (12-6, HFE-optimized).
+///   A 12-6-4 variant also exists (their Table 4: Na 1.450/0.02545423/C4 0,
+///   Cl 2.143/0.51564233/C4 −69) — left unused because the engine applies
+///   anisotropic C4 to cation–water-O pairs only (negative anion C4 has no
+///   consumer; revisit with a hydrogen-side path).
+/// - Divalent: Li, Song, Li & Merz, J. Chem. Theory Comput. 2020, 16, 4429
+///   (doi:10.1021/acs.jctc.0c00194), Table 5 (12-6-4). Their Eq. 5 defines
+///   the pair term `U = ... − C4_MW/r⁴` for ion–water-oxygen; ion–H C4 = 0.
+///   Against other solute atoms C4 now follows the PGY extension: pairs of
+///   two c4-carrying atoms combine by geometric mean (see
+///   `combine_lj_params`) — that is how Panteva–Giambasu–York site
+///   corrections are meant to ride on the Li–Merz ions ([`panteva`]).
+///
+/// Since v1.3.2 this is the *atomic* member of the insertable-species family:
+/// `IonParams: Insertable` normalizes into a single-site [`SpeciesSpec`]
+/// (see the `species` module), so the same `add_salt`/`SaltSpec` channel
+/// that takes these constants also takes multi-site species.
+#[derive(Clone, Copy, Debug)]
+pub struct IonParams {
+    pub ff_type: &'static str,
+    pub element: Element,
+    pub mass: f32,
+    pub charge_scaled: f32,
+    pub sigma: f32,
+    pub eps: f32,
+    pub c4: f32,
+}
+
+pub const ION_NA: IonParams = IonParams {
+    ff_type: "Na+",
+    element: Element::Sodium,
+    mass: 22.99,
+    charge_scaled: CHARGE_UNIT_SCALER,
+    sigma: 1.467 * R_STAR_TO_SIGMA,
+    eps: 0.029_603_43,
+    c4: 0.0,
+};
+pub const ION_CL: IonParams = IonParams {
+    ff_type: "Cl-",
+    element: Element::Chlorine,
+    mass: 35.45,
+    charge_scaled: -CHARGE_UNIT_SCALER,
+    sigma: 2.360 * R_STAR_TO_SIGMA,
+    eps: 0.678_788_7,
+    c4: 0.0,
+};
+/// K⁺ — same Sengupta Table 2 OPC 12-6 HFE family as Na⁺/Cl⁻.
+/// Provenance audit (2026-09-18): the paper's Erratum (doi:10.1021/
+/// acs.jcim.1c00576) revises only Table 1's Rb⁺/Cs⁺ *coordination-number
+/// targets* and one reference number — it touches no LJ parameter — so the
+/// PMC-hosted Table 2 row (1.702 Å / 0.13953816 kcal/mol) is the shipped,
+/// corrected value (author confirmed on the AMBER list that the frcmod
+/// files rebase on this publication).
+pub const ION_K: IonParams = IonParams {
+    ff_type: "K+",
+    element: Element::Potassium,
+    mass: 39.0983,
+    charge_scaled: CHARGE_UNIT_SCALER,
+    sigma: 1.702 * R_STAR_TO_SIGMA,
+    eps: 0.139_538_16,
+    c4: 0.0,
+};
+pub const ION_MG: IonParams = IonParams {
+    ff_type: "Mg2+",
+    element: Element::Magnesium,
+    mass: 24.305,
+    charge_scaled: 2.0 * CHARGE_UNIT_SCALER,
+    sigma: 1.405 * R_STAR_TO_SIGMA,
+    eps: 0.016_529_39,
+    c4: 127.0,
+};
+pub const ION_CA: IonParams = IonParams {
+    ff_type: "Ca2+",
+    element: Element::Calcium,
+    mass: 40.078,
+    charge_scaled: 2.0 * CHARGE_UNIT_SCALER,
+    sigma: 1.602 * R_STAR_TO_SIGMA,
+    eps: 0.080_342_31,
+    c4: 86.0,
+};
+pub const ION_SR: IonParams = IonParams {
+    ff_type: "Sr2+",
+    // na_seq 0.3.15 (crates.io, latest published) has no Strontium variant;
+    // `Other` is its documented catch-all. Identity is carried by ff_type
+    // "Sr2+" — filter on that (not element) when counting Sr. Switch once
+    // upstream na_seq adds Strontium; monitored passively, nothing here
+    // blocks on it.
+    element: Element::Other,
+    mass: 87.62,
+    charge_scaled: 2.0 * CHARGE_UNIT_SCALER,
+    sigma: 1.738 * R_STAR_TO_SIGMA,
+    eps: 0.165_002_96,
+    c4: 87.0,
+};
+pub const ION_BA: IonParams = IonParams {
+    ff_type: "Ba2+",
+    element: Element::Barium,
+    mass: 137.327,
+    charge_scaled: 2.0 * CHARGE_UNIT_SCALER,
+    sigma: 1.898 * R_STAR_TO_SIGMA,
+    eps: 0.297_186_82,
+    c4: 78.0,
+};
+
+/// Selectable divalent salts; each formula unit is electroneutral and
+/// displaces that many whole waters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivalentSalt {
+    /// MgCl2: 1 Mg²⁺ + 2 Cl⁻ (3 waters displaced per formula unit)
+    Mg,
+    /// CaCl2
+    Ca,
+    /// SrCl2 — na_seq::Element has no Strontium variant, so the ion carries
+    /// `Element::Other` and identity lives in its ff_type "Sr2+".
+    Sr,
+    /// BaCl2
+    Ba,
+}
+
+impl DivalentSalt {
+    pub fn cation(self) -> IonParams {
+        match self {
+            DivalentSalt::Mg => ION_MG,
+            DivalentSalt::Ca => ION_CA,
+            DivalentSalt::Sr => ION_SR,
+            DivalentSalt::Ba => ION_BA,
+        }
+    }
+}
+
+/// Provenance lock for the ion table (v1.3.1). These tests fail if anyone
+/// edits `ION_*` without re-deriving from the published Li–Merz/Sengupta
+/// OPC tables, and they encode the r_star→σ semantics that the engine's
+/// atom table uses (bio_files' conversion) — the convention bug the audit
+/// caught is exactly what the Rmin-sum test below would have caught.
+#[cfg(test)]
+mod ion_provenance_tests {
+    use super::{
+        CHARGE_UNIT_SCALER, ION_BA, ION_CA, ION_CL, ION_K, ION_MG, ION_NA, ION_SR, IonParams,
+        R_STAR_TO_SIGMA,
+    };
+    use crate::engine::md_core::solvent::{O_RSTAR, O_SIGMA};
+
+    /// (label, params, published R_min/2, eps, c4) — Sengupta JCIM 2021
+    /// Table 2 (Na, K, Cl) and Li-Merz JCTC 2020 Table 5 (divalent), OPC.
+    const TABLE: &[(&str, IonParams, f32, f32, f32)] = &[
+        ("Na+", ION_NA, 1.467, 0.029_603_43, 0.0),
+        ("K+", ION_K, 1.702, 0.139_538_16, 0.0),
+        ("Cl-", ION_CL, 2.360, 0.678_788_7, 0.0),
+        ("Mg2+", ION_MG, 1.405, 0.016_529_39, 127.0),
+        ("Ca2+", ION_CA, 1.602, 0.080_342_31, 86.0),
+        ("Sr2+", ION_SR, 1.738, 0.165_002_96, 87.0),
+        ("Ba2+", ION_BA, 1.898, 0.297_186_82, 78.0),
+    ];
+
+    #[test]
+    fn sigma_is_exactly_published_rstar_scaled() {
+        for (name, p, r, _, _) in TABLE {
+            assert_eq!(p.sigma, r * R_STAR_TO_SIGMA, "{name} sigma drift");
+        }
+    }
+
+    #[test]
+    fn eps_and_c4_match_the_papers() {
+        for (name, p, _, eps, c4) in TABLE {
+            assert_eq!(p.eps, *eps, "{name} eps drift");
+            assert_eq!(p.c4, *c4, "{name} c4 drift");
+        }
+        // Charges in units of e (engine-scaled): monovalent ±1, divalent +2.
+        assert_eq!(ION_NA.charge_scaled, CHARGE_UNIT_SCALER);
+        assert_eq!(ION_K.charge_scaled, CHARGE_UNIT_SCALER);
+        assert_eq!(ION_CL.charge_scaled, -CHARGE_UNIT_SCALER);
+        for i in [ION_MG, ION_CA, ION_SR, ION_BA] {
+            assert_eq!(i.charge_scaled, 2.0 * CHARGE_UNIT_SCALER, "{}", i.ff_type);
+        }
+    }
+
+    #[test]
+    fn ion_water_lj_minimum_equals_amber_rmin_sum() {
+        // The engine's σ-form pair minimum sits at 2^(1/6)·(σi+σj)/2; with
+        // correct conversions this MUST equal Amber's Rmin,ij = R*_i + R*_j.
+        let two_one_sixth = 1.122_462_048_309_373f32;
+        for (name, p, r, _, _) in TABLE {
+            let engine_min = two_one_sixth * (p.sigma + O_SIGMA) * 0.5;
+            let amber_min = r + O_RSTAR;
+            assert!(
+                (engine_min - amber_min).abs() < 2e-4,
+                "{name}: engine pair minimum {engine_min:.4} vs Amber Rmin,ij {amber_min:.4}"
+            );
+        }
+    }
+}
+
+/// Minimum distance an ion must keep from every non-solvent atom (protein,
+/// ligands, previously placed ions) — mirrors `gmx genion -rmin` (0.6 nm).
+pub const ION_EXCLUSION_RADIUS_ANGSTROM: f32 = 6.0;
+
+/// Fixed seed so ion sites — like everything else about a build — are
+/// reproducible run to run (genion uses a fresh seed by default; we don't).
+const ION_SHUFFLE_SEED: u64 = 0x5EED_1017;
+
+/// Choose `count` distinct water indices to displace with ions, genion-style:
+/// seeded random permutation of all waters, accepted in order if the water's
+/// O sits at least [`ION_EXCLUSION_RADIUS_ANGSTROM`] (PBC min-image) from
+/// every non-solvent atom. The previous fixed-stride walk laid ions on a
+/// lattice-regular subset of the water array and allowed them to sit directly
+/// on buried waters touching protein atoms. If the box is so salt-loaded that
+/// too few sites honor the exclusion, the remainder is taken anyway with one
+/// warning — a buildable system beats a fatal error.
+///
+/// This is a *placement-time* guarantee: the solvation-relaxation and
+/// initial-minimization passes that follow deliberately let Coulomb
+/// interactions pull ions toward (counter-ions) or away from (co-ions) the
+/// protein — settling into solvation shells is the physics we want, and the
+/// `rmin`-style floor only exists to keep the starting configuration from
+/// burying an ion inside the solute.
+///
+/// Placement quality was assessed once (v1.3.5 audit) and ACCEPTED as-is;
+/// three independent reasons, so the question need not be reopened:
+/// (1) the protocol mirrors `gmx genion` (seeded shuffle + greedy 6 Å floor),
+/// the placement used by the whole Amber/CHARMM user base;
+/// (2) post-build relaxation, not the placement, is what forms solvation
+/// shells — over-engineering slots would pre-judge the physics;
+/// (3) any "smarter" in-place rearrangement would make the deterministic
+/// insertion tail (tests/ion_layout_golden.rs) disagree with itself between
+/// code paths, sacrificing the one bit-identity guard we have.
+fn pick_ion_slots(state: &MdState, count: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..state.water.len()).collect();
+    let mut rng = StdRng::seed_from_u64(ION_SHUFFLE_SEED);
+    order.shuffle(&mut rng);
+
+    let excl2 = ION_EXCLUSION_RADIUS_ANGSTROM * ION_EXCLUSION_RADIUS_ANGSTROM;
+    let cell = &state.cell;
+    let allowed = |&w: &usize| {
+        let pos = state.water[w].o.posit;
+        !state.atoms.iter().any(|a| {
+            let d = cell.min_image(a.posit - pos);
+            d.x * d.x + d.y * d.y + d.z * d.z < excl2
+        })
+    };
+
+    // Greedy accept in shuffled order. Each site is checked against the
+    // solute *and* every ion already taken this batch, so the exclusion is
+    // pairwise-complete, not just batch-vs-solute.
+    let mut chosen: Vec<(usize, lin_alg::f32::Vec3)> = Vec::with_capacity(count);
+    for &w in &order {
+        if chosen.len() == count {
+            break;
+        }
+        let pos = state.water[w].o.posit;
+        let clear_of_solute = allowed(&w);
+        if clear_of_solute
+            && chosen.iter().all(|(_, p)| {
+                let d = cell.min_image(pos - *p);
+                d.x * d.x + d.y * d.y + d.z * d.z >= excl2
+            })
+        {
+            chosen.push((w, pos));
+        }
+    }
+    if chosen.len() < count {
+        let taken: std::collections::HashSet<usize> = chosen.iter().map(|(w, _)| *w).collect();
+        eprintln!(
+            "Ion placement: only {}/{} sites honor the {ION_EXCLUSION_RADIUS_ANGSTROM}\u{00c5} exclusion; \
+             placing the rest at nearest available waters.",
+            chosen.len(),
+            count
+        );
+        for &w in &order {
+            if chosen.len() == count {
+                break;
+            }
+            if taken.contains(&w) || !allowed(&w) {
+                continue;
+            }
+            chosen.push((w, state.water[w].o.posit));
+        }
+    }
+    chosen.into_iter().map(|(w, _)| w).collect()
+}
+
+// The general insertable-species vocabulary (v1.3.2). `SiteSpec` replaced the
+// old private-shape `CosolventSite` (kept as an alias below for source
+// compatibility); single-atom ions normalize into the same shape via
+// `SpeciesSpec::from_ion`, and `insert_instance` is now the ONE place that
+// writes species atoms into the state.
+pub use species::{
+    Insertable, SaltBalanceError, SaltSpec, SiteSpec, SpeciesSpec, balance_stoichiometry,
+};
+
+/// A [`CosolventSpec`] molecule's site: offset from the displaced water's
+/// oxygen, charge in engine-scaled units, LJ in the engine's true-σ
+/// convention, and the per-site 12-6-4 `c4`.
+pub type CosolventSite = SiteSpec;
+
+/// A user-parameterized cosolute molecule (denaturant, osmolyte, …).
+/// `bonds` are (site_i, site_j, k kcal·mol⁻¹·Å⁻², r0 Å): they drive BOTH the
+/// harmonic connectivity — applied through `distance_restraints`, the
+/// parameter-carrying mechanism — and the 1-2 nonbonded exclusions (via
+/// `bonds_topology`), so internal site pairs do not feel full Coulomb/LJ.
+/// A cosolute carries no net implicit-solvent trickery; charges must sum to
+/// the intended molecular charge (the neutrality warning will shout if the
+/// overall system ends up fractional).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CosolventSpec {
+    pub name: String,
+    /// Formula-unit molarity, mol/L; count = round(c·V·N_A) molecules.
+    pub molarity: f32,
+    pub sites: Vec<CosolventSite>,
+    /// Internal connectivity as (site_i, site_j, k, r0) — NOTE the force
+    /// constant comes BEFORE the equilibrium distance (the order `
+    /// add_cosolvent` destructures and the v1.3 PRB probe test established).
+    /// Each bond becomes a harmonic distance restraint (E = ½kΔr²) and a 1-2
+    /// topology exclusion. Sites absent from every bond (e.g. GdmCl's Cl⁻)
+    /// float free within the molecule's slot.
+    pub bonds: Vec<(usize, usize, f32, f32)>,
+}
+
+impl MdState {
+    /// Displace waters with `n_mols` copies of `spec` at genion-style seeded,
+    /// exclusion-respecting sites (each molecule occupies ONE water slot; its
+    /// sites hang off that water's O by `offset`). Rebuilds LJ tables, the
+    /// molecule-energy matrix, and thermo DOF, and runs the neutrality
+    /// diagnostic — same contract as the salt paths.
+    pub fn add_cosolvent(&mut self, spec: &CosolventSpec, n_mols: usize) {
+        if n_mols == 0 || spec.sites.is_empty() {
+            return;
+        }
+        // One normalized template, N instances (v1.3.2: this and every other
+        // insertion path now share `insert_instance`; bond-index validation
+        // moved there, so the failure message says "species").
+        let sp = spec.to_species();
+        let slots = pick_ion_slots(self, n_mols);
+        let per_mol = sp.sites.len();
+        let mut placed = 0usize;
+        for &slot in &slots {
+            insert_instance(self, &sp, slot);
+            placed += 1;
+        }
+        if placed < n_mols {
+            eprintln!(
+                "Cosolvent {}: only {placed}/{} molecules placed (solvent exhausted).",
+                spec.name, n_mols
+            );
+        }
+        remove_waters(self, slots);
+        refresh_mol_energy_matrix(self);
+        self.setup_nonbonded_exclusion_scale_flags();
+        self.lj_tables = LjTables::new(&self.atoms);
+        self.thermo_dof = self.dof_for_thermo();
+        eprintln!(
+            "Added {placed} cosolute molecule(s) of {} ({} sites, {:.2} M).",
+            spec.name, per_mol, spec.molarity
+        );
+        warn_if_not_neutral(self);
+    }
+}
+
+/// PME/Ewald assumes an electroneutral cell; a nonzero net charge is silently
+/// treated as a uniform neutralizing background (GROMACS refuses such systems,
+/// LAMMPS warns). Integer counterions cannot cancel fractional *e* exactly when
+/// terminal-residue charge units assume backbone hydrogens the internal digit
+/// map never adds, so we surface the residue instead of aborting a scan build.
+fn warn_if_not_neutral(state: &MdState) {
+    let net = state.net_charge_e();
+    if net.abs() > 0.01 {
+        eprintln!(
+            "Warning: system net charge {net:+.3} e after ion placement; \
+             PME will apply its implicit neutralizing background."
+        );
+    }
+}
+
+/// Keep the dense molecule-energy analysis matrix coherent after the
+/// molecule list changed (ions displaced waters).
+fn refresh_mol_energy_matrix(state: &mut MdState) {
+    let n_mols = state.mol_start_indices.len();
+    if n_mols <= 256 && !state.potential_energy_between_mols.is_empty() {
+        state
+            .potential_energy_between_mols
+            .resize(n_mols * n_mols, 0.0);
+    } else {
+        state.potential_energy_between_mols.clear();
+    }
+}
+
+pub(crate) fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
     // Add counter-ions to neutralize any net charge.
     // Positive net → add Cl⁻;  negative net → add Na⁺.
     if n_ions > 0 && !state.water.is_empty() {
-        let (ff_type, elem, mass, q_scaled, sigma, eps): (&str, Element, f32, f32, f32, f32) =
-            if net_q_e > 0.0 {
-                (
-                    "Cl-",
-                    Element::Chlorine,
-                    35.45,
-                    -CHARGE_UNIT_SCALER,
-                    4.478,
-                    0.0073,
-                )
-            } else {
-                (
-                    "Na+",
-                    Element::Sodium,
-                    22.99,
-                    CHARGE_UNIT_SCALER,
-                    2.439,
-                    0.1065,
-                )
-            };
+        let ion = if net_q_e > 0.0 { &ION_CL } else { &ION_NA };
 
-        let stride = (state.water.len() / n_ions).max(1);
-        let w_indices: Vec<usize> = (0..n_ions)
-            .map(|i| (i * stride).min(state.water.len() - 1))
-            .collect();
+        let w_indices = pick_ion_slots(state, n_ions);
 
         for &w_idx in &w_indices {
-            insert_ion(state, w_idx, ff_type, elem, mass, q_scaled, sigma, eps);
+            insert_ion(
+                state,
+                w_idx,
+                ion.ff_type,
+                ion.element,
+                ion.mass,
+                ion.charge_scaled,
+                ion.sigma,
+                ion.eps,
+                ion.c4,
+            );
         }
-        // Keep dense molecule-energy analysis bounded for low-memory RL runs.
-        let n_mols = state.mol_start_indices.len();
-        if n_mols <= 256 && !state.potential_energy_between_mols.is_empty() {
-            state
-                .potential_energy_between_mols
-                .resize(n_mols * n_mols, 0.0);
-        } else {
-            state.potential_energy_between_mols.clear();
-        }
-
+        refresh_mol_energy_matrix(state);
         remove_waters(state, w_indices);
 
         eprintln!(
             "Added {n_ions} {} ion(s) to neutralize net charge ({net_q_e:+.3}e).",
-            ff_type
+            ion.ff_type
         );
     } else if n_ions > 0 {
         eprintln!(
@@ -1864,6 +2541,16 @@ fn add_ions(state: &mut MdState, net_q_e: f32, n_ions: usize) {
 }
 
 impl MdState {
+    /// Rebuild the derived per-atom tables after external atom-list surgery
+    /// (the reuse-path ion repack strips ions before re-inserting them):
+    /// LJ pair tables and thermostat DOF, identical to what the insertion
+    /// helpers do at their tail (v1.3.2 single-refresh contract).
+    pub fn refresh_species_tables(&mut self) {
+        self.mass_accel_factor = self.atoms.iter().map(|a| KCAL_TO_NATIVE / a.mass).collect();
+        self.lj_tables = LjTables::new(&self.atoms);
+        self.thermo_dof = self.dof_for_thermo();
+    }
+
     /// Add `n_pairs` Na⁺/Cl⁻ ion pairs to reach a target ionic strength, each pair
     /// displacing a water molecule. Rebuilds the LJ tables and thermo DOF so the new
     /// ions are fully accounted for. Safe to call again later (e.g. to change salt).
@@ -1872,50 +2559,321 @@ impl MdState {
             return;
         }
 
-        let (na_ff, na_elem, na_mass, na_q, na_sig, na_eps): (&str, Element, f32, f32, f32, f32) = (
-            "Na+",
-            Element::Sodium,
-            22.99,
-            CHARGE_UNIT_SCALER,
-            2.439,
-            0.1065,
-        );
-        let (cl_ff, cl_elem, cl_mass, cl_q, cl_sig, cl_eps): (&str, Element, f32, f32, f32, f32) = (
-            "Cl-",
-            Element::Chlorine,
-            35.45,
-            -CHARGE_UNIT_SCALER,
-            4.478,
-            0.0073,
-        );
-
-        let total = 2 * n_pairs;
-        let stride = (self.water.len() / total).max(1);
-        let w_indices: Vec<usize> = (0..total)
-            .map(|i| (i * stride).min(self.water.len() - 1))
-            .collect();
-
-        for (k, &w_idx) in w_indices.iter().enumerate() {
-            let (ff, elem, mass, q, sig, eps) = if k % 2 == 0 {
-                (na_ff, na_elem, na_mass, na_q, na_sig, na_eps)
-            } else {
-                (cl_ff, cl_elem, cl_mass, cl_q, cl_sig, cl_eps)
-            };
-            insert_ion(self, w_idx, ff, elem, mass, q, sig, eps);
-        }
-        remove_waters(self, w_indices);
-
-        // Keep dense molecule-energy analysis bounded for low-memory RL runs.
-        let n_mols = self.mol_start_indices.len();
-        if n_mols <= 256 && !self.potential_energy_between_mols.is_empty() {
-            self.potential_energy_between_mols
-                .resize(n_mols * n_mols, 0.0);
-        } else {
-            self.potential_energy_between_mols.clear();
-        }
-
+        // One pick+insert+remove pass inside the helper (alternating
+        // Na/Cl over the seeded shuffled order keeps every pair neutral).
+        self.insert_formula_unit_salts(&ION_NA, &[ION_CL], n_pairs);
         self.lj_tables = LjTables::new(&self.atoms);
         self.thermo_dof = self.dof_for_thermo();
         eprintln!("Added {n_pairs} Na⁺/Cl⁻ pair(s) for ionic strength.");
+        warn_if_not_neutral(self);
+    }
+
+    /// Insert `n_units` electroneutral formula units `cation + anions` by
+    /// displacing whole waters at genion-style exclusion-respecting sites.
+    /// Every call draws from the same seeded shuffle, but sites already used
+    /// by previously inserted ions fail the exclusion and are skipped — so
+    /// repeated calls never collide. Caller must refresh `lj_tables` (the
+    /// batched env update in `add_divalent_salt` does).
+    pub(crate) fn insert_formula_unit_salts<C: Insertable, A: Insertable>(
+        &mut self,
+        cation: &C,
+        anions: &[A],
+        n_units: usize,
+    ) {
+        // v1.3.2: normalize to species, then expand one formula unit in the
+        // exact [cation, anions…] order the old `.cycle()` produced — the
+        // slot draw, instance↔slot mapping and atom append order are
+        // bit-identical to v1.3.1.
+        let csp = cation.to_species();
+        let asps: Vec<SpeciesSpec> = anions.iter().map(|a| a.to_species()).collect();
+        let parts: Vec<&SpeciesSpec> = std::iter::once(&csp).chain(asps.iter()).collect();
+        self.insert_formula_unit(&parts, n_units);
+    }
+
+    /// Insert `n_units` copies of an expanded formula unit: `parts` is the
+    /// instance order *within one unit* (MgCl₂ → [Mg²⁺, Cl⁻, Cl⁻]), each
+    /// instance occupying its own displaced water slot. Multi-site parts
+    /// (a polyatomic anion, someday) hang their extra sites off their own
+    /// slot's oxygen — same contract as `add_cosolvent`.
+    /// Caller refreshes `lj_tables`/`thermo_dof`, as the salt paths always
+    /// have.
+    pub(crate) fn insert_formula_unit(&mut self, parts: &[&SpeciesSpec], n_units: usize) {
+        let total = parts.len() * n_units;
+        let w_indices = pick_ion_slots(self, total);
+        let mut iter = parts.iter().copied().cycle().take(total);
+        for &w_idx in &w_indices {
+            insert_instance(self, iter.next().unwrap(), w_idx);
+        }
+        remove_waters(self, w_indices);
+        refresh_mol_energy_matrix(self);
+    }
+
+    /// Insert `n_units` formula units of any balanced electrolyte (v1.3.2
+    /// species channel — KCl, CsCl, a future Na₂SO₄, …). The per-unit
+    /// instance order comes straight from [`SaltSpec::formula_unit_parts`];
+    /// a pair that cannot be balanced (two anions, junk charges) is skipped
+    /// with a warning rather than panicking a long scan build. Same tail
+    /// contract as `add_divalent_salt` (tables, DOF, neutrality note).
+    pub fn add_salt(&mut self, salt: &SaltSpec, n_units: usize) {
+        if n_units == 0 {
+            return;
+        }
+        let parts = match salt.formula_unit_parts() {
+            Ok(parts) => parts,
+            Err(e) => {
+                eprintln!("Salt {}/{} skipped: {e}", salt.cation.name, salt.anion.name);
+                return;
+            }
+        };
+        self.insert_formula_unit(&parts, n_units);
+        self.lj_tables = LjTables::new(&self.atoms);
+        self.thermo_dof = self.dof_for_thermo();
+        let (nc, na) = salt
+            .stoichiometry()
+            .unwrap_or((0, 0)) // parts succeeded above, so this cannot fail
+            ;
+        eprintln!(
+            "Added {n_units} {}/{} formula unit(s) ({nc} cation + {na} anion instances).",
+            salt.cation.name, salt.anion.name
+        );
+        warn_if_not_neutral(self);
+    }
+
+    /// Add `n_units` formula units (e.g. MgCl2) of a divalent salt, replacing
+    /// waters. Table 5 (Li-Merz 2020, OPC column) values; see `IonParams`.
+    pub fn add_divalent_salt(&mut self, salt: DivalentSalt, n_units: usize) {
+        if n_units == 0 {
+            return;
+        }
+        let cation = salt.cation();
+        self.insert_formula_unit_salts(&cation, &[ION_CL, ION_CL], n_units);
+        self.lj_tables = LjTables::new(&self.atoms);
+        self.thermo_dof = self.dof_for_thermo();
+        eprintln!(
+            "Added {n_units} {}Cl2 formula unit(s) (1 {}, 2 Cl⁻ each).",
+            cation.ff_type.trim_end_matches('+'),
+            cation.ff_type
+        );
+        warn_if_not_neutral(self);
+    }
+
+    /// Net charge of the whole system in units of *e*: every solute/ion atom
+    /// plus every explicit water site charge (OPC puts the charge at the M/EP
+    /// site and the hydrogens; O itself is chargeless by design).
+    pub fn net_charge_e(&self) -> f32 {
+        let mut q = 0.0_f64;
+        for a in &self.atoms {
+            q += f64::from(a.partial_charge);
+        }
+        for w in &self.water {
+            q += f64::from(w.o.partial_charge)
+                + f64::from(w.h0.partial_charge)
+                + f64::from(w.h1.partial_charge)
+                + f64::from(w.m.partial_charge);
+        }
+        (q / f64::from(CHARGE_UNIT_SCALER)) as f32
+    }
+
+    /// Effective ionic strength of the built box, I = ½ Σᵢ cᵢ zᵢ² (mol/L), summed
+    /// over every explicit salt ion present (monovalent Na⁺/K⁺/Cl⁻, divalent
+    /// Mg²⁺/Ca²⁺/Sr²⁺/Ba²⁺, and any `salts_json` electrolyte whose site is a
+    /// registered ion).
+    ///
+    /// This is DIFFERENT from `EnvParams::ionic_strength_m`, which only sets the
+    /// NaCl background molarity — adding divalent salts or extra electrolytes
+    /// raises the true I above that single number. Ions are matched by
+    /// `force_field_type` (NOT element: Sr²⁺ is `Element::Other` upstream), and
+    /// z is the ion's formal valence (|partial_charge| in e, rounded). A cosolute
+    /// site that is itself a free chloride (e.g. GdmCl) carries the `Cl-` type and
+    /// so correctly contributes to I.
+    pub fn effective_ionic_strength_m(&self) -> f32 {
+        let vol_l = f64::from(self.cell.volume()) * 1.0e-27;
+        if vol_l <= 0.0 {
+            return 0.0;
+        }
+        // Concentration of a single particle of one species: 1 / (V_L · N_A).
+        let c_one = 1.0 / (vol_l * AVOGADRO);
+        let mut i = 0.0_f64;
+        for a in &self.atoms {
+            let is_ion = matches!(
+                a.force_field_type.as_str(),
+                "Na+" | "K+" | "Cl-" | "Mg2+" | "Ca2+" | "Sr2+" | "Ba2+"
+            );
+            if !is_ion {
+                continue;
+            }
+            let z = (f64::from(a.partial_charge) / f64::from(CHARGE_UNIT_SCALER))
+                .round()
+                .abs();
+            if z > 0.5 {
+                i += 0.5 * c_one * z * z;
+            }
+        }
+        i as f32
+    }
+
+    // ------------------------------------------------------------------
+    // Observability probes (analysis module). Read-only: none of these
+    // mutate state or touch the MD hot path, so golden byte-identity and
+    // the determinism of runs are unaffected.
+    // ------------------------------------------------------------------
+
+    /// Electrostatic potential at arbitrary probe points, in kcal/mol/e,
+    /// using the engine's OWN PME conventions: the charge list is the
+    /// production packer (`pack_pme_pos_q`: atoms, then water M/H0/H1), the
+    /// real-space term is `erfc(alpha r)/r` minimum-image inside the Coulomb
+    /// cutoff, the reciprocal term is the same half-spectrum mesh sum with
+    /// the exact B-spline deconvolution (validated against the ewald fork's
+    /// reciprocal energy in `analysis::tests`).
+    ///
+    /// Report POTENTIAL DIFFERENCES or values relative to a reference point.
+    /// The PME constant offset (self-energy + neutralizing background) is
+    /// position-independent and cancels in any difference; absolute values
+    /// carry the arbitrary gauge of the mesh, so they are not meaningful.
+    /// Catalytic-axis field strength = (phi(b) - phi(a)) / |b - a|; anion-hole
+    /// potential and pH-dependent site potential are single points here.
+    pub fn electrostatic_potential(&self, points: &[[f64; 3]]) -> Vec<f64> {
+        let (pos, q) = self.pack_pme_pos_q();
+        analysis::electrostatic_potential(
+            points,
+            &pos,
+            &q,
+            self.cell.extent,
+            f64::from(self.cfg.spme_alpha),
+            f64::from(self.cfg.coulomb_cutoff),
+            f64::from(self.cfg.spme_mesh_spacing),
+        )
+    }
+
+    /// Electrostatic FIELD **E = −∇φ** (kcal/mol·e⁻¹·Å⁻¹) at probe points, one PME
+    /// pass (real erfc-gradient + reciprocal k-gradient) — see
+    /// `analysis::electrostatic_field`. This is the B2 functional-probe primitive
+    /// (the site's catalytic field), computed ANALYTICALLY so it does NOT inherit
+    /// the subtractive-cancellation noise of finite-differencing the gauge-
+    /// wandering potential.
+    ///
+    /// `positions = Some(p)` feeds a *time-averaged structure* (length must equal
+    /// `pme_positions()`) so thermal motion averages out: snapshot `pme_positions`
+    /// over a window, take the running mean, pass it back here. `None` uses the
+    /// current frame.
+    pub fn electrostatic_field(
+        &self,
+        points: &[[f64; 3]],
+        positions: Option<&[[f64; 3]]>,
+    ) -> Vec<[f64; 3]> {
+        let (base_pos, q) = self.pack_pme_pos_q();
+        let owned: Vec<Vec3>;
+        let pos: &[Vec3] = match positions {
+            Some(ov) => {
+                assert_eq!(
+                    ov.len(),
+                    base_pos.len(),
+                    "electrostatic_field positions override length {} != pme particles {}",
+                    ov.len(),
+                    base_pos.len()
+                );
+                owned = ov
+                    .iter()
+                    .map(|p| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+                    .collect();
+                &owned
+            }
+            None => &base_pos,
+        };
+        analysis::electrostatic_field(
+            points,
+            pos,
+            &q,
+            self.cell.extent,
+            f64::from(self.cfg.spme_alpha),
+            f64::from(self.cfg.coulomb_cutoff),
+            f64::from(self.cfg.spme_mesh_spacing),
+        )
+    }
+
+    /// PME particle positions (the SAME order/index space as
+    /// `electrostatic_field`'s `positions` override): atoms + water (O/M/H) +
+    /// ions/cosolvent. Snapshot these across a trajectory window and average to
+    /// build a time-averaged structure for the site-field query.
+    pub fn pme_positions(&self) -> Vec<[f64; 3]> {
+        let (pos, _q) = self.pack_pme_pos_q();
+        pos.iter()
+            .map(|p| [p.x as f64, p.y as f64, p.z as f64])
+            .collect()
+    }
+
+    /// Site layout WITH explicit solvent, for occlusion-style queries: all
+    /// non-solvent atoms first (indices `0..atoms.len()`, the same index
+    /// space as `SpiceEngine::select_atoms`), then per water its O, H0, H1.
+    /// The M/EP site is never included: it is a virtual charge placement
+    /// with no LJ and no vdW radius. Used by `bottleneck_profile` with
+    /// `include_water=true` (a hydrated pore radius really does have water
+    /// lining it); NOT used by SASA (see `atom_sasa`).
+    pub fn real_sites_pos_radii(&self) -> (Vec<Vec3>, Vec<f64>) {
+        let mut pos = Vec::with_capacity(self.atoms.len() + 3 * self.water.len());
+        let mut radii = Vec::with_capacity(pos.capacity());
+        for a in &self.atoms {
+            pos.push(a.posit);
+            radii.push(analysis::vdw_radius(&a.element, f64::from(a.lj_sigma)));
+        }
+        for w in &self.water {
+            for site in [&w.o, &w.h0, &w.h1] {
+                pos.push(site.posit);
+                radii.push(analysis::vdw_radius(
+                    &site.element,
+                    f64::from(site.lj_sigma),
+                ));
+            }
+        }
+        (pos, radii)
+    }
+
+    /// Per-atom solvent-accessible surface area (Angstrom^2, Shrake-Rupley
+    /// with `n_sphere` Fibonacci lattice points): exactly one value per
+    /// `state.atoms` entry, the same index space as `select_atoms`. Summing
+    /// over a selection gives MM/PBSA nonpolar terms and per-site burial;
+    /// core atoms come out near zero, exposed surface atoms near 4 pi r^2.
+    ///
+    /// Explicit water is deliberately NOT part of this calculation, as both
+    /// target and occluder. The 1.4 A probe IS the solvent model: a surface
+    /// atom already loses the cap the probe cannot reach. Feeding the first
+    /// hydration shell in as occluder spheres instead measures the
+    /// solute-water CONTACT area, which is nearly zero for a solvated
+    /// protein (this collapsed 2LYZ from ~1.8e4 A^2 to ~30 A^2 when tried; `tests/observables.rs` prints the kept side).
+    /// Ions/cosolvent sites live in `state.atoms` and do occlude, matching
+    /// an "all non-solvent atoms" SASA from standard tools.
+    pub fn atom_sasa(&self, probe: f64, n_sphere: usize) -> Vec<f64> {
+        let pos: Vec<Vec3> = self.atoms.iter().map(|a| a.posit).collect();
+        let radii: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|a| analysis::vdw_radius(&a.element, f64::from(a.lj_sigma)))
+            .collect();
+        analysis::atom_sasa(&pos, &radii, self.cell.extent, probe, n_sphere.max(50))
+    }
+}
+
+#[cfg(test)]
+mod efield_tests {
+    use super::*;
+
+    #[test]
+    fn efield_term_matches_manual_dipole_energy() {
+        // One +1 e charge at x=2 with field (E0,0,0): F = +qE·x̂, U = −q·E·x.
+        let raw = 0.5_f32; // kcal·mol⁻¹·e⁻¹·Å⁻¹
+        let e = [raw / CHARGE_UNIT_SCALER, 0.0, 0.0];
+        let q = CHARGE_UNIT_SCALER; // +1 e in engine-scaled units
+        let (f_pos, u_pos) = efield_term(q, Vec3::new(2.0, 0.0, 0.0), e);
+        assert!((f_pos.x - raw).abs() < 1e-6, "force must equal q_e·E");
+        assert!(f_pos.y == 0.0 && f_pos.z == 0.0);
+        assert!((u_pos + 1.0).abs() < 1e-6, "U = −(+1)(0.5)(2) = −1");
+    }
+
+    #[test]
+    fn efield_net_force_on_neutral_pair_is_zero() {
+        let e = [0.3 / CHARGE_UNIT_SCALER, -0.1 / CHARGE_UNIT_SCALER, 0.0];
+        let (f1, _) = efield_term(CHARGE_UNIT_SCALER, Vec3::new(1.0, 2.0, 3.0), e);
+        let (f2, _) = efield_term(-CHARGE_UNIT_SCALER, Vec3::new(-1.0, 0.0, 4.0), e);
+        assert!((f1 + f2).magnitude() < 1e-6);
     }
 }

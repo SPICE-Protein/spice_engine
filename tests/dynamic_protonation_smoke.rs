@@ -5,8 +5,8 @@ use std::path::Path;
 
 use bio_files::MmCif;
 use na_seq::AminoAcidProtenationVariant;
-use spice_engine::engine::dynamics::ComputationDevice;
-use spice_engine::engine::dynamics::params::FfParamSet;
+use spice_engine::engine::md_core::ComputationDevice;
+use spice_engine::engine::md_core::params::FfParamSet;
 use spice_engine::{BuildOptions, build_system};
 
 #[test]

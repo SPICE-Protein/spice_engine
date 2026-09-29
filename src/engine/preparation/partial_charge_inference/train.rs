@@ -7,10 +7,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder};
 use rand::seq::SliceRandom;
 
-use crate::engine::md_core::partial_charge_inference::{
-    AtomVocab, MolGNN,
-    files::{GEOSTD_PATH, MODEL_PATH, VOCAB_PATH, find_mol2_paths},
-    save,
+use crate::engine::md_core::{
+    partial_charge_inference::{AtomVocab, MolGNN},
+    pci_files::{MODEL_PATH, VOCAB_PATH, find_mol2_paths, geostd_path, save},
 };
 
 // Higher = perhaps better training, but slower to train.
@@ -168,7 +167,7 @@ pub(crate) fn run_training() -> candle_core::Result<()> {
 
     println!("Training on GeoStd data with device: {device:?}");
 
-    let paths_mol2 = find_mol2_paths(Path::new(GEOSTD_PATH))?;
+    let paths_mol2 = find_mol2_paths(&geostd_path())?;
 
     // normalize charges in training, then map back in inference.
 

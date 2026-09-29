@@ -1,4 +1,4 @@
-use std::time::Instant;
+use crate::engine::md_core::clock::Mono;
 
 use lin_alg::f32::Vec3;
 
@@ -63,16 +63,16 @@ impl MdState {
         max_iters: usize,
         external_force: Option<Vec<Vec3>>,
     ) {
-        let pb = indicatif::ProgressBar::new(max_iters as u64);
+        let pb = crate::progress::ProgressBar::new(max_iters as u64);
         pb.set_style(
-            indicatif::ProgressStyle::default_bar()
+            crate::progress::ProgressStyle::default_bar()
                 .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg} ({eta})")
                 .unwrap()
                 .progress_chars("#>-"),
         );
         pb.set_message("Minimizing energy...");
 
-        let start = Instant::now();
+        let start = Mono::now();
 
         let iters = self.minimize_lbfgs(dev, max_iters, &external_force, Some(&pb));
 
@@ -96,7 +96,7 @@ impl MdState {
         dev: &ComputationDevice,
         max_iters: usize,
         external_force: &Option<Vec<Vec3>>,
-        pb: Option<&indicatif::ProgressBar>,
+        pb: Option<&crate::progress::ProgressBar>,
     ) -> usize {
         // L-BFGS / line-search constants (same values as OpenMM).
         const NUM_VECTORS: usize = 6;

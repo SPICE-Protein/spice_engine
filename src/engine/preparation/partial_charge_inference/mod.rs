@@ -2,17 +2,17 @@
 //! GeoStd library as training data. Uses a neural net. Force field types must be assigned
 //! prior to running this, e.g. from the `param_inference` module.
 
-pub(crate) mod files;
+// v1.3.9 web split: the candle-free bincode helpers (files.rs) are promoted
+// to their own always-compiled module `md_core::pci_files`, because the
+// embedded water template loads through them in slim (no-inference) builds.
+// This module is the candle GNN half; it compiles only with `inference`.
 
 pub(crate) mod train;
 // Pub so the training program can access it.
 
 use std::{
     collections::{BTreeSet, HashMap},
-    fs::File,
-    io,
-    io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use bincode::{Decode, Encode};
@@ -21,7 +21,7 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn as nn;
 use candle_nn::{Embedding, Linear, VarBuilder, ops::sigmoid};
 
-use crate::engine::md_core::partial_charge_inference::files::load_from_bytes_bincode;
+use crate::engine::md_core::pci_files::load_from_bytes_bincode;
 
 // Load the model and vocab from bytes. Note: This has implications for the portability
 // of this library.
@@ -376,16 +376,4 @@ pub fn infer_charge(atoms: &[AtomGeneric], bonds: &[BondGeneric]) -> candle_core
     // todo: Update Dihedrals based on this (?)
 
     Ok(charges)
-}
-
-// C+P from graphics.
-/// Save to file, using Bincode. We currently use this for preference files.
-pub(crate) fn save<T: Encode>(path: &Path, data: &T) -> io::Result<()> {
-    let config = bincode::config::standard();
-
-    let encoded: Vec<u8> = bincode::encode_to_vec(data, config).unwrap();
-
-    let mut file = File::create(path)?;
-    file.write_all(&encoded)?;
-    Ok(())
 }

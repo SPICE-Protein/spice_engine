@@ -6,7 +6,7 @@
 //!
 //! We generally use cell-wrapped distances for solvent, and direct distances for non-solvent.
 
-use std::time::Instant;
+use crate::engine::md_core::clock::Mono;
 
 use lin_alg::f32::Vec3;
 use rayon::prelude::*;
@@ -14,6 +14,7 @@ use rayon::prelude::*;
 #[cfg(feature = "cuda")]
 use crate::engine::md_core::gpu_interface::PerNeighborGpu;
 use crate::engine::md_core::{ComputationDevice, MdState, barostat::SimBox};
+use crate::forcefield::neighbors::ClusterPairStream;
 
 /// By index for fast lookups; separate fields, as these indices are applied differently for non-solvent atoms
 /// and solvent.
@@ -78,6 +79,10 @@ pub struct NeighborsNb {
     pub(crate) build_atom_posits: Vec<Vec3>,
     pub(crate) build_water_posits: Vec<Vec3>,
     pub(crate) build_is_static: Vec<bool>,
+    pub(crate) soa_x: Vec<f32>,
+    pub(crate) soa_y: Vec<f32>,
+    pub(crate) soa_z: Vec<f32>,
+    pub(crate) std_cluster_stream: ClusterPairStream,
 }
 
 impl NeighborsNb {
@@ -142,6 +147,24 @@ impl MdState {
         self.neighbors_nb
             .build_atom_posits
             .extend(self.atoms.iter().map(|a| a.posit));
+        self.neighbors_nb.soa_x = self
+            .neighbors_nb
+            .build_atom_posits
+            .iter()
+            .map(|p| p.x)
+            .collect();
+        self.neighbors_nb.soa_y = self
+            .neighbors_nb
+            .build_atom_posits
+            .iter()
+            .map(|p| p.y)
+            .collect();
+        self.neighbors_nb.soa_z = self
+            .neighbors_nb
+            .build_atom_posits
+            .iter()
+            .map(|p| p.z)
+            .collect();
         self.neighbors_nb.build_water_posits.clear();
         self.neighbors_nb
             .build_water_posits
@@ -220,7 +243,7 @@ impl MdState {
     /// Call during each step; determines if we need to rebuild neighbors, and if so, do it.
     pub(crate) fn build_neighbors_if_needed(&mut self, dev: &ComputationDevice) {
         if self.neighbors_nb.max_displacement_sq >= self.neighbors_nb.half_skin_sq {
-            let start = Instant::now();
+            let start = Mono::now();
 
             self.build_all_neighbors(dev);
             self.computation_time.neighbor_rebuild_count += 1;

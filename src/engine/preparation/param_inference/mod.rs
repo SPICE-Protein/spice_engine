@@ -29,7 +29,12 @@ pub use frcmod::assign_missing_params;
 use na_seq::Element;
 use post_process::*;
 
-use crate::engine::md_core::{partial_charge_inference::infer_charge, util::build_adjacency_list};
+use crate::engine::md_core::util::build_adjacency_list;
+// v1.3.9 web: the candle GNN charge inference is optional. Slim builds
+// (no `inference`) still compile `update_small_mol_params` (the FF-type part)
+// but reject small-molecule charge inference honestly rather than fake it.
+#[cfg(feature = "inference")]
+use crate::engine::md_core::partial_charge_inference::infer_charge;
 
 /// See note: Only loading ones we need for small organic molecules.
 const DEF_ABCG2: &str = include_str!("../../param_data/antechamber_defs/ATOMTYPE_ABCG2.DEF");
@@ -819,19 +824,31 @@ pub fn update_small_mol_params(
         atom.force_field_type = Some(ff_types[i].clone());
     }
 
-    let charge = infer_charge(atoms, bonds).map_err(|e| io::Error::other(e))?;
-
-    for (i, atom) in atoms.iter_mut().enumerate() {
-        atom.partial_charge = Some(charge[i]);
+    #[cfg(not(feature = "inference"))]
+    {
+        // No fake success: the geostd GNN is not compiled into this build
+        // (v1.3.9 slim/wasm). Small organic molecules must bring their own
+        // charges; protein/nucleic builds — the only demo path — carry library
+        // params and never reach here.
+        let _ = (adjacency_list, gaff2, bonds);
+        Err(io::Error::other(
+            "partial-charge inference (candle geostd GNN) is not compiled into this build (feature `inference` off); supply explicit charges for small molecules.",
+        ))
     }
+    #[cfg(feature = "inference")]
+    {
+        let charge = infer_charge(atoms, bonds).map_err(|e| io::Error::other(e))?;
 
-    let adj_list = match adjacency_list {
-        Some(a) => a,
-        None => &build_adjacency_list(atoms, bonds)
-            .map_err(|_| io::Error::other("Problem building adjacency list"))?,
-    };
+        for (i, atom) in atoms.iter_mut().enumerate() {
+            atom.partial_charge = Some(charge[i]);
+        }
 
-    let params = assign_missing_params(atoms, adj_list, gaff2)?;
+        let adj_list = match adjacency_list {
+            Some(a) => a,
+            None => &build_adjacency_list(atoms, bonds)
+                .map_err(|_| io::Error::other("Problem building adjacency list"))?,
+        };
 
-    Ok(params)
+        assign_missing_params(atoms, adj_list, gaff2)
+    }
 }
