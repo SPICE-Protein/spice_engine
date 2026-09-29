@@ -63,10 +63,12 @@ rand_distr = { version = "0.6.0", default-features = false, features = ["std"] }
 # three share ONE ewald source.
 [patch.crates-io]
 ewald = { git = "https://github.com/SPICE-Protein/ewald.git" }
-# Dev path patch while iterating (offline box); switch to the git URL once the
-# web-demo branch merges into main, same drill as ewald above:
-# bio_files = { git = "https://github.com/SPICE-Protein/bio_files.git" }
-bio_files = { path = "../bio_files" }
+# web-demo merged into main 2026-09-29 (rev 8144907): `network` feature makes
+# bio_apis (ureq/rustls/ring) optional — default-on keeps every existing
+# consumer resolving identically; the `web` build opts out. A path patch is
+# CI-poison (runners have no ../bio_files), so this is the git source, same
+# drill as ewald above.
+bio_files = { git = "https://github.com/SPICE-Protein/bio_files.git" }
 
 [features]
 # Native/dev default: full capability, bit-identical to 1.3.8 resolution.

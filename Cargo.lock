@@ -93,6 +93,7 @@ dependencies = [
 [[package]]
 name = "bio_files"
 version = "0.5.3"
+source = "git+https://github.com/SPICE-Protein/bio_files.git#814490714b079228216e0cdffef4307c355e1722"
 dependencies = [
  "bio_apis",
  "byteorder",
