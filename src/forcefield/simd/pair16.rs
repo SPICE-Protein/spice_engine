@@ -62,7 +62,8 @@ impl PairBatch16 {
     #[inline]
     pub unsafe fn eval_lj_coulomb_avx512(self, coulomb_k: f32) -> PairResult16 {
         let dist_sq = self.dx * self.dx + self.dy * self.dy + self.dz * self.dz;
-        let inv_dist = dist_sq.sqrt().recip();
+        // lin_alg f32x16 has no .recip() (unlike wide::f32x8): exact _mm512_div_ps.
+        let inv_dist = f32x16::splat(1.0) / dist_sq.sqrt();
         let sr = self.sigma * inv_dist;
         let sr2 = sr * sr;
         let sr6 = sr2 * sr2 * sr2;
