@@ -16,6 +16,11 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # Nightly: the web demo does NOT commit wasm blobs (web/dist is gitignored);
+  # this schedule is the canonical producer of the artifact the loader/page
+  # consumes via `make web-nightly` (or Actions → spice_engine-wasm).
+  schedule:
+    - cron: '0 18 * * *'   # 18:00 UTC
   workflow_dispatch:
 
 env:
@@ -68,11 +73,19 @@ jobs:
       - name: Node end-to-end smoke (simd128)
         run: node --max-old-space-size=4096 web/smoke.mjs target/wasm32-unknown-unknown/release/spice_engine_simd.wasm
 
+      - name: Stage dist (raw + gz; the browser loader consumes the .gz)
+        run: |
+          mkdir -p wasm-dist
+          cp target/wasm32-unknown-unknown/release/spice_engine.wasm wasm-dist/
+          cp target/wasm32-unknown-unknown/release/spice_engine_simd.wasm wasm-dist/
+          gzip -kf wasm-dist/*.wasm
+
+      # Files land at the artifact ROOT (directory contents are stored
+      # relative to the directory) — `make web-nightly` downloads straight
+      # into web/dist/.
       - name: Upload wasm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: spice_engine-wasm
-          path: |
-            target/wasm32-unknown-unknown/release/spice_engine.wasm
-            target/wasm32-unknown-unknown/release/spice_engine_simd.wasm
+          path: wasm-dist/
           if-no-files-found: error

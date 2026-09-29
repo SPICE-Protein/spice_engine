@@ -19,7 +19,7 @@ else
   DEV_RUSTFLAGS :=
 endif
 
-.PHONY: build check test install wheel clean web-check wasm wasm-simd web-smoke web-verify web-serve
+.PHONY: build check test install wheel clean web-check wasm wasm-simd web-smoke web-verify web-serve web-dist web-nightly
 
 ## Compile the native lib only (fast feedback, no Python bindings).
 build:
@@ -81,6 +81,24 @@ web-verify: wasm wasm-simd
 	node --max-old-space-size=4096 web/smoke.mjs target/$(WASM_TARGET)/release/spice_engine.wasm
 	node --max-old-space-size=4096 web/smoke.mjs target/$(WASM_TARGET)/release/spice_engine_simd.wasm
 
-## Serve the demo dir locally (for manual browser testing of the loader).
+## Stage the demo binaries under web/dist/ (gzipped; NOT committed — the repo
+## keeps no wasm blobs, see web-nightly for the CI-built alternative).
+web-dist: wasm wasm-simd
+	@mkdir -p web/dist
+	@cp target/$(WASM_TARGET)/release/spice_engine.wasm target/$(WASM_TARGET)/release/spice_engine_simd.wasm web/dist/
+	@gzip -kf web/dist/spice_engine.wasm web/dist/spice_engine_simd.wasm
+	@ls -lh web/dist/
+
+## Fetch the latest web-wasm CI artifacts into web/dist/ (needs `gh`, a
+## completed run, and matches what nightly produces; unzip layout: the
+## artifact carries the two .wasm blobs, we gzip them for the loader).
+web-nightly:
+	@mkdir -p web/dist
+	gh run download --repo SPICE-Protein/spice_engine -n spice_engine-wasm --dir web/dist
+	@gzip -kf web/dist/spice_engine.wasm web/dist/spice_engine_simd.wasm
+	@ls -lh web/dist/
+
+## Serve the demo dir locally (builds the binaries if missing).
 web-serve:
+	@test -f web/dist/spice_engine.wasm.gz || $(MAKE) web-dist
 	python3 -m http.server 8080 --directory web

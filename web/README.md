@@ -10,15 +10,16 @@ feature-graph, ABI design notes and measured performance budget:
 | `loader.mjs` | dependency-free JS wrapper over the raw `extern "C"` ABI (`loadSpice({url})` → `SpiceEngine` handle class; gzip via client-side `DecompressionStream`) |
 | `index.html` | minimal reference page — build → `requestAnimationFrame` stepping → canvas dots coloured by atom role, toy force-term switches, dual-bath temperature inputs |
 | `mini.cif` | 5-residue fast fixture (~1.5 k sites, builds in ~3 s in-tab) |
-| `dist/spice_engine.wasm.gz` / `dist/spice_engine_simd.wasm.gz` | prebuilt scalar + simd128 modules (regenerate with `make wasm` / `make wasm-simd`, then `gzip -k`) |
+| `dist/` | **gitignored** — wasm blobs are never committed. Populate with `make web-dist` (local build) or `make web-nightly` (fetches the latest `spice_engine-wasm` artifact from the web-wasm CI, which runs on every main push + nightly) |
 | `smoke.mjs` | node correctness gate — instantiate → build → step → read back (`make web-smoke` / `make web-verify`) |
 | `selftest.mjs` | node end-to-end test of `loader.mjs` + `index.html` assets over http |
 
 Try it:
 
 ```bash
-make wasm          # or reuse the committed dist/*.wasm.gz
-make web-serve     # http://localhost:8080 → the reference page
+make web-serve     # auto-builds web/dist/ if missing → http://localhost:8080
+# or skip the toolchain entirely:
+make web-nightly   # download the CI-built scalar+simd wasm into web/dist/
 ```
 
 Bring your own renderer — the loader is the whole interface; `index.html` is

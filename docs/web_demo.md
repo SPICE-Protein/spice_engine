@@ -3,9 +3,11 @@
 This is the **authoritative in-tree reference** for the browser build. The runnable
 artifact + JS loader + a minimal reference page live in this repo's `web/`
 directory: `web/loader.mjs` (ergonomic JS wrapper), `web/index.html` (canvas
-reference page), `web/dist/*.wasm.gz` (prebuilt scalar + simd128), `web/mini.cif`
-(fast fixture), `web/smoke.mjs` / `web/selftest.mjs` (node correctness gates).
-Serve it locally with `make web-serve` (then open `http://localhost:8080`).
+reference page), `web/mini.cif` (fast fixture), `web/smoke.mjs` / `web/selftest.mjs`
+(node correctness gates). **Wasm blobs are NOT committed** — `web/dist/` is
+gitignored; populate it with `make web-dist` (local build) or `make web-nightly`
+(pulls the latest `spice_engine-wasm` CI artifact, produced on every main push
+and on a nightly schedule). Serve with `make web-serve` → `http://localhost:8080`.
 
 ## Why this works at all
 
@@ -26,6 +28,9 @@ make wasm
 # simd128 variant (Chrome 101+/FF 100+/Safari 16+; non-bit-exact)
 make wasm-simd
 #   → …/spice_engine_simd.wasm
+
+# stage web/dist/{,simd.}wasm(.gz) for the demo (or make web-nightly = CI artifact)
+make web-dist
 
 # end-to-end correctness gate (node): instantiate → build 2LYZ → step → read back
 make web-smoke      # scalar

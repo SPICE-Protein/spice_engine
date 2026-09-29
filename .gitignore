@@ -1,3 +1,5 @@
 /target
 .DS_Store
 md_out/
+# wasm blobs are build/CI artifacts, never committed (make web-dist / web-nightly)
+web/dist/
