@@ -9,6 +9,12 @@ impl MdState {
     /// We use the MD-standard [S]PME approach to handle approximated Coulomb forces. This function
     /// applies forces from non-solvent, and solvent sources.
     pub fn apply_nonbonded_forces(&mut self, dev: &ComputationDevice) {
+        // See `refresh_soa_posits` (neighbors.rs): the x86 fused kernel reads
+        // the SoA view of the std positions, so it must be live at every
+        // evaluation, not only right after a neighbor rebuild.
+        if matches!(dev, ComputationDevice::Cpu) {
+            self.refresh_soa_posits();
+        }
         let (f_on_non_water, f_on_water, virial, energy, energy_between_mols, alch_dh_dl) =
             match dev {
                 ComputationDevice::Cpu => calc_force_cpu_dispatch(

@@ -93,6 +93,28 @@ impl NeighborsNb {
             ..Default::default()
         }
     }
+
+    /// Re-sync the fused-kernel SoA coordinate cache with the live positions.
+    ///
+    /// The SoA triples are a gather optimization for the x86
+    /// `std_simd_lanes_x86` kernel, NOT a rebuild snapshot: pair *lists* are
+    /// skin-tolerant, but pair *evaluations* must see current positions —
+    /// exactly what the scalar path and the arm64 kernel (which reads
+    /// `atoms[i].posit` directly) always did. Leaving them at the last rebuild
+    /// frame made the x86 force law evaluate up to half-a-skin of stale
+    /// coordinates: the Kaggle canary localized it (1.3.10 wheel — water-site
+    /// Δf ≈ 2e-4 but solute Δf ≈ 33% of |f| on one frame, equilibration
+    /// diverging from step 4), which is why x86 SIMD MD exploded while arm64
+    /// was bit-stable. Three linear passes over the std atoms per force call
+    /// — noise against the evaluation itself.
+    pub(crate) fn set_soa_from(&mut self, atoms: &[crate::engine::md_core::AtomDynamics]) {
+        self.soa_x.clear();
+        self.soa_y.clear();
+        self.soa_z.clear();
+        self.soa_x.extend(atoms.iter().map(|a| a.posit.x));
+        self.soa_y.extend(atoms.iter().map(|a| a.posit.y));
+        self.soa_z.extend(atoms.iter().map(|a| a.posit.z));
+    }
 }
 
 impl MdState {
@@ -140,6 +162,17 @@ impl MdState {
         self.neighbors_nb.max_displacement_sq = 0.0;
     }
 
+    /// Align the SoA cache with live std positions before every CPU force
+    /// evaluation — see [`NeighborsNb::set_soa_from`] for the why.
+    pub(crate) fn refresh_soa_posits(&mut self) {
+        let Self {
+            atoms,
+            neighbors_nb,
+            ..
+        } = self;
+        neighbors_nb.set_soa_from(atoms);
+    }
+
     #[allow(unused)] // Unused when not using GPU.
     /// This rebuilds all neighbor lists.
     pub(crate) fn build_all_neighbors(&mut self, dev: &ComputationDevice) {
@@ -147,24 +180,15 @@ impl MdState {
         self.neighbors_nb
             .build_atom_posits
             .extend(self.atoms.iter().map(|a| a.posit));
-        self.neighbors_nb.soa_x = self
-            .neighbors_nb
-            .build_atom_posits
-            .iter()
-            .map(|p| p.x)
-            .collect();
-        self.neighbors_nb.soa_y = self
-            .neighbors_nb
-            .build_atom_posits
-            .iter()
-            .map(|p| p.y)
-            .collect();
-        self.neighbors_nb.soa_z = self
-            .neighbors_nb
-            .build_atom_posits
-            .iter()
-            .map(|p| p.z)
-            .collect();
+        {
+            // One SoA producer everywhere (see `set_soa_from`).
+            let Self {
+                atoms,
+                neighbors_nb,
+                ..
+            } = self;
+            neighbors_nb.set_soa_from(atoms);
+        }
         self.neighbors_nb.build_water_posits.clear();
         self.neighbors_nb
             .build_water_posits
@@ -376,4 +400,39 @@ pub fn build_neighbors(
             out
         })
         .collect()
+}
+
+#[cfg(test)]
+mod soa_freshness_tests {
+    use super::*;
+    use crate::engine::md_core::AtomDynamics;
+
+    /// The x86 fused kernel reads the SoA view; if it lags the live
+    /// positions by the skin drift accumulated between rebuilds, pair forces
+    /// are evaluated at wrong distances (Kaggle canary: solute Δf ≈ 33% of
+    /// |f|, equilibration diverged from step 4 on 1.3.10). This pins the
+    /// contract that every refresh reflects CURRENT coordinates.
+    #[test]
+    fn set_soa_from_tracks_live_positions_not_rebuild_frame() {
+        let mut nb = NeighborsNb::new(2.0, 10.0);
+        let mut atoms = vec![
+            AtomDynamics {
+                posit: Vec3::new(1.0, 2.0, 3.0),
+                ..Default::default()
+            },
+            AtomDynamics {
+                posit: Vec3::new(-4.0, 0.5, 9.0),
+                ..Default::default()
+            },
+        ];
+        nb.set_soa_from(&atoms);
+        assert_eq!(nb.soa_x, vec![1.0, -4.0]);
+        assert_eq!(nb.soa_y, vec![2.0, 0.5]);
+        assert_eq!(nb.soa_z, vec![3.0, 9.0]);
+        // MD advances a sub-skin drift without triggering a rebuild — the
+        // fused kernel must still see the moved atom, not the rebuild frame.
+        atoms[0].posit = Vec3::new(1.25, 2.0, 3.0);
+        nb.set_soa_from(&atoms);
+        assert_eq!(nb.soa_x[0], 1.25);
+    }
 }
