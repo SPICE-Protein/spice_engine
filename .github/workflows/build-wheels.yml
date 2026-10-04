@@ -2,7 +2,8 @@
 # build artifacts (login required to download — fine for private use until we
 # publish publicly). On tags, wheels are also attached to a GitHub Release.
 #
-# Python matrix: 3.12 (Colab / most cloud runtimes) + 3.11 (Kaggle). The wheel's
+# Python matrix: 3.12 (Colab / most cloud runtimes) + 3.11/3.13 (Kaggle old/new
+# CPU images). The wheel's
 # cp tag MUST match the runtime Python — otherwise pip rejects it with
 # "not a supported wheel on this platform" (e.g. a cp39 wheel on a 3.12 runtime).
 #
@@ -55,6 +56,12 @@ jobs:
             target: x86_64
             python: "3.11"
             interpreter: python3.11
+          # Kaggle rolled its CPU image to Python 3.13 (factory-cage died on
+          # "no wheel for cp313" 2026-10-04) — ship the matching interpreter.
+          - os: ubuntu-latest
+            target: x86_64
+            python: "3.13"
+            interpreter: python3.13
           # NOTE: linux/aarch64 (Jetson, ARM cloud) is deferred — maturin's
           # cross-build can't find an aarch64 CPython reliably; re-add with the
           # proper manylinux docker/QEMU or a native ARM runner when needed.
