@@ -758,6 +758,23 @@ impl PyEngine {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// All atom positions `[n, 3]` in `state.atoms` order. The engine appends
+    /// solvent/ions AFTER the solute during build, so the caller's known solute
+    /// atom count slices the topology back out (`coords_all()[:n_solute]`).
+    /// Why: two-segment MD protocols (Kaggle CPU 12 h cap) checkpoint between
+    /// segments; CA-only frames cannot refeed the mutant builder, which needs
+    /// the N/CA/C backbone to orient sidechain placement — full solute
+    /// coordinates make the restore exact, sidechain rotamers included.
+    fn coords_all<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let n = self.engine.state.atoms.len();
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for a in self.engine.state.atoms.iter() {
+            let p = a.posit;
+            out.push(vec![p.x, p.y, p.z]);
+        }
+        PyArray2::from_vec2(py, &out).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// Low-allocation flat Cα coordinates `[x0,y0,z0,...]`.
     fn coords_ca_flat<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let ca_indices = self.topology().ca_indices.clone();
