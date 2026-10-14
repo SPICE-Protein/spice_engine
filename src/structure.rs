@@ -225,10 +225,19 @@ pub fn atoms_to_mmcif(input: &StructureInput) -> Result<MmCif, String> {
             if chains.iter().any(|c: &ChainGeneric| c.id == *chain_id) {
                 continue;
             }
+            // Residue serials are POSITIONAL (`res_idx as u32 + 1` in the loop
+            // above), not auth numbers. Keying by `key.1 + 1` (auth) made the
+            // residue/atom wiring silently empty for any window whose auth
+            // numbering does not overlap 1..n (1wer@718, 3im1@1839, 1nty@1231,
+            // 4m9p@478, 4ifj@322 — every chain then lost all atoms, the
+            // `retain(!atom_sns.is_empty())` in forcefield/params deleted the
+            // empty chains, and add_hydrogens exploded on `chains[0]` at the
+            // first added H: "index out of bounds: the len is 0").
             let residue_sns: Vec<u32> = kept_res
                 .iter()
-                .filter(|(key, _)| key.0 == *chain_id)
-                .map(|(key, _)| key.1 as u32 + 1)
+                .enumerate()
+                .filter(|(_, (key, _))| key.0 == *chain_id)
+                .map(|(i, _)| i as u32 + 1)
                 .collect();
             let atom_sns: Vec<u32> = residues
                 .iter()
@@ -264,4 +273,49 @@ pub fn build_from_input(
 ) -> Result<SpiceEngine, String> {
     let protein = atoms_to_mmcif(input)?;
     build_system(dev, param_set, protein, opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn el(s: &str) -> Element {
+        Element::from_letter(s).unwrap()
+    }
+
+    /// Four backbone-ish atoms per Ala residue laid out along x, auth numbering
+    /// `start..start+n-1` (non-contiguous-with-positional serials on purpose).
+    fn input_with_auth(start: i32, n: i32) -> StructureInput {
+        let mut s = StructureInput::default();
+        for k in 0..n {
+            let res_seq = start + k;
+            for (name, e, dx) in
+                [("N", el("N"), 0.0f32), ("CA", el("C"), 1.5), ("C", el("C"), 2.5), ("CB", el("C"), 3.5)]
+            {
+                s.push(AtomInput::new("A", res_seq, "ALA", name, e,
+                                      dx + 10.0 * k as f32, 5.0, 5.0));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn offset_auth_numbering_wires_chain_residues_positionally() {
+        // v1.3.12 production autopsies (entry windows 1wer/3im1/1nty/4m9p/4ifj):
+        // the chain builder keyed residue_sns by AUTH number+1 while residues
+        // carry POSITIONAL serials (res_idx+1). Windows starting far from 1 gave
+        // zero overlap -> every chain lost all atoms, params' retain deleted the
+        // empty chains, and add_hydrogens exploded on chains[0] at the first H
+        // ("index out of bounds: the len is 0"). Chain wiring must be complete
+        // for ANY auth numbering scheme, and match ResidueGeneric serials.
+        for start in [718i32, 1839, 1231, 478, 322, -4, 0, 1] {
+            let m = atoms_to_mmcif(&input_with_auth(start, 324)).expect("build");
+            assert_eq!(m.chains.len(), 1, "chain vanished for auth start {start}");
+            let c = &m.chains[0];
+            assert_eq!(c.residue_sns.len(), 324, "residue wiring for auth start {start}");
+            assert_eq!(c.residue_sns.first().copied(), Some(1));
+            assert_eq!(c.residue_sns.last().copied(), Some(324));
+            assert_eq!(c.atom_sns.len(), 324 * 4, "atom wiring for auth start {start}");
+        }
+    }
 }
