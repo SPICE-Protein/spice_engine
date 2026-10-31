@@ -100,6 +100,7 @@ pub(crate) fn make_h_digit_map_custom(
     ff_map: &ProtFfChargeMap,
     ph: f32,
     custom_variant: Option<AminoAcidProtenationVariant>,
+    terminal: bool,
 ) -> DigitMap {
     let mut result: DigitMap = HashMap::new();
 
@@ -132,6 +133,15 @@ pub(crate) fn make_h_digit_map_custom(
                         (AminoAcid::His, _) => false,
                         _ => true,
                     }
+                } else if terminal
+                    && matches!(
+                        aa,
+                        AminoAcid::Asp | AminoAcid::Glu | AminoAcid::Cys | AminoAcid::Lys
+                    )
+                {
+                    // Terminal charge libs ship no ASH/GLH/CYM/LYN units; keep
+                    // the standard side-chain H map even below/above the pKa.
+                    true
                 } else {
                     standard_allowed_at_ph(aa, ph)
                 }
@@ -139,6 +149,16 @@ pub(crate) fn make_h_digit_map_custom(
             AminoAcidGeneral::Variant(v) => {
                 if let Some(cv) = custom_variant {
                     cv == v
+                } else if terminal
+                    && matches!(
+                        v,
+                        AminoAcidProtenationVariant::Ash
+                            | AminoAcidProtenationVariant::Glh
+                            | AminoAcidProtenationVariant::Cym
+                            | AminoAcidProtenationVariant::Lyn
+                    )
+                {
+                    false
                 } else {
                     if matches!(
                         v,
@@ -948,7 +968,12 @@ pub fn populate_hydrogens_dihedrals(
             }
             _ => None,
         };
-        let this_digit_map = make_h_digit_map_custom(&ff_map.internal, ph, selected_variant);
+        let this_digit_map = make_h_digit_map_custom(
+            &ff_map.internal,
+            ph,
+            selected_variant,
+            !matches!(res.end, ResidueEnd::Internal),
+        );
 
         // todo: Handle the N term and C term cases; pass those params in.
         let (dihedral, mut h_added_this_res, this_cp_ca) = aa_data_from_coords(

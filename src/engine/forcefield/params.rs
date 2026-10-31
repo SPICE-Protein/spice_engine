@@ -17,7 +17,7 @@ use na_seq::{AminoAcid, AminoAcidGeneral, AminoAcidProtenationVariant, AtomTypeI
 
 use crate::engine::md_core::{
     Dihedral, ParamError,
-    add_hydrogens::ph::{resolve_his_tautomer_by_geometry, resolve_variant},
+    add_hydrogens::ph::{PKA_ASP, PKA_GLU, resolve_his_tautomer_by_geometry, resolve_variant},
     merge_params, populate_hydrogens_dihedrals,
 };
 
@@ -221,6 +221,31 @@ pub struct ProtFfChargeMapSet {
     pub c_terminus: ProtFfChargeMap,
 }
 
+/// Default protonation variant for an amino acid at a given pH.
+///
+/// This must match the H-placement rules in `add_hydrogens/ph.rs`: below the
+/// acidic pKa, Asp/Glu are the protonated ASH/GLH forms, whose carboxylate O is
+/// typed "OH" and the added H "HO" (amino19.lib). Typing them as the standard
+/// deprotonated forms leaves an O2–HB2 bond that has no parameters, which used
+/// to crash low-pH builds (pH 0–4 → "Missing bond params for O2-HB2").
+fn default_aa_general(aa: AminoAcid, ph: f32, end: ResidueEnd) -> AminoAcidGeneral {
+    // Terminal charge libs (aminont12/aminoct12) ship no ASH/GLH/CYM/LYN
+    // units. Keep terminal residues on their standard variant at every pH —
+    // the same gate the H-placement pass uses.
+    if !matches!(end, ResidueEnd::Internal) {
+        return AminoAcidGeneral::Standard(aa);
+    }
+    match aa {
+        AminoAcid::Asp if ph < PKA_ASP => {
+            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Ash)
+        }
+        AminoAcid::Glu if ph < PKA_GLU => {
+            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Glh)
+        }
+        _ => AminoAcidGeneral::Standard(aa),
+    }
+}
+
 /// Populate forcefield type, and partial charge on atoms. This should be run on mmCIF
 /// files prior to running molecular dynamics on them. These files from RCSB PDB do not
 /// natively have this data.
@@ -253,6 +278,23 @@ pub fn populate_peptide_ff_and_q(
                     )));
                 }
                 res_var_override = Some(AminoAcidGeneral::Variant(var));
+            }
+        }
+
+        // Terminal charge libs ship no ASH/GLH/CYM/LYN units. Ignore those
+        // overrides on terminal residues so the FF typing matches the H map
+        // (which also forces the standard variant there).
+        if !matches!(res.end, ResidueEnd::Internal) {
+            if let Some(AminoAcidGeneral::Variant(v)) = res_var_override {
+                if matches!(
+                    v,
+                    AminoAcidProtenationVariant::Ash
+                        | AminoAcidProtenationVariant::Glh
+                        | AminoAcidProtenationVariant::Cym
+                        | AminoAcidProtenationVariant::Lyn
+                ) {
+                    res_var_override = None;
+                }
             }
         }
 
@@ -317,7 +359,7 @@ pub fn populate_peptide_ff_and_q(
                 if let Some(vo) = res_var_override.clone() {
                     vo
                 } else {
-                    AminoAcidGeneral::Standard(*aa)
+                    default_aa_general(*aa, ph, res.end)
                 }
             };
 
@@ -970,4 +1012,61 @@ fn filter_protein_bonds(
             atoms[c_idx].type_in_res == Some(C) && atoms[n_idx].type_in_res == Some(N)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acidic_residues_use_protonated_variants_below_pka() {
+        // pH 2 is below both pKa's: ASH/GLH keep the carboxyl O–H typed OH–HO,
+        // which has bond parameters (the O2–HB2 pair does not).
+        assert_eq!(
+            default_aa_general(AminoAcid::Asp, 2.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Ash)
+        );
+        assert_eq!(
+            default_aa_general(AminoAcid::Glu, 2.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Variant(AminoAcidProtenationVariant::Glh)
+        );
+    }
+
+    #[test]
+    fn acidic_residues_stay_deprotonated_at_neutral_ph() {
+        assert_eq!(
+            default_aa_general(AminoAcid::Asp, 7.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Standard(AminoAcid::Asp)
+        );
+        assert_eq!(
+            default_aa_general(AminoAcid::Glu, 7.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Standard(AminoAcid::Glu)
+        );
+    }
+
+    #[test]
+    fn terminal_acid_stays_standard_below_pka() {
+        // aminont12/aminoct12 have no ASH/GLH units; selecting one there
+        // fails with "Unable to find AA mapping for Variant(Glh) in NTerminus".
+        assert_eq!(
+            default_aa_general(AminoAcid::Glu, 2.0, ResidueEnd::NTerminus),
+            AminoAcidGeneral::Standard(AminoAcid::Glu)
+        );
+        assert_eq!(
+            default_aa_general(AminoAcid::Asp, 2.0, ResidueEnd::CTerminus),
+            AminoAcidGeneral::Standard(AminoAcid::Asp)
+        );
+    }
+
+    #[test]
+    fn other_residues_ignore_ph() {
+        assert_eq!(
+            default_aa_general(AminoAcid::Lys, 2.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Standard(AminoAcid::Lys)
+        );
+        assert_eq!(
+            default_aa_general(AminoAcid::His, 12.0, ResidueEnd::Internal),
+            AminoAcidGeneral::Standard(AminoAcid::His)
+        );
+    }
 }
